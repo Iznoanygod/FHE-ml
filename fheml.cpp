@@ -3,6 +3,7 @@
 #define PROFILE
 
 #include "palisade.h"
+#include "fhematrix.h"
 
 using namespace lbcrypto;
 
@@ -49,6 +50,10 @@ int main(int argc, char** argv){
 	cc->Decrypt(keys.secretKey, cMul, &result);
 	result->SetLength(batchSize);
 	std::cout << "x1 * x2 = " << result;
-
+    
+    fhe::Matrix M(10,10);
+    fhe::Matrix N(20,20);
+    fhe::Matrix O = M+N;
+    std::cout<<O.get_rows();
 	return 0;
 }
