@@ -80,6 +80,8 @@ namespace fhe {
         for(int i = 0; i < cols; i++)
             for(int j = 0; j < rows; j++)
                 temp[i][j] = mat[j][i];
+    
+        return temp;
     }
 
     double* Matrix::operator[] (int m){
