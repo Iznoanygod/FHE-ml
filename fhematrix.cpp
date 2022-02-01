@@ -1,5 +1,5 @@
 #include "fhematrix.h"
-#include <iostream>
+
 namespace fhe {
     Matrix::Matrix(int rows, int cols) {
         this->rows = rows;
