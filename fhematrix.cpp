@@ -10,15 +10,15 @@ namespace fhe {
             this->mat[i] = new double[cols];
     }
 
-    int Matrix::get_rows() {
+    int Matrix::get_rows() const {
         return rows;
     }
 
-    int Matrix::get_cols() {
+    int Matrix::get_cols() const {
         return cols;
     }
 
-    Matrix Matrix::operator+ (Matrix M) {
+    Matrix Matrix::operator+ (Matrix M) const {
         if(rows != M.get_rows() || cols != M.get_cols()) {
             throw -1;
         }
@@ -32,7 +32,7 @@ namespace fhe {
         return temp;
     }
     
-    Matrix Matrix::operator- (Matrix M) {
+    Matrix Matrix::operator- (Matrix M) const {
         if(rows != M.get_rows() || cols != M.get_cols()) {
             throw -1;
         }
@@ -46,7 +46,7 @@ namespace fhe {
         return temp;
     }
 #ifdef __AVX2__
-    Matrix Matrix::operator* (Matrix M) {
+    Matrix Matrix::operator* (Matrix M) const {
         if(cols != M.get_rows()){
             throw -1;
         }
@@ -61,7 +61,7 @@ namespace fhe {
         return temp;
     }
 #else
-    Matrix Matrix::operator* (Matrix M) {
+    Matrix Matrix::operator* (Matrix M) const {
         if(cols != M.get_rows()){
             throw -1;
         }
@@ -77,12 +77,12 @@ namespace fhe {
                 temp[i][j] = sum;
             }
         }
-#endif
 
         return temp;
     }
+#endif
 
-    Matrix Matrix::operator^ (Matrix M) {
+    Matrix Matrix::operator^ (Matrix M) const {
         if(rows != M.get_rows() || cols != M.get_cols()) {
             throw -1;
         }
@@ -96,7 +96,7 @@ namespace fhe {
         return temp;
     }
 
-    Matrix Matrix::operator! () {
+    Matrix Matrix::operator! () const {
         Matrix temp(cols, rows);
 
         for(int i = 0; i < cols; i++)
@@ -112,7 +112,13 @@ namespace fhe {
 
         return mat[m];
     }
-    
+
+    Matrix::operator std::string() const {
+        std::string val = "{";
+
+        return val;
+    }
+
     FHEMatrix::FHEMatrix(int rows, int cols, int batch,
             Matrix mat, CryptoContext<DCRTPoly> cc, Key_t key) {
         this->rows = rows;
@@ -152,6 +158,10 @@ namespace fhe {
         return cols;
     }
 
+    int FHEMatrix::get_batch() {
+        return batch;
+    }
+
     FHEMatrix FHEMatrix::operator+ (FHEMatrix M) {
         if(rows != M.get_rows() || cols != M.get_cols()) {
             throw -1;
@@ -176,6 +186,27 @@ namespace fhe {
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)
                 temp[i][j] = cc->EvalSub(mat[i][j], M[i][j]);
+
+        return temp;
+    }
+
+    FHEMatrix FHEMatrix::operator* (FHEMatrix M) {
+        if(cols != M.get_rows() || batch != M.get_batch()){
+            throw -1;
+        }    
+
+        FHEMatrix temp(rows, M.get_cols(), batch, cc);
+        
+        for(int i = 0; i < rows; i++) {
+            for(int j = 0; j < M.get_cols(); j++) {
+                Ciphertext_t sum = cc->EvalMult(mat[i][0], M[0][j]);
+                for(int k = 1; k < cols; k++){
+                    Ciphertext_t mul = cc->EvalMult(mat[i][k], M[k][j]);
+                    sum = cc->EvalAdd(sum,mul);
+                }
+                temp[i][j] = sum;
+            }
+        }
 
         return temp;
     }

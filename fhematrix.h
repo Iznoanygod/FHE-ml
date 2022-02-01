@@ -17,16 +17,17 @@ namespace fhe {
         public:
             Matrix(int, int);
 
-            int get_rows();
-            int get_cols();
+            int get_rows() const;
+            int get_cols() const;
 
-            Matrix operator + (Matrix);
-            Matrix operator - (Matrix);
-            Matrix operator * (Matrix);
-            Matrix operator ^ (Matrix);
-            Matrix operator ! ();
+            Matrix operator + (Matrix) const;
+            Matrix operator - (Matrix) const;
+            Matrix operator * (Matrix) const;
+            Matrix operator ^ (Matrix) const;
+            Matrix operator ! () const;
             
             double *operator[] (int);
+            operator std::string() const;
         private:
             int rows;
             int cols;

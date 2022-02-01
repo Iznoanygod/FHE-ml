@@ -51,17 +51,14 @@ int main(int argc, char** argv){
     
     fhe::Matrix M(2,2);
     M[0][0] = 1;
-    M[0][1] = 1;
-    M[1][0] = 1;
-    M[1][1] = 1;
+    M[0][1] = 2;
+    M[1][0] = 3;
+    M[1][1] = 4;
+    std::cout << std::string(M) << std::endl;
     fhe::Matrix N(2,2);
     N[0][0] = 1;
-    N[0][1] = 0;
-    N[1][0] = 0;
-    N[1][1] = 1;
-    fhe::Matrix O = M*N;
-    std::cout << O[0][0] << std::endl;
-    fhe::Matrix L = !O;
-    std::cout << L[1][0] << std::endl;
+    N[0][1] = 2;
+    N[1][0] = 3;
+    N[1][1] = 4;
     return 0;
 }
