@@ -106,12 +106,85 @@ namespace fhe {
         return temp;
     }
 
-    double* Matrix::operator[] (int m){
+    double *Matrix::operator[] (int m){
         if(m < 0 || m >= rows)
             throw -1;
 
         return mat[m];
     }
     
+    FHEMatrix::FHEMatrix(int rows, int cols, int batch,
+            Matrix mat, CryptoContext<DCRTPoly> cc, Key_t key) {
+        this->rows = rows;
+        this->cols = cols;
+        this->batch = batch;
+        this->cc = cc;
+
+        this->mat = new Ciphertext_t*[rows];
+        for(int i = 0; i < rows; i++) {
+            this->mat[i] = new Ciphertext_t[cols];
+            for(int j = 0; j < cols; j++){
+                vector<double> v = {mat[i][j]};
+                Plaintext ptxt = cc->MakeCKKSPackedPlaintext(v);
+                this->mat[i][j] = cc->Encrypt(key.publicKey, ptxt);
+            }
+        }
+        
+    }
+
+    FHEMatrix::FHEMatrix(int rows, int cols, int batch, CryptoContext<DCRTPoly> cc) {
+        this->rows = rows;
+        this->cols = cols;
+        this->batch = batch;
+        this->cc = cc;
+
+        this->mat = new Ciphertext_t*[rows];
+        for(int i = 0; i < rows; i++)
+            this->mat[i] = new Ciphertext_t[cols];
+
+    }
+
+    int FHEMatrix::get_rows() {
+        return rows;
+    }
+    
+    int FHEMatrix::get_cols() {
+        return cols;
+    }
+
+    FHEMatrix FHEMatrix::operator+ (FHEMatrix M) {
+        if(rows != M.get_rows() || cols != M.get_cols()) {
+            throw -1;
+        }
+
+        FHEMatrix temp(rows, cols, batch, cc);
+        
+        for(int i = 0; i < rows; i++)
+            for(int j = 0; j < cols; j++)
+                temp[i][j] = cc->EvalAdd(mat[i][j], M[i][j]);
+
+        return temp;
+    }
+
+    FHEMatrix FHEMatrix::operator- (FHEMatrix M) {
+        if(rows != M.get_rows() || cols != M.get_cols()) {
+            throw -1;
+        }
+
+        FHEMatrix temp(rows, cols, batch, cc);
+
+        for(int i = 0; i < rows; i++)
+            for(int j = 0; j < cols; j++)
+                temp[i][j] = cc->EvalSub(mat[i][j], M[i][j]);
+
+        return temp;
+    }
+
+    Ciphertext_t *FHEMatrix::operator[] (int m) {
+        if(m < 0 || m >= rows)
+            throw -1;
+
+        return mat[m];
+    }
 }
 

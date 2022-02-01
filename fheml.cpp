@@ -5,8 +5,6 @@
 #include "palisade.h"
 #include "fhematrix.h"
 
-using namespace lbcrypto;
-
 int main(int argc, char** argv){
 	
 	uint32_t multDepth = 1;
@@ -22,9 +20,9 @@ int main(int argc, char** argv){
 	cc->Enable(ENCRYPTION);
 	cc->Enable(SHE);
 
-	auto keys = cc->KeyGen();
-
-	cc->EvalMultKeyGen(keys.secretKey);
+    auto keys = cc->KeyGen();
+	
+    cc->EvalMultKeyGen(keys.secretKey);
 
 	vector<double> x1 = {0.25, 0.5, 0.75, 0.0, 2.0, 3.0, 4.0, 5.0};
 	vector<double> x2 = {5.0, 4.0, 3.0, 2.0, 1.0, 0.75, 0.5, 0.25};
@@ -35,10 +33,10 @@ int main(int argc, char** argv){
 	std::cout << "Input x1: " << ptxt1 << std::endl;
 	std::cout << "Input x2: " << ptxt2 << std::endl;
 
-	auto c1 = cc->Encrypt(keys.publicKey, ptxt1);
+	Ciphertext_t c1 = cc->Encrypt(keys.publicKey, ptxt1);
 	auto c2 = cc->Encrypt(keys.publicKey, ptxt2);
-
-	auto cAdd = cc->EvalAdd(c1, c2);
+	
+    auto cAdd = cc->EvalAdd(c1, c2);
 	auto cMul = cc->EvalMult(c1, c2);
 
 	Plaintext result;
@@ -63,5 +61,7 @@ int main(int argc, char** argv){
     N[1][1] = 1;
     fhe::Matrix O = M*N;
     std::cout << O[0][0] << std::endl;
+    fhe::Matrix L = !O;
+    std::cout << L[1][0] << std::endl;
     return 0;
 }
