@@ -45,20 +45,29 @@ namespace fhe {
 
         return temp;
     }
+#ifdef __AVX2__
+    Matrix Matrix::operator* (Matrix M) {
+        if(cols != M.get_rows()){
+            throw -1;
+        }
 
+        Matrix temp(rows, M.get_cols());
+
+        /*
+         * TODO:
+         *  - Write AVX implementation
+         */
+
+        return temp;
+    }
+#else
     Matrix Matrix::operator* (Matrix M) {
         if(cols != M.get_rows()){
             throw -1;
         }
         
         Matrix temp(rows, M.get_cols());
-        /*
-         * Finish this implementation
-         * TODO:
-         *  - Optimized multiplication using vector extension
-         */
-#ifdef __AVX2__
-#else
+        
         for(int i = 0; i < rows; i++){
             for(int j = 0; j < M.get_cols(); j++){
                 double sum = 0;
