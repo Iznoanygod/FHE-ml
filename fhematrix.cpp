@@ -1,4 +1,5 @@
 #include "fhematrix.h"
+#include <iostream>
 namespace fhe {
     Matrix::Matrix(int rows, int cols) {
         this->rows = rows;
@@ -21,7 +22,7 @@ namespace fhe {
         if(rows != M.get_rows() || cols != M.get_cols()) {
             throw -1;
         }
-
+        
         Matrix temp(rows, cols);
         
         for(int i = 0; i < rows; i++)
@@ -54,9 +55,21 @@ namespace fhe {
         /*
          * Finish this implementation
          * TODO:
-         *  - Basic multiplication
          *  - Optimized multiplication using vector extension
          */
+#ifdef __AVX2__
+#else
+        for(int i = 0; i < rows; i++){
+            for(int j = 0; j < M.get_cols(); j++){
+                double sum = 0;
+                for(int k = 0; k < cols; k++){
+                    sum += mat[i][k] * M[k][j];
+                }
+                temp[i][j] = sum;
+            }
+        }
+#endif
+
         return temp;
     }
 

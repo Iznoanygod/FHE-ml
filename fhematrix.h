@@ -1,5 +1,10 @@
 #ifndef _FHEMATRIX_H_
 #define _FHEMATRIX_H_
+
+#ifdef __AVX2__
+#include <x86intrin.h>
+#endif
+
 namespace fhe {
     class Matrix {
         public:

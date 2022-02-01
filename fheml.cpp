@@ -51,9 +51,17 @@ int main(int argc, char** argv){
 	result->SetLength(batchSize);
 	std::cout << "x1 * x2 = " << result;
     
-    fhe::Matrix M(10,10);
-    fhe::Matrix N(20,20);
-    fhe::Matrix O = M+N;
-    std::cout<<O.get_rows();
-	return 0;
+    fhe::Matrix M(2,2);
+    M[0][0] = 1;
+    M[0][1] = 1;
+    M[1][0] = 1;
+    M[1][1] = 1;
+    fhe::Matrix N(2,2);
+    N[0][0] = 1;
+    N[0][1] = 0;
+    N[1][0] = 0;
+    N[1][1] = 1;
+    fhe::Matrix O = M*N;
+    std::cout << O[0][0] << std::endl;
+    return 0;
 }

@@ -49,3 +49,8 @@ add_library( fhematrix SHARED fhematrix.cpp)
 add_executable( fheml fheml.cpp )
 
 target_link_libraries( fheml fhematrix)
+
+if(AVX)
+    target_compile_options ( fhematrix PRIVATE -mavx2)
+endif()
+
