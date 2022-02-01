@@ -11,8 +11,10 @@ namespace fhe {
             Matrix operator + (Matrix);
             Matrix operator - (Matrix);
             Matrix operator * (Matrix);
+            Matrix operator ^ (Matrix);
+            Matrix operator ! ();
             
-
+            double* operator[] (int);
         private:
             int rows;
             int cols;
