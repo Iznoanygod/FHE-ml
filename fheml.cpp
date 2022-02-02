@@ -24,7 +24,7 @@ int main(int argc, char** argv){
 	
     cc->EvalMultKeyGen(keys.secretKey);
 
-	vector<double> x1 = {0.25, 0.5, 0.75, 0.0, 2.0, 3.0, 4.0, 5.0};
+	/*vector<double> x1 = {0.25, 0.5, 0.75, 0.0, 2.0, 3.0, 4.0, 5.0};
 	vector<double> x2 = {5.0, 4.0, 3.0, 2.0, 1.0, 0.75, 0.5, 0.25};
 
 	Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
@@ -48,17 +48,35 @@ int main(int argc, char** argv){
 	cc->Decrypt(keys.secretKey, cMul, &result);
 	result->SetLength(batchSize);
 	std::cout << "x1 * x2 = " << result;
+    */
+    fhe::Matrix M(2,2,1);
+    M[0][0] = {1};
+    M[0][1] = {2};
+    M[1][0] = {3};
+    M[1][1] = {4};
     
-    fhe::Matrix M(2,2);
-    M[0][0] = 1;
-    M[0][1] = 2;
-    M[1][0] = 3;
-    M[1][1] = 4;
     std::cout << std::string(M) << std::endl;
-    fhe::Matrix N(2,2);
-    N[0][0] = 1;
-    N[0][1] = 2;
-    N[1][0] = 3;
-    N[1][1] = 4;
+
+    fhe::Matrix N(2,3,1);
+    N[0][0] = {1};
+    N[0][1] = {2};
+    N[0][2] = {3};
+    N[1][0] = {4};
+    N[1][1] = {5};
+    N[1][2] = {6};
+
+    std::cout << std::string(N) << std::endl;
+
+    fhe::Matrix MN = M*N;
+
+    std::cout << std::string(MN) << std::endl;
+    
+    fhe::FHEMatrix M_e(M,cc,keys);
+    fhe::FHEMatrix N_e(N,cc,keys);
+    fhe::FHEMatrix MN_e = M_e*N_e;
+    fhe::Matrix MN_d = MN_e.Decrypt(keys);
+    
+    std::cout << std::string(MN_d) << std::endl;
+
     return 0;
 }

@@ -1,13 +1,63 @@
 #include "fhematrix.h"
 
+vector<double> operator+(vector<double> A, vector<double> B) {
+    if(A.size() != B.size())
+        throw -1;
+
+    vector<double> C(A.size());
+
+    for(unsigned int i = 0; i < A.size(); i++) {
+        C[i] = A[i]+B[i];
+    }
+
+    return C;
+}
+
+vector<double> operator*(vector<double> A, vector<double> B) {
+    if(A.size() != B.size())
+        throw -1;
+
+    vector<double> C(A.size());
+
+    for(unsigned int i = 0; i < A.size(); i++){
+        C[i] = A[i]*B[i];
+    }
+
+    return C;
+}
+
+vector<double> operator-(vector<double> A, vector<double> B) {
+    if(A.size() != B.size())
+        throw -1;
+
+    vector<double> C(A.size());
+
+    for(unsigned int i = 0; i < A.size(); i++) {
+        C[i] = A[i]-B[i];
+    }
+
+    return C;
+}
+
+vector<double> & operator+=(vector<double> &A, const vector<double> &B) {
+    if(A.size() != B.size())
+        throw -1;
+
+    for(unsigned int i = 0; i < A.size(); i++) {
+        A[i] += B[i];
+    }
+    return A;
+}
+
 namespace fhe {
-    Matrix::Matrix(int rows, int cols) {
+    Matrix::Matrix(int rows, int cols, int batch) {
         this->rows = rows;
         this->cols = cols;
+        this->batch = batch;
 
-        this->mat = new double*[rows];
+        this->mat = new vector<double> *[rows];
         for(int i = 0; i < rows; i++)
-            this->mat[i] = new double[cols];
+            this->mat[i] = new vector<double>[cols];
     }
 
     int Matrix::get_rows() const {
@@ -18,12 +68,16 @@ namespace fhe {
         return cols;
     }
 
+    int Matrix::get_batch() const {
+        return batch;
+    }
+
     Matrix Matrix::operator+ (Matrix M) const {
         if(rows != M.get_rows() || cols != M.get_cols()) {
             throw -1;
         }
         
-        Matrix temp(rows, cols);
+        Matrix temp(rows, cols, batch);
         
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)
@@ -37,7 +91,7 @@ namespace fhe {
             throw -1;
         }
 
-        Matrix temp(rows, cols);
+        Matrix temp(rows, cols, batch);
 
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)
@@ -51,7 +105,7 @@ namespace fhe {
             throw -1;
         }
 
-        Matrix temp(rows, M.get_cols());
+        Matrix temp(rows, M.get_cols(), batch);
 
         /*
          * TODO:
@@ -65,12 +119,12 @@ namespace fhe {
         if(cols != M.get_rows()){
             throw -1;
         }
-        
-        Matrix temp(rows, M.get_cols());
+        Matrix temp(rows, M.get_cols(), batch);
         
         for(int i = 0; i < rows; i++){
             for(int j = 0; j < M.get_cols(); j++){
-                double sum = 0;
+                vector<double> sum(batch);
+                fill(sum.begin(), sum.end(), 0);
                 for(int k = 0; k < cols; k++){
                     sum += mat[i][k] * M[k][j];
                 }
@@ -87,7 +141,7 @@ namespace fhe {
             throw -1;
         }
 
-        Matrix temp(rows, cols);
+        Matrix temp(rows, cols, batch);
         
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)
@@ -97,7 +151,7 @@ namespace fhe {
     }
 
     Matrix Matrix::operator! () const {
-        Matrix temp(cols, rows);
+        Matrix temp(cols, rows, batch);
 
         for(int i = 0; i < cols; i++)
             for(int j = 0; j < rows; j++)
@@ -106,7 +160,7 @@ namespace fhe {
         return temp;
     }
 
-    double *Matrix::operator[] (int m){
+    vector<double> *Matrix::operator[] (int m){
         if(m < 0 || m >= rows)
             throw -1;
 
@@ -115,15 +169,31 @@ namespace fhe {
 
     Matrix::operator std::string() const {
         std::string val = "{";
-
+        for(int i = 0; i < batch; i++){
+            val += std::to_string(i) + ":{";
+            for(int j = 0; j < rows; j++){
+                val += "{";
+                for(int k = 0; k < cols; k++){
+                    val += std::to_string(mat[j][k].at(i));
+                    if(k != cols - 1)
+                        val += ",";
+                }
+                val += "}";
+                if(j != rows-1)
+                    val += "\n";
+            }
+            val += "}";
+            if(i != batch - 1)
+                val += "\n";
+        }
+        val += "}";
         return val;
     }
 
-    FHEMatrix::FHEMatrix(int rows, int cols, int batch,
-            Matrix mat, CryptoContext<DCRTPoly> cc, Key_t key) {
-        this->rows = rows;
-        this->cols = cols;
-        this->batch = batch;
+    FHEMatrix::FHEMatrix(Matrix mat, CryptoContext<DCRTPoly> cc, Key_t key) {
+        this->rows = mat.get_rows();
+        this->cols = mat.get_cols();
+        this->batch = mat.get_batch();
         this->cc = cc;
 
         this->mat = new Ciphertext_t*[rows];
@@ -211,11 +281,41 @@ namespace fhe {
         return temp;
     }
 
+    FHEMatrix FHEMatrix::operator^ (FHEMatrix M) {
+        if(rows != M.get_rows() || cols != M.get_cols()) {
+            throw -1;
+        }
+
+        FHEMatrix temp(rows, cols, batch, cc);
+
+        for(int i = 0; i < rows; i++)
+            for(int j = 0; j < cols; j++)
+                temp[i][j] = cc->EvalMult(mat[i][j], M[i][j]);
+
+        return temp;
+    }
+
     Ciphertext_t *FHEMatrix::operator[] (int m) {
         if(m < 0 || m >= rows)
             throw -1;
 
         return mat[m];
+    }
+
+    Matrix FHEMatrix::Decrypt(Key_t key) const {
+        Matrix temp(rows, cols, batch);
+
+        for(int i = 0; i < rows; i++) {
+            for(int j = 0; j < cols; j++) {
+                Plaintext result;
+                cc->Decrypt(key.secretKey, mat[i][j], &result);
+                result->SetLength(batch);
+                temp[i][j] = result->GetRealPackedValue();
+                //std::cout << result << ",";
+            }
+            //std::cout << std::endl;
+        }
+        return temp;
     }
 }
 

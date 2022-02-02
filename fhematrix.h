@@ -15,10 +15,11 @@ using namespace lbcrypto;
 namespace fhe {
     class Matrix {
         public:
-            Matrix(int, int);
+            Matrix(int, int, int);
 
             int get_rows() const;
             int get_cols() const;
+            int get_batch() const;
 
             Matrix operator + (Matrix) const;
             Matrix operator - (Matrix) const;
@@ -26,17 +27,18 @@ namespace fhe {
             Matrix operator ^ (Matrix) const;
             Matrix operator ! () const;
             
-            double *operator[] (int);
+            vector<double> *operator[] (int);
             operator std::string() const;
         private:
             int rows;
             int cols;
-            double **mat;
+            int batch;
+            vector<double> **mat;
     };
 
     class FHEMatrix {
         public:
-            FHEMatrix(int, int, int, Matrix, CryptoContext<DCRTPoly>, Key_t);
+            FHEMatrix(Matrix, CryptoContext<DCRTPoly>, Key_t);
             
             int get_rows();
             int get_cols();
@@ -49,6 +51,8 @@ namespace fhe {
             FHEMatrix operator ! ();
 
             Ciphertext_t *operator[] (int);
+        
+            Matrix Decrypt(Key_t) const;
         private:
             FHEMatrix(int, int, int, CryptoContext<DCRTPoly>);
             int rows;
