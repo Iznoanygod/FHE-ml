@@ -8,6 +8,7 @@ namespace ml {
         public:
             Network(int, int, int, int, double);
             fhe::Matrix predict(fhe::Matrix);
+            void train(fhe::Matrix, fhe::Matrix);
         private:
             fhe::Matrix weights_ih;
             fhe::Matrix weights_ho;
