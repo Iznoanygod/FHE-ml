@@ -302,7 +302,7 @@ namespace fhe {
         return mat[m];
     }
 
-    Matrix FHEMatrix::Decrypt(Key_t key) const {
+    Matrix FHEMatrix::decrypt(Key_t key) const {
         Matrix temp(rows, cols, batch);
 
         for(int i = 0; i < rows; i++) {

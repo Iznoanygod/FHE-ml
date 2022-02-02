@@ -46,9 +46,12 @@ endif()
 ###
 ### EXAMPLE:
 add_library( fhematrix SHARED fhematrix.cpp)
-add_executable( fheml fheml.cpp )
+add_library( fheml SHARED fheml.cpp )
+add_executable( fheclient fheclient.cpp )
 
 target_link_libraries( fheml fhematrix)
+target_link_libraries( fheclient fhematrix)
+target_link_libraries( fheclient fheml)
 
 if(AVX)
     target_compile_options ( fhematrix PRIVATE -mavx2)

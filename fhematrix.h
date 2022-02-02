@@ -39,7 +39,7 @@ namespace fhe {
     class FHEMatrix {
         public:
             FHEMatrix(Matrix, CryptoContext<DCRTPoly>, Key_t);
-            
+            FHEMatrix(int, int, int, CryptoContext<DCRTPoly>);
             int get_rows();
             int get_cols();
             int get_batch();
@@ -52,9 +52,8 @@ namespace fhe {
 
             Ciphertext_t *operator[] (int);
         
-            Matrix Decrypt(Key_t) const;
+            Matrix decrypt(Key_t) const;
         private:
-            FHEMatrix(int, int, int, CryptoContext<DCRTPoly>);
             int rows;
             int cols;
             int batch;
