@@ -33,11 +33,11 @@ fhe::Matrix dsigmoid(fhe::Matrix M) {
 
 namespace ml {
     
-    Network::Network(int i, int h, int o, int batch_size, double l_rate):
-    weights_ih(fhe::Matrix(h, i, batch_size)),
-    weights_ho(fhe::Matrix(o, h, batch_size)),
-    bias_h(fhe::Matrix(h, 1, batch_size)),
-    bias_o(fhe::Matrix(o, 1, batch_size))
+    Network::Network(int i, int h, int o, double l_rate):
+    weights_ih(fhe::Matrix(h, i, 1)),
+    weights_ho(fhe::Matrix(o, h, 1)),
+    bias_h(fhe::Matrix(h, 1, 1)),
+    bias_o(fhe::Matrix(o, 1, 1))
     {
         this->l_rate = l_rate;
     }

@@ -1,6 +1,42 @@
 #include "fhematrix.h"
 
+#define MAX(a,b) a > b ? a : b
+
+vector<double> operator+(double A, vector<double> B) {
+    vector<double> temp(B.size());
+
+    for(unsigned int i = 0; i < B.size(); i++) {
+        temp[i] = A + B[i];
+    }
+
+    return temp;
+}
+
+vector<double> operator*(double A, vector<double> B) {
+    vector<double> temp(B.size());
+
+    for(unsigned int i = 0; i < B.size(); i++) {
+        temp[i] = A * B[i];
+    }
+
+    return temp;
+}
+
+vector<double> operator-(double A, vector<double> B) {
+    vector<double> temp(B.size());
+
+    for(unsigned int i = 0; i < B.size(); i++) {
+        temp[i] = A - B[i];
+    }
+    
+    return temp;
+}
+
 vector<double> operator+(vector<double> A, vector<double> B) {
+    if(A.size() == 1)
+        return A[0] + B;
+    if(B.size() == 1)
+        return B[0] + A;
     if(A.size() != B.size())
         throw -1;
 
@@ -14,6 +50,10 @@ vector<double> operator+(vector<double> A, vector<double> B) {
 }
 
 vector<double> operator*(vector<double> A, vector<double> B) {
+    if(A.size() == 1)
+        return A[0] * B;
+    if(B.size() == 1)
+        return B[0] * A;
     if(A.size() != B.size())
         throw -1;
 
@@ -27,6 +67,10 @@ vector<double> operator*(vector<double> A, vector<double> B) {
 }
 
 vector<double> operator-(vector<double> A, vector<double> B) {
+    if(A.size() == 1)
+        return A[0] - B;
+    if(B.size() == 1)
+        return -B[0] + A;
     if(A.size() != B.size())
         throw -1;
 
@@ -76,8 +120,9 @@ namespace fhe {
         if(rows != M.get_rows() || cols != M.get_cols()) {
             throw -1;
         }
-        
-        Matrix temp(rows, cols, batch);
+
+        int b = MAX(batch, M.get_batch());
+        Matrix temp(rows, cols, b);
         
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)
@@ -90,8 +135,9 @@ namespace fhe {
         if(rows != M.get_rows() || cols != M.get_cols()) {
             throw -1;
         }
-
-        Matrix temp(rows, cols, batch);
+        
+        int b = MAX(batch, M.get_batch());
+        Matrix temp(rows, cols, b);
 
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)
@@ -119,11 +165,13 @@ namespace fhe {
         if(cols != M.get_rows()){
             throw -1;
         }
-        Matrix temp(rows, M.get_cols(), batch);
+
+        int b = MAX(batch, M.get_batch());
+        Matrix temp(rows, M.get_cols(), b);
         
         for(int i = 0; i < rows; i++){
             for(int j = 0; j < M.get_cols(); j++){
-                vector<double> sum(batch);
+                vector<double> sum(b);
                 fill(sum.begin(), sum.end(), 0);
                 for(int k = 0; k < cols; k++){
                     sum += mat[i][k] * M[k][j];
@@ -141,7 +189,8 @@ namespace fhe {
             throw -1;
         }
 
-        Matrix temp(rows, cols, batch);
+        int b = MAX(batch, M.get_batch());
+        Matrix temp(rows, cols, b);
         
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)
@@ -190,19 +239,28 @@ namespace fhe {
         return val;
     }
 
-    FHEMatrix::FHEMatrix(Matrix mat, CryptoContext<DCRTPoly> cc, Key_t key) {
+    FHEMatrix::FHEMatrix(Matrix mat, int batch, CryptoContext<DCRTPoly> cc, Key_t key) {
         this->rows = mat.get_rows();
         this->cols = mat.get_cols();
-        this->batch = mat.get_batch();
+        this->batch = batch;
         this->cc = cc;
 
         this->mat = new Ciphertext_t*[rows];
         for(int i = 0; i < rows; i++) {
             this->mat[i] = new Ciphertext_t[cols];
             for(int j = 0; j < cols; j++){
-                vector<double> v = {mat[i][j]};
-                Plaintext ptxt = cc->MakeCKKSPackedPlaintext(v);
-                this->mat[i][j] = cc->Encrypt(key.publicKey, ptxt);
+                
+                if(mat[i][j].size() == 1) {
+                    vector<double> v(batch);
+                    std::fill(v.begin(), v.end(), mat[i][j][0]);
+                    Plaintext ptxt = cc->MakeCKKSPackedPlaintext(v);
+                    this->mat[i][j] = cc->Encrypt(key.publicKey, ptxt);
+                }
+                else {
+                    vector<double> v = mat[i][j];
+                    Plaintext ptxt = cc->MakeCKKSPackedPlaintext(v);
+                    this->mat[i][j] = cc->Encrypt(key.publicKey, ptxt);
+                }
             }
         }
         
@@ -237,7 +295,8 @@ namespace fhe {
             throw -1;
         }
 
-        FHEMatrix temp(rows, cols, batch, cc);
+        int b = MAX(batch, M.get_batch());
+        FHEMatrix temp(rows, cols, b, cc);
         
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)

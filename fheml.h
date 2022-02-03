@@ -6,7 +6,7 @@
 namespace ml {
     class Network {
         public:
-            Network(int, int, int, int, double);
+            Network(int, int, int, double);
             fhe::Matrix predict(fhe::Matrix);
             void train(fhe::Matrix, fhe::Matrix);
         private:

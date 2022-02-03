@@ -38,7 +38,7 @@ namespace fhe {
 
     class FHEMatrix {
         public:
-            FHEMatrix(Matrix, CryptoContext<DCRTPoly>, Key_t);
+            FHEMatrix(Matrix, int, CryptoContext<DCRTPoly>, Key_t);
             FHEMatrix(int, int, int, CryptoContext<DCRTPoly>);
             int get_rows();
             int get_cols();
