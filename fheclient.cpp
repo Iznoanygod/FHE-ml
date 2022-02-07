@@ -2,7 +2,7 @@
 #include <fstream>
 
 int main(int argc, char** argv) {
-    uint32_t multDepth = 20;
+    uint32_t multDepth = 8;
     uint32_t scaleFactorBits = 50;
     uint32_t batchSize = 1;
 
@@ -38,9 +38,9 @@ int main(int argc, char** argv) {
     delete M;
     delete M_d;
     */
-    ml::Network *net = new ml::Network(784,400,10,0.001);
+    ml::Network *net = new ml::Network(784,100,10,0.001);
     net->randomize_weights();
-    std::string line;
+    /*std::string line;
     for(int epochs = 0; epochs < 1; epochs++){
     std::ifstream training_file("../mnist_train.csv");
     int t_cout = 0;
@@ -108,13 +108,18 @@ int main(int argc, char** argv) {
     }
     double percent = correct * 100. / total;
     std::cout << percent <<std::endl;
-    
-    ml::FHENetwork *fhenet = new ml::FHENetwork(784, 400, 10, 0.001, cc);
+    */
+    std::cout << "Creating FHE Network" << std::endl;
+    ml::FHENetwork *fhenet = new ml::FHENetwork(784,100, 10, 0.001, cc);
+    std::cout << "Loading model weights" << std::endl;
     fhe::FHEMatrix *wih_e = new fhe::FHEMatrix(net->get_weights_ih(), cc, keys);
+    std::cout << "Loaded first set of weights" << std::endl;
+
     fhe::FHEMatrix *who_e = new fhe::FHEMatrix(net->get_weights_ho(), cc, keys);
     fhe::FHEMatrix *bh_e = new fhe::FHEMatrix(net->get_bias_h(), cc, keys);
     fhe::FHEMatrix *bo_e = new fhe::FHEMatrix(net->get_bias_o(), cc, keys);
     fhenet->load_weights(wih_e, who_e, bh_e, bo_e);
     
+    fhenet->full_train(NULL, NULL);
     return 0;
 }

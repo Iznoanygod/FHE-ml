@@ -191,7 +191,7 @@ namespace ml {
         return output_sigmoid;
     }
 
-    void full_train(fhe::FHEMatrix *, fhe::FHEMatrix *) {
+    void FHENetwork::full_train(fhe::FHEMatrix *, fhe::FHEMatrix *) {
 
     }
     
