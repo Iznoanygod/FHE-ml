@@ -1,18 +1,10 @@
 #include "fheml.h"
-<<<<<<< HEAD
-
-int main(int argc, char** argv) {
-    uint32_t multDepth = 1;
-    uint32_t scaleFactorBits = 50;
-    uint32_t batchSize = 2;
-=======
 #include <fstream>
 
 int main(int argc, char** argv) {
-    /*uint32_t multDepth = 8;
+    uint32_t multDepth = 20;
     uint32_t scaleFactorBits = 50;
     uint32_t batchSize = 1;
->>>>>>> 77aed8b (02.05.22)
 
     SecurityLevel securityLevel = HEStd_128_classic;
 
@@ -26,51 +18,7 @@ int main(int argc, char** argv) {
     auto keys = cc->KeyGen();
 	
     cc->EvalMultKeyGen(keys.secretKey);
-
-<<<<<<< HEAD
-    fhe::Matrix M(2,2,1);
-    M[0][0] = {1};
-    M[0][1] = {2};
-    M[1][0] = {3};
-    M[1][1] = {4};
-
-    std::cout << std::string(M) << std::endl;
-
-    fhe::Matrix N(2,2,2);
-    N[0][0] = {1,2};
-    N[0][1] = {2,4};
-    N[1][0] = {3,6};
-    N[1][1] = {4,8};
-
-    std::cout << std::string(N) << std::endl;
-
-    fhe::Matrix MpN = M+N;
-    fhe::Matrix MxN = M*N;
-
-    std::cout << std::string(MpN) << std::endl;
-    std::cout << std::string(MxN) << std::endl;
-
-    std::cout << "FHE" << std::endl;
-    fhe::FHEMatrix M_e(M,2,cc,keys);
-    fhe::FHEMatrix N_e(N,2,cc,keys);
-
-    fhe::FHEMatrix MpN_e = M_e+N_e;
-    fhe::FHEMatrix MxN_e = M_e*N_e;
-
-    fhe::Matrix M_d = M_e.decrypt(keys);
-    fhe::Matrix N_d = N_e.decrypt(keys);
-
-    fhe::Matrix MpN_d = MpN_e.decrypt(keys);
-    fhe::Matrix MxN_d = MxN_e.decrypt(keys);
-    
-    std::cout << std::string(M_d) << std::endl;
-    std::cout << std::string(N_d) << std::endl;
-    std::cout << std::string(MpN_d) << std::endl;
-    std::cout << std::string(MxN_d) << std::endl;
-
-    return 0;
-
-=======
+    /*
     fhe::Matrix *M = new fhe::Matrix(2,2);
     M->set(0,0,1);
     M->set(0,1,2);
@@ -93,7 +41,7 @@ int main(int argc, char** argv) {
     ml::Network *net = new ml::Network(784,400,10,0.001);
     net->randomize_weights();
     std::string line;
-    for(int epochs = 0; epochs < 20; epochs++){
+    for(int epochs = 0; epochs < 1; epochs++){
     std::ifstream training_file("../mnist_train.csv");
     int t_cout = 0;
     while(getline(training_file, line)) {
@@ -160,6 +108,13 @@ int main(int argc, char** argv) {
     }
     double percent = correct * 100. / total;
     std::cout << percent <<std::endl;
+    
+    ml::FHENetwork *fhenet = new ml::FHENetwork(784, 400, 10, 0.001, cc);
+    fhe::FHEMatrix *wih_e = new fhe::FHEMatrix(net->get_weights_ih(), cc, keys);
+    fhe::FHEMatrix *who_e = new fhe::FHEMatrix(net->get_weights_ho(), cc, keys);
+    fhe::FHEMatrix *bh_e = new fhe::FHEMatrix(net->get_bias_h(), cc, keys);
+    fhe::FHEMatrix *bo_e = new fhe::FHEMatrix(net->get_bias_o(), cc, keys);
+    fhenet->load_weights(wih_e, who_e, bh_e, bo_e);
+    
     return 0;
->>>>>>> 77aed8b (02.05.22)
 }

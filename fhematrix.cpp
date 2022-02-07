@@ -1,101 +1,5 @@
 #include "fhematrix.h"
 
-<<<<<<< HEAD
-#define MAX(a,b) a > b ? a : b
-
-vector<double> operator+(double A, vector<double> B) {
-    vector<double> temp(B.size());
-
-    for(unsigned int i = 0; i < B.size(); i++) {
-        temp[i] = A + B[i];
-    }
-
-    return temp;
-}
-
-vector<double> operator*(double A, vector<double> B) {
-    vector<double> temp(B.size());
-
-    for(unsigned int i = 0; i < B.size(); i++) {
-        temp[i] = A * B[i];
-    }
-
-    return temp;
-}
-
-vector<double> operator-(double A, vector<double> B) {
-    vector<double> temp(B.size());
-
-    for(unsigned int i = 0; i < B.size(); i++) {
-        temp[i] = A - B[i];
-    }
-    
-    return temp;
-}
-
-vector<double> operator+(vector<double> A, vector<double> B) {
-    if(A.size() == 1)
-        return A[0] + B;
-    if(B.size() == 1)
-        return B[0] + A;
-    if(A.size() != B.size())
-        throw -1;
-
-    vector<double> C(A.size());
-
-    for(unsigned int i = 0; i < A.size(); i++) {
-        C[i] = A[i]+B[i];
-    }
-
-    return C;
-}
-
-vector<double> operator*(vector<double> A, vector<double> B) {
-    if(A.size() == 1)
-        return A[0] * B;
-    if(B.size() == 1)
-        return B[0] * A;
-    if(A.size() != B.size())
-        throw -1;
-
-    vector<double> C(A.size());
-
-    for(unsigned int i = 0; i < A.size(); i++){
-        C[i] = A[i]*B[i];
-    }
-
-    return C;
-}
-
-vector<double> operator-(vector<double> A, vector<double> B) {
-    if(A.size() == 1)
-        return A[0] - B;
-    if(B.size() == 1)
-        return -B[0] + A;
-    if(A.size() != B.size())
-        throw -1;
-
-    vector<double> C(A.size());
-
-    for(unsigned int i = 0; i < A.size(); i++) {
-        C[i] = A[i]-B[i];
-    }
-
-    return C;
-}
-
-vector<double> & operator+=(vector<double> &A, const vector<double> &B) {
-    if(A.size() != B.size())
-        throw -1;
-
-    for(unsigned int i = 0; i < A.size(); i++) {
-        A[i] += B[i];
-    }
-    return A;
-}
-
-=======
->>>>>>> 77aed8b (02.05.22)
 namespace fhe {
     Matrix::Matrix(int rows, int cols) {
         this->rows = rows;
@@ -120,41 +24,15 @@ namespace fhe {
         return cols;
     }
 
-<<<<<<< HEAD
-    int Matrix::get_batch() const {
-        return batch;
-    }
-
-    Matrix Matrix::operator+ (Matrix M) const {
-        if(rows != M.get_rows() || cols != M.get_cols()) {
-            throw -1;
-        }
-
-        int b = MAX(batch, M.get_batch());
-        Matrix temp(rows, cols, b);
-        
-=======
     void Matrix::add(double scalar) {
->>>>>>> 77aed8b (02.05.22)
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)
                 mat[i][j] += scalar;
     }
-<<<<<<< HEAD
-    
-    Matrix Matrix::operator- (Matrix M) const {
-        if(rows != M.get_rows() || cols != M.get_cols()) {
-            throw -1;
-        }
-        
-        int b = MAX(batch, M.get_batch());
-        Matrix temp(rows, cols, b);
-=======
 
     void Matrix::add(Matrix *M) {
         if(rows != M->get_rows() || cols != M->get_cols())
             throw -1;
->>>>>>> 77aed8b (02.05.22)
 
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)
@@ -204,21 +82,6 @@ namespace fhe {
     Matrix *Matrix::multiply(Matrix *M) const{
         if(cols != M->get_rows())
             throw -1;
-<<<<<<< HEAD
-        }
-
-        int b = MAX(batch, M.get_batch());
-        Matrix temp(rows, M.get_cols(), b);
-        
-        for(int i = 0; i < rows; i++){
-            for(int j = 0; j < M.get_cols(); j++){
-                vector<double> sum(b);
-                fill(sum.begin(), sum.end(), 0);
-                for(int k = 0; k < cols; k++){
-                    sum += mat[i][k] * M[k][j];
-                }
-                temp[i][j] = sum;
-=======
 
         Matrix *temp = new Matrix(rows, M->get_cols());
         for(int i = 0; i < rows; i++) {
@@ -227,7 +90,6 @@ namespace fhe {
                 for(int k = 0; k < cols; k++)
                     sum += mat[i][k] * M->at(k,j);
                 temp->set(i,j,sum);
->>>>>>> 77aed8b (02.05.22)
             }
         }
         return temp;
@@ -244,12 +106,6 @@ namespace fhe {
     Matrix *Matrix::copy() {
         Matrix *temp = new Matrix(rows, cols);
 
-<<<<<<< HEAD
-        int b = MAX(batch, M.get_batch());
-        Matrix temp(rows, cols, b);
-        
-=======
->>>>>>> 77aed8b (02.05.22)
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)
                 temp->set(i,j,mat[i][j]);
@@ -274,40 +130,18 @@ namespace fhe {
         return val;
     }
 
-<<<<<<< HEAD
-    FHEMatrix::FHEMatrix(Matrix mat, int batch, CryptoContext<DCRTPoly> cc, Key_t key) {
-        this->rows = mat.get_rows();
-        this->cols = mat.get_cols();
-        this->batch = batch;
-=======
     FHEMatrix::FHEMatrix(Matrix *mat, CryptoContext<DCRTPoly> cc, Key_t key) {
         this->rows = mat->get_rows();
         this->cols = mat->get_cols();
->>>>>>> 77aed8b (02.05.22)
         this->cc = cc;
 
         this->mat = new Ciphertext_t*[rows];
         for(int i = 0; i < rows; i++) {
             this->mat[i] = new Ciphertext_t[cols];
             for(int j = 0; j < cols; j++){
-<<<<<<< HEAD
-                
-                if(mat[i][j].size() == 1) {
-                    vector<double> v(batch);
-                    std::fill(v.begin(), v.end(), mat[i][j][0]);
-                    Plaintext ptxt = cc->MakeCKKSPackedPlaintext(v);
-                    this->mat[i][j] = cc->Encrypt(key.publicKey, ptxt);
-                }
-                else {
-                    vector<double> v = mat[i][j];
-                    Plaintext ptxt = cc->MakeCKKSPackedPlaintext(v);
-                    this->mat[i][j] = cc->Encrypt(key.publicKey, ptxt);
-                }
-=======
                 vector<double> v = {mat->at(i,j)};
                 Plaintext ptxt = cc->MakeCKKSPackedPlaintext(v);
                 this->mat[i][j] = cc->Encrypt(key.publicKey, ptxt);
->>>>>>> 77aed8b (02.05.22)
             }
         }
         
@@ -330,30 +164,19 @@ namespace fhe {
         delete[] mat;
     }
 
-    int FHEMatrix::get_rows() {
+    int FHEMatrix::get_rows() const {
         return rows;
     }
     
-    int FHEMatrix::get_cols() {
+    int FHEMatrix::get_cols() const {
         return cols;
     }
 
-<<<<<<< HEAD
-    int FHEMatrix::get_batch() {
-        return batch;
+    CryptoContext<DCRTPoly> FHEMatrix::get_cc() const {
+        return cc;
     }
 
-    FHEMatrix FHEMatrix::operator+ (FHEMatrix M) {
-        if(rows != M.get_rows() || cols != M.get_cols()) {
-            throw -1;
-        }
-
-        int b = MAX(batch, M.get_batch());
-        FHEMatrix temp(rows, cols, b, cc);
-        
-=======
     void FHEMatrix::add(double scalar) {
->>>>>>> 77aed8b (02.05.22)
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)
                 mat[i][j] = cc->EvalAdd(mat[i][j], scalar);
@@ -429,13 +252,8 @@ namespace fhe {
         mat[m][n] = c;
     }
 
-<<<<<<< HEAD
-    Matrix FHEMatrix::decrypt(Key_t key) const {
-        Matrix temp(rows, cols, batch);
-=======
     Matrix *FHEMatrix::decrypt(Key_t key) const {
         Matrix *temp = new Matrix(rows, cols);
->>>>>>> 77aed8b (02.05.22)
 
         for(int i = 0; i < rows; i++) {
             for(int j = 0; j < cols; j++) {

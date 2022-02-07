@@ -52,13 +52,9 @@ add_executable( fheclient fheclient.cpp )
 target_link_libraries( fheml fhematrix)
 target_link_libraries( fheclient fhematrix)
 target_link_libraries( fheclient fheml)
-<<<<<<< HEAD
-
-=======
 target_compile_options( fhematrix PRIVATE -g)
 target_compile_options( fheml PRIVATE -g)
 target_compile_options( fheclient PRIVATE -g)
->>>>>>> 77aed8b (02.05.22)
 if(AVX)
     target_compile_options ( fhematrix PRIVATE -mavx2)
 endif()

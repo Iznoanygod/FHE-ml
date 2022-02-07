@@ -42,16 +42,12 @@ namespace fhe {
 
     class FHEMatrix {
         public:
-<<<<<<< HEAD
-            FHEMatrix(Matrix, int, CryptoContext<DCRTPoly>, Key_t);
-            FHEMatrix(int, int, int, CryptoContext<DCRTPoly>);
-=======
             FHEMatrix(Matrix *, CryptoContext<DCRTPoly>, Key_t);
             FHEMatrix(int, int, CryptoContext<DCRTPoly>);
             ~FHEMatrix();
->>>>>>> 77aed8b (02.05.22)
-            int get_rows();
-            int get_cols();
+            int get_rows() const;
+            int get_cols() const;
+            CryptoContext<DCRTPoly> get_cc() const;
 
             void add(double);
             void add(FHEMatrix *);
@@ -65,11 +61,7 @@ namespace fhe {
             Ciphertext_t at(int, int) const;
             void set(int, int, Ciphertext_t);
         
-<<<<<<< HEAD
-            Matrix decrypt(Key_t) const;
-=======
             Matrix *decrypt(Key_t) const;
->>>>>>> 77aed8b (02.05.22)
         private:
             int rows;
             int cols;

@@ -7,39 +7,32 @@ namespace ml {
     class Network {
         public:
             Network(int, int, int, double);
-<<<<<<< HEAD
-            fhe::Matrix predict(fhe::Matrix);
-            void train(fhe::Matrix, fhe::Matrix);
-        private:
-            fhe::Matrix weights_ih;
-            fhe::Matrix weights_ho;
-            fhe::Matrix bias_h;
-            fhe::Matrix bias_o;
-=======
             fhe::Matrix *predict(fhe::Matrix *);
             void train(fhe::Matrix *, fhe::Matrix *);
             void randomize_weights();
+            fhe::Matrix *get_weights_ih();
+            fhe::Matrix *get_weights_ho();
+            fhe::Matrix *get_bias_h();
+            fhe::Matrix *get_bias_o();
         private:
             fhe::Matrix *weights_ih;
             fhe::Matrix *weights_ho;
             fhe::Matrix *bias_h;
             fhe::Matrix *bias_o;
->>>>>>> 77aed8b (02.05.22)
             double l_rate;
     };
     class FHENetwork {
+        public:
+            FHENetwork(int, int, int, double, CryptoContext<DCRTPoly>);
+            fhe::FHEMatrix *predict(fhe::FHEMatrix *);
+            void full_train(fhe::FHEMatrix *, fhe::FHEMatrix *);
+            void load_weights(fhe::FHEMatrix *, fhe::FHEMatrix*,
+                    fhe::FHEMatrix *, fhe::FHEMatrix *);
         private:
-<<<<<<< HEAD
-            fhe::FHEMatrix weights_ih;
-            fhe::FHEMatrix weights_oh;
-            fhe::FHEMatrix bias_h;
-            fhe::FHEMatrix bias_o;
-=======
             fhe::FHEMatrix *weights_ih;
-            fhe::FHEMatrix *weights_oh;
+            fhe::FHEMatrix *weights_ho;
             fhe::FHEMatrix *bias_h;
             fhe::FHEMatrix *bias_o;
->>>>>>> 77aed8b (02.05.22)
             double l_rate;
     };
 }

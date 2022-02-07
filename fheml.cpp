@@ -2,35 +2,6 @@
 #include <math.h>
  #include <numeric>
 
-<<<<<<< HEAD
-fhe::Matrix sigmoid(fhe::Matrix M) {
-    fhe::Matrix temp(M.get_rows(), M.get_cols(), M.get_batch());
-
-    for(int i = 0; i < temp.get_rows(); i++) {
-        for(int j = 0; j < temp.get_rows(); j++) {
-            vector<double> sig(M.get_batch());
-
-            for(int k = 0; k < M.get_batch(); k++){
-                sig[k] = 1. / (1 + exp(-M[i][j][k]));
-            }
-            
-            temp[i][j] = sig;
-        }
-    }
-    
-    return temp;
-}
-
-fhe::Matrix dsigmoid(fhe::Matrix M) {
-    fhe::Matrix sig = sigmoid(M);
-    fhe::Matrix ones(sig.get_rows(), sig.get_cols(), sig.get_batch());
-    for(int i = 0; i < ones.get_rows(); i++){
-        for(int j = 0; j < ones.get_cols(); j++){
-            std::fill(ones[i][j].begin(), ones[i][j].end(), 1.0);
-        }
-    }
-    return sig * (ones - sig);
-=======
 fhe::Matrix *sigmoid(const fhe::Matrix *M) {
     fhe::Matrix *temp = new fhe::Matrix(M->get_rows(), M->get_cols());
     
@@ -46,6 +17,7 @@ fhe::Matrix *sigmoid(const fhe::Matrix *M) {
 
 fhe::Matrix *dsigmoid(const fhe::Matrix *M) {
     fhe::Matrix *sig = sigmoid(M);
+    
     for(int i = 0; i < sig->get_rows(); i++){
         for(int j = 0; j < sig->get_cols(); j++){
             double s = sig->at(i,j);
@@ -54,52 +26,40 @@ fhe::Matrix *dsigmoid(const fhe::Matrix *M) {
     }
     
     return sig;
->>>>>>> 77aed8b (02.05.22)
+}
+
+fhe::FHEMatrix *sigmoid(const fhe::FHEMatrix *M) {
+    fhe::FHEMatrix *temp = new fhe::FHEMatrix(M->get_rows(), M->get_cols(), M->get_cc());
+    
+    for(int i = 0; i < temp->get_rows(); i++) {
+        for(int j = 0; j < temp->get_cols(); j++) {
+            Ciphertext_t ct = M->at(i,j);
+            Ciphertext_t sig = M->get_cc()->EvalPoly(ct, {0.000186759, 0.0, -0.0098156, 0.0, 0.22769, 0.5});
+            temp->set(i,j,sig);
+        }
+    }
+
+    return temp;
+}
+
+fhe::FHEMatrix *dsigmoid(const fhe::FHEMatrix *M) {
+    fhe::FHEMatrix *temp = new fhe::FHEMatrix(M->get_rows(), M->get_cols(), M->get_cc());
+
+    for(int i = 0; i < temp->get_rows(); i++) {
+        for(int j = 0; j < temp->get_cols(); j++) {
+            CryptoContext<DCRTPoly> cc = M->get_cc();
+            Ciphertext_t ct = M->at(i,j);
+
+            Ciphertext_t dsig = cc->EvalPoly(ct, {0.000933795, 0.0, -0.0294468, 0.0, 0.227692});
+            
+        }
+    }
+
+    return temp;
 }
 
 namespace ml {
     
-<<<<<<< HEAD
-    Network::Network(int i, int h, int o, double l_rate):
-    weights_ih(fhe::Matrix(h, i, 1)),
-    weights_ho(fhe::Matrix(o, h, 1)),
-    bias_h(fhe::Matrix(h, 1, 1)),
-    bias_o(fhe::Matrix(o, 1, 1))
-    {
-        this->l_rate = l_rate;
-    }
-
-    fhe::Matrix Network::predict(fhe::Matrix input) {
-        fhe::Matrix hidden = weights_ih * input;
-        hidden = hidden + bias_h;
-        hidden = sigmoid(hidden);
-
-        fhe::Matrix output = weights_ho * hidden;
-        output = output + bias_o;
-        output = sigmoid(output);
-
-        return output;
-    }
-
-    void Network::train(fhe::Matrix input, fhe::Matrix target) {
-        fhe::Matrix output = predict(input);
-
-        fhe::Matrix error_batch = target - output;
-
-        fhe::Matrix error(error_batch.get_rows(), error_batch.get_cols(),
-                error_batch.get_batch());
-        for(int i = 0; i < error_batch.get_rows(); i++){
-            for(int j = 0; j < error_batch.get_cols(); j++){
-                double sum = std::accumulate(error_batch[i][j].begin(),
-                        error_batch[i][j].end(), 0.0f);
-                std::fill(error[i][j].begin(), error[i][j].end(), sum);
-            }
-        }
-
-        fhe::Matrix gradient = dsigmoid(output);
-        gradient = gradient ^ error;
-
-=======
     Network::Network(int i, int h, int o, double l_rate) {
         this->weights_ih = new fhe::Matrix(h, i);
         this->weights_ho = new fhe::Matrix(o, h);
@@ -189,6 +149,58 @@ namespace ml {
         for(int i = 0; i < bias_o->get_rows(); i++)
             for(int j = 0; j < bias_o->get_cols(); j++)
                 bias_o->set(i,j,((double)rand()/(double)RAND_MAX) * 2 - 1);
->>>>>>> 77aed8b (02.05.22)
     }
+    
+    fhe::Matrix *Network::get_weights_ih() {
+        return weights_ih;
+    }
+
+    fhe::Matrix *Network::get_weights_ho() {
+        return weights_ho;
+    }
+
+    fhe::Matrix *Network::get_bias_h() {
+        return bias_h;
+    }
+
+    fhe::Matrix *Network::get_bias_o() {
+        return bias_o;
+    }
+
+    FHENetwork::FHENetwork(int i, int h, int o, double l_rate,
+            CryptoContext<DCRTPoly> cc) {
+        this->weights_ih = new fhe::FHEMatrix(h, i, cc);
+        this->weights_ho = new fhe::FHEMatrix(o, h, cc);
+        this->bias_h = new fhe::FHEMatrix(h, 1, cc);
+        this->bias_o = new fhe::FHEMatrix(o, 1, cc);
+        this->l_rate = l_rate;
+    }
+
+    fhe::FHEMatrix *FHENetwork::predict(fhe::FHEMatrix *input) {
+        fhe::FHEMatrix *hidden = weights_ih->multiply(input);
+        hidden->add(bias_h);
+        fhe::FHEMatrix *hidden_sigmoid = sigmoid(hidden);
+
+        fhe::FHEMatrix *output = weights_ho->multiply(hidden_sigmoid);
+        output->add(bias_o);
+        fhe::FHEMatrix *output_sigmoid = sigmoid(output);
+
+        delete hidden;
+        delete hidden_sigmoid;
+        delete output;
+        return output_sigmoid;
+    }
+
+    void full_train(fhe::FHEMatrix *, fhe::FHEMatrix *) {
+
+    }
+    
+    void FHENetwork::load_weights(fhe::FHEMatrix *ih, fhe::FHEMatrix *ho,
+            fhe::FHEMatrix *bh, fhe::FHEMatrix *bo) {
+        weights_ih = ih;
+        weights_ho = ho;
+        bias_h = bh;
+        bias_o = bo;
+    }
+
 }
