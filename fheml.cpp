@@ -68,6 +68,13 @@ namespace ml {
         this->l_rate = l_rate;
     }
 
+    Network::~Network() {
+        delete this->weights_ih;
+        delete this->weights_ho;
+        delete this->bias_h;
+        delete this->bias_o;
+    }
+
     fhe::Matrix *Network::predict(fhe::Matrix *input) {
         fhe::Matrix *hidden = weights_ih->multiply(input);
         hidden->add(bias_h);
@@ -174,6 +181,13 @@ namespace ml {
         this->bias_h = new fhe::FHEMatrix(h, 1, cc);
         this->bias_o = new fhe::FHEMatrix(o, 1, cc);
         this->l_rate = l_rate;
+    }
+
+    FHENetwork::~FHENetwork() {
+        delete this->weights_ih;
+        delete this->weights_ho;
+        delete this->bias_h;
+        delete this->bias_o;
     }
 
     fhe::FHEMatrix *FHENetwork::predict(fhe::FHEMatrix *input) {

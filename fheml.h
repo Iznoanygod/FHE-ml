@@ -7,6 +7,7 @@ namespace ml {
     class Network {
         public:
             Network(int, int, int, double);
+            ~Network();
             fhe::Matrix *predict(fhe::Matrix *);
             void train(fhe::Matrix *, fhe::Matrix *);
             void randomize_weights();
@@ -24,6 +25,7 @@ namespace ml {
     class FHENetwork {
         public:
             FHENetwork(int, int, int, double, CryptoContext<DCRTPoly>);
+            ~FHENetwork();
             fhe::FHEMatrix *predict(fhe::FHEMatrix *);
             void full_train(fhe::FHEMatrix *, fhe::FHEMatrix *);
             void load_weights(fhe::FHEMatrix *, fhe::FHEMatrix*,

@@ -2,8 +2,8 @@
 #include <fstream>
 
 int main(int argc, char** argv) {
-    uint32_t multDepth = 8;
-    uint32_t scaleFactorBits = 50;
+    uint32_t multDepth = 1;
+    uint32_t scaleFactorBits = 20;
     uint32_t batchSize = 1;
 
     SecurityLevel securityLevel = HEStd_128_classic;
@@ -16,10 +16,18 @@ int main(int argc, char** argv) {
 	cc->Enable(SHE);
 
     auto keys = cc->KeyGen();
-	
+    
     cc->EvalMultKeyGen(keys.secretKey);
-    /*
-    fhe::Matrix *M = new fhe::Matrix(2,2);
+    std::cout << sizeof(Ciphertext_t) << std::endl;
+    
+    //vector<double> vectxt = {0.1, 0.2, 0.3};
+
+    //auto ptxt = cc->MakeCKKSPackedPlaintext(vectxt);
+
+    //auto ctxt = cc->Encrypt(keys.publicKey, ptxt);
+
+    //std::cout << sizeof(ctxt) << std::endl;
+    /*fhe::Matrix *M = new fhe::Matrix(2,2);
     M->set(0,0,1);
     M->set(0,1,2);
     M->set(1,0,3);
@@ -38,7 +46,7 @@ int main(int argc, char** argv) {
     delete M;
     delete M_d;
     */
-    ml::Network *net = new ml::Network(784,100,10,0.001);
+    ml::Network *net = new ml::Network(10,10,10,0.001);
     net->randomize_weights();
     /*std::string line;
     for(int epochs = 0; epochs < 1; epochs++){
@@ -110,16 +118,20 @@ int main(int argc, char** argv) {
     std::cout << percent <<std::endl;
     */
     std::cout << "Creating FHE Network" << std::endl;
-    ml::FHENetwork *fhenet = new ml::FHENetwork(784,100, 10, 0.001, cc);
+    ml::FHENetwork *fhenet = new ml::FHENetwork(10, 10, 10, 0.001, cc);
     std::cout << "Loading model weights" << std::endl;
     fhe::FHEMatrix *wih_e = new fhe::FHEMatrix(net->get_weights_ih(), cc, keys);
     std::cout << "Loaded first set of weights" << std::endl;
-
-    fhe::FHEMatrix *who_e = new fhe::FHEMatrix(net->get_weights_ho(), cc, keys);
-    fhe::FHEMatrix *bh_e = new fhe::FHEMatrix(net->get_bias_h(), cc, keys);
-    fhe::FHEMatrix *bo_e = new fhe::FHEMatrix(net->get_bias_o(), cc, keys);
-    fhenet->load_weights(wih_e, who_e, bh_e, bo_e);
+    wih_e->multiply(1.0);
+    //fhe::FHEMatrix *who_e = new fhe::FHEMatrix(net->get_weights_ho(), cc, keys);
+    //fhe::FHEMatrix *bh_e = new fhe::FHEMatrix(net->get_bias_h(), cc, keys);
+    //fhe::FHEMatrix *bo_e = new fhe::FHEMatrix(net->get_bias_o(), cc, keys);
+    //fhenet->load_weights(wih_e, who_e, bh_e, bo_e);
     
     fhenet->full_train(NULL, NULL);
+    delete fhenet;
+    delete net;
+    delete wih_e;
+    
     return 0;
 }

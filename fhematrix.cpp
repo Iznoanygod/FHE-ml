@@ -134,15 +134,14 @@ namespace fhe {
         this->rows = mat->get_rows();
         this->cols = mat->get_cols();
         this->cc = cc;
-        std::cout << rows << std::endl;
         this->mat = new Ciphertext_t*[rows];
         for(int i = 0; i < rows; i++) {
             this->mat[i] = new Ciphertext_t[cols];
-            std::cout << i << std::endl;
             for(int j = 0; j < cols; j++){
                 vector<double> v = {mat->at(i,j)};
                 Plaintext ptxt = cc->MakeCKKSPackedPlaintext(v);
                 this->mat[i][j] = cc->Encrypt(key.publicKey, ptxt);
+                v.clear();
             }
         }
         
