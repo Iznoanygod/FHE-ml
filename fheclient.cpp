@@ -48,9 +48,9 @@ int main(int argc, char** argv) {
     ml::Network *net = new ml::Network(784,200,10,0.005);
     //net->randomize_weights();
     //net->save("net.nf");
-    net->load("net1.nf");
+    //net->load("net1.nf");
     std::string line;
-    /*for(int epochs = 0; epochs < 1; epochs++){
+    for(int epochs = 0; epochs < 1; epochs++){
     std::ifstream training_file("../mnist_train.csv");
     int t_cout = 0;
     while(getline(training_file, line)) {
@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
         }
         t_cout++;
     }
-    }*/
+    }
     std::ifstream test_file("../mnist_test.csv");
     int correct = 0;
     int total = 0;
