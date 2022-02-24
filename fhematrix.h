@@ -32,6 +32,7 @@ namespace fhe {
             double at(int, int) const;
             void set(int, int, double);
             
+            double **get_mat();
             Matrix *copy();
             std::string toString() const;
         private:

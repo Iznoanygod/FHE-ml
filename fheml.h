@@ -11,6 +11,8 @@ namespace ml {
             fhe::Matrix *predict(fhe::Matrix *);
             void train(fhe::Matrix *, fhe::Matrix *);
             void randomize_weights();
+            void save(std::string);
+            void load(std::string);
             fhe::Matrix *get_weights_ih();
             fhe::Matrix *get_weights_ho();
             fhe::Matrix *get_bias_h();

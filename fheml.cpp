@@ -1,6 +1,7 @@
 #include "fheml.h"
 #include <math.h>
- #include <numeric>
+#include <numeric>
+#include <cstdio>
 
 fhe::Matrix *sigmoid(const fhe::Matrix *M) {
     fhe::Matrix *temp = new fhe::Matrix(M->get_rows(), M->get_cols());
@@ -158,6 +159,69 @@ namespace ml {
                 bias_o->set(i,j,((double)rand()/(double)RAND_MAX) * 2 - 1);
     }
     
+    void Network::save(std::string file_name) {
+        FILE *fp = fopen(file_name.c_str(), "w");
+        int input_size = weights_ih->get_cols();
+        int hidden_size = weights_ih->get_rows();
+        int output_size = weights_ho->get_rows();
+        fwrite(&input_size, sizeof(input_size), 1, fp);
+        fwrite(&hidden_size, sizeof(hidden_size), 1, fp);
+        fwrite(&output_size, sizeof(output_size), 1, fp);
+        fwrite(&l_rate, sizeof(l_rate), 1, fp);
+        double **ih_mat = weights_ih->get_mat();
+        double **ho_mat = weights_ho->get_mat();
+        for(int i = 0; i < weights_ih->get_rows(); i++) {
+            fwrite(ih_mat[i], sizeof(*ih_mat[i]), weights_ih->get_cols(), fp);
+        }
+        for(int i = 0; i < weights_ho->get_rows(); i++) {
+            fwrite(ho_mat[i], sizeof(*ho_mat[i]), weights_ho->get_cols(), fp);
+        }
+        double **bh_mat = bias_h->get_mat();
+        double **bo_mat = bias_o->get_mat();
+        for(int i = 0; i < bias_h->get_rows(); i++) {
+            fwrite(bh_mat[i], sizeof(*bh_mat[i]), bias_h->get_cols(), fp);
+        }
+        for(int i = 0; i < bias_o->get_rows(); i++) {
+            fwrite(bo_mat[i], sizeof(*bh_mat[i]), bias_o->get_cols(), fp);
+        }
+
+        fclose(fp);
+    }
+
+    void Network::load(std::string file_name) {
+        FILE *fp = fopen(file_name.c_str(), "r");
+        if(fp == NULL){
+            std::cout << "Error: file doesn't exist" << std::endl;
+            throw -1;
+        }
+        int input_size;
+        int hidden_size;
+        int output_size;
+        double l_rate;
+
+        fread(&input_size, sizeof(input_size), 1, fp);
+        fread(&hidden_size, sizeof(hidden_size), 1, fp);
+        fread(&output_size, sizeof(output_size), 1, fp);
+        fread(&l_rate, sizeof(l_rate), 1, fp);
+        double **ih_mat = weights_ih->get_mat();
+        double **ho_mat = weights_ho->get_mat();
+        for(int i = 0; i < weights_ih->get_rows(); i++) {
+            fread(ih_mat[i], sizeof(*ih_mat[i]), weights_ih->get_cols(), fp);
+        }
+        for(int i = 0; i < weights_ho->get_rows(); i++) {
+            fread(ho_mat[i], sizeof(*ho_mat[i]), weights_ho->get_cols(), fp);
+        }
+        double **bh_mat = bias_h->get_mat();
+        double **bo_mat = bias_o->get_mat();
+        for(int i = 0; i < bias_h->get_rows(); i++) {
+            fread(bh_mat[i], sizeof(*bh_mat[i]), bias_h->get_cols(), fp);
+        }
+        for(int i = 0; i < bias_o->get_rows(); i++) {
+            fread(bo_mat[i], sizeof(*bh_mat[i]), bias_o->get_cols(), fp);
+        }
+        fclose(fp);
+    }
+
     fhe::Matrix *Network::get_weights_ih() {
         return weights_ih;
     }
@@ -211,6 +275,11 @@ namespace ml {
     
     void FHENetwork::load_weights(fhe::FHEMatrix *ih, fhe::FHEMatrix *ho,
             fhe::FHEMatrix *bh, fhe::FHEMatrix *bo) {
+        delete this->weights_ih;
+        delete this->weights_ho;
+        delete this->bias_h;
+        delete this->bias_o;
+
         weights_ih = ih;
         weights_ho = ho;
         bias_h = bh;

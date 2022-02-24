@@ -103,6 +103,10 @@ namespace fhe {
         mat[m][n] = j;
     }
 
+    double **Matrix::get_mat() {
+        return mat;
+    }
+
     Matrix *Matrix::copy() {
         Matrix *temp = new Matrix(rows, cols);
 
