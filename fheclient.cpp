@@ -2,6 +2,7 @@
 #include <fstream>
 
 int main(int argc, char** argv) {
+    // TODO add cryptocontexts of different batch sizes
     uint32_t multDepth = 1;
     uint32_t scaleFactorBits = 20;
     uint32_t batchSize = 1;
@@ -82,7 +83,7 @@ int main(int argc, char** argv) {
         t_cout++;
     }
     }*/
-    std::ifstream test_file("../mnist_test.csv");
+    /*std::ifstream test_file("../mnist_test.csv");
     int correct = 0;
     int total = 0;
     while(getline(test_file, line)) {
@@ -117,17 +118,12 @@ int main(int argc, char** argv) {
     }
     double percent = correct * 100. / total;
     std::cout << percent <<std::endl;
-    net->save("net1.nf");
+    */
+    //net->save("net1.nf");
     fhe::FHEMatrix *wih_e = new fhe::FHEMatrix(net->get_weights_ih(), cc, keys);
     std::cout << "Matrix 1" << std::endl;
     fhe::FHEMatrix *who_e = new fhe::FHEMatrix(net->get_weights_ho(), cc, keys);
     std::cout << "Matrix 2" << std::endl;
-    fhe::FHEMatrix *bh_e = new fhe::FHEMatrix(net->get_bias_h(), cc, keys);
-    std::cout << "Matrix 3" << std::endl;
-    fhe::FHEMatrix *bo_e = new fhe::FHEMatrix(net->get_bias_o(), cc, keys);
-    std::cout << "Matrices created" << std::endl;
-    ml::FHENetwork *fhenet = new ml::FHENetwork(784,200,10,0.005,cc);
-    fhenet->load_weights(wih_e, who_e, bh_e, bo_e);
     
     return 0;
 }

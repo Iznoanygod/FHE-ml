@@ -29,34 +29,14 @@ fhe::Matrix *dsigmoid(const fhe::Matrix *M) {
     return sig;
 }
 
-fhe::FHEMatrix *sigmoid(const fhe::FHEMatrix *M) {
-    fhe::FHEMatrix *temp = new fhe::FHEMatrix(M->get_rows(), M->get_cols(), M->get_cc());
-    
-    for(int i = 0; i < temp->get_rows(); i++) {
-        for(int j = 0; j < temp->get_cols(); j++) {
-            Ciphertext_t ct = M->at(i,j);
-            Ciphertext_t sig = M->get_cc()->EvalPoly(ct, {0.000186759, 0.0, -0.0098156, 0.0, 0.22769, 0.5});
-            temp->set(i,j,sig);
-        }
-    }
-
-    return temp;
+Ciphertext<DCRTPoly> sigmoid(const Ciphertext<DCRTPoly> v, CryptoContext<DCRTPoly> cc) {
+    Ciphertext<DCRTPoly> sig = cc->EvalPoly(v, {0.000186759, 0.0, -0.0098156, 0.0, 0.22769, 0.5});
+    return sig;
 }
 
-fhe::FHEMatrix *dsigmoid(const fhe::FHEMatrix *M) {
-    fhe::FHEMatrix *temp = new fhe::FHEMatrix(M->get_rows(), M->get_cols(), M->get_cc());
-
-    for(int i = 0; i < temp->get_rows(); i++) {
-        for(int j = 0; j < temp->get_cols(); j++) {
-            CryptoContext<DCRTPoly> cc = M->get_cc();
-            Ciphertext_t ct = M->at(i,j);
-
-            Ciphertext_t dsig = cc->EvalPoly(ct, {0.000933795, 0.0, -0.0294468, 0.0, 0.227692});
-            
-        }
-    }
-
-    return temp;
+Ciphertext<DCRTPoly> dsigmoid(const Ciphertext<DCRTPoly> v, CryptoContext<DCRTPoly> cc) {
+    Ciphertext<DCRTPoly> dsig = cc->EvalPoly(v, {0.000933795, 0.0, -0.0294468, 0.0, 0.227692});
+    return dsig;
 }
 
 namespace ml {
@@ -242,30 +222,54 @@ namespace ml {
             CryptoContext<DCRTPoly> cc) {
         this->weights_ih = new fhe::FHEMatrix(h, i, cc);
         this->weights_ho = new fhe::FHEMatrix(o, h, cc);
-        this->bias_h = new fhe::FHEMatrix(h, 1, cc);
-        this->bias_o = new fhe::FHEMatrix(o, 1, cc);
+        //this->bias_h = new fhe::FHEMatrix(h, 1, cc);
+        //this->bias_o = new fhe::FHEMatrix(o, 1, cc);
         this->l_rate = l_rate;
+        this->cc = cc;
+    }
+
+    FHENetwork::FHENetwork(Network *n, CryptoContext<DCRTPoly> cc){
+        this->weights_ih = new fhe::FHEMatrix(n->get_weights_ih());
+        this->weights_ho = new fhe::FHEMatrix(n->get_weights_ho());
+        
+        double** mat_bh = n->get_bias_h()->get_mat();
+        vector<double> bh_vector;
+        bh_vector.resize(n->get_bias_h()->get_rows());
+        for(int i = 0; i < n->get_bias_h()->get_rows(); i++){
+            bh_vector[i] = mat_bh[i][0];
+        }
+        
+        double** mat_bo = n->get_bias_o()->get_mat();
+        vector<double> bo_vector;
+        bo_vector.resize(n->get_bias_o()->get_rows());
+        for(int i = 0; i < n->get_bias_o()->get_rows(); i++){
+            bo_vector[i] = mat_bo[i][0];
+        }
+
+        Plaintext ptxt_bh = cc->MakeCKKSPackedPlaintext(bh_vector);
+        this->l_rate = l_rate;
+        this->cc = cc;
     }
 
     FHENetwork::~FHENetwork() {
         delete this->weights_ih;
         delete this->weights_ho;
-        delete this->bias_h;
-        delete this->bias_o;
+        //delete this->bias_h;
+        //delete this->bias_o;
     }
 
-    fhe::FHEMatrix *FHENetwork::predict(fhe::FHEMatrix *input) {
-        fhe::FHEMatrix *hidden = weights_ih->multiply(input);
-        hidden->add(bias_h);
-        fhe::FHEMatrix *hidden_sigmoid = sigmoid(hidden);
+    Ciphertext<DCRTPoly> FHENetwork::predict(Ciphertext<DCRTPoly> input) {
+        Ciphertext<DCRTPoly> hidden = weights_ih->multiply(input);
+        hidden = cc->EvalAdd(bias_h, hidden);
+        Ciphertext<DCRTPoly> hidden_sigmoid = sigmoid(hidden, cc);
 
-        fhe::FHEMatrix *output = weights_ho->multiply(hidden_sigmoid);
-        output->add(bias_o);
-        fhe::FHEMatrix *output_sigmoid = sigmoid(output);
-
-        delete hidden;
-        delete hidden_sigmoid;
-        delete output;
+        Ciphertext<DCRTPoly> output = weights_ho->multiply(hidden_sigmoid);
+        output = cc->EvalAdd(bias_o, hidden);
+        Ciphertext<DCRTPoly> output_sigmoid = sigmoid(output, cc);
+    
+        //delete hidden;
+        //delete hidden_sigmoid;
+        //delete output;
         return output_sigmoid;
     }
 
@@ -274,11 +278,9 @@ namespace ml {
     }
     
     void FHENetwork::load_weights(fhe::FHEMatrix *ih, fhe::FHEMatrix *ho,
-            fhe::FHEMatrix *bh, fhe::FHEMatrix *bo) {
+            Ciphertext<DCRTPoly> bh, Ciphertext<DCRTPoly> bo) {
         delete this->weights_ih;
         delete this->weights_ho;
-        delete this->bias_h;
-        delete this->bias_o;
 
         weights_ih = ih;
         weights_ho = ho;

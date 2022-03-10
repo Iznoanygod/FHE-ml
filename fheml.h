@@ -3,12 +3,15 @@
 
 #include "fhematrix.h"
 
+#define VECTOR_LENGTH 32
+
 namespace ml {
     class Network {
         public:
             Network(int, int, int, double);
             ~Network();
             fhe::Matrix *predict(fhe::Matrix *);
+            fhe::FHEMatrix *predict(fhe::FHEMatrix *);
             void train(fhe::Matrix *, fhe::Matrix *);
             void randomize_weights();
             void save(std::string);
@@ -27,16 +30,18 @@ namespace ml {
     class FHENetwork {
         public:
             FHENetwork(int, int, int, double, CryptoContext<DCRTPoly>);
+            FHENetwork(Network, CryptoContext<DCRTPoly>);
             ~FHENetwork();
-            fhe::FHEMatrix *predict(fhe::FHEMatrix *);
+            Ciphertext<DCRTPoly> predict(Ciphertext<DCRTPoly>);
             void full_train(fhe::FHEMatrix *, fhe::FHEMatrix *);
             void load_weights(fhe::FHEMatrix *, fhe::FHEMatrix*,
-                    fhe::FHEMatrix *, fhe::FHEMatrix *);
+                    Ciphertext<DCRTPoly>, Ciphertext<DCRTPoly>);
         private:
             fhe::FHEMatrix *weights_ih;
             fhe::FHEMatrix *weights_ho;
-            fhe::FHEMatrix *bias_h;
-            fhe::FHEMatrix *bias_o;
+            Ciphertext<DCRTPoly> bias_h;
+            Ciphertext<DCRTPoly> bias_o;
+            CryptoContext<DCRTPoly> cc;
             double l_rate;
     };
 }

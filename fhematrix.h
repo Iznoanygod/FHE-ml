@@ -9,7 +9,6 @@
 
 using namespace lbcrypto;
 
-#define Ciphertext_t Ciphertext<DCRTPolyImpl<bigintfxd::BigVectorImpl<bigintfxd::BigInteger<unsigned int, BigIntegerBitLength>>>>
 #define Key_t LPKeyPair<DCRTPolyImpl<bigintfxd::BigVectorImpl<bigintfxd::BigInteger<unsigned int, BigIntegerBitLength>>>>
 
 namespace fhe {
@@ -57,17 +56,18 @@ namespace fhe {
             FHEMatrix *T();
             void multiply(double);
             void element_multiply(FHEMatrix *);
+            Ciphertext<DCRTPoly> multiply(Ciphertext<DCRTPoly>);
             FHEMatrix *multiply(FHEMatrix *) const;
 
-            Ciphertext_t at(int, int) const;
-            void set(int, int, Ciphertext_t);
+            Ciphertext<DCRTPoly> at(int) const;
+            void set(int, Ciphertext<DCRTPoly>);
         
             Matrix *decrypt(Key_t) const;
         private:
             int rows;
             int cols;
             CryptoContext<DCRTPoly> cc;
-            Ciphertext_t **mat;
+            Ciphertext<DCRTPoly> *mat;
     };
 }
 #endif
