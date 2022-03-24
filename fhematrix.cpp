@@ -223,13 +223,15 @@ namespace fhe {
 
     Ciphertext<DCRTPoly> FHEMatrix::multiply(Ciphertext<DCRTPoly> v){
         vector<Ciphertext<DCRTPoly>> ct;
-        ct.resize(rows);
         for(int i = 0; i < rows; i++){
             Ciphertext<DCRTPoly> cipherrow = at(i);
             Ciphertext<DCRTPoly> result = cc->EvalInnerProduct(cipherrow, v, cols);
-            ct[i] = result;
+            //ct[i] = result;
+            ct.push_back(result);
         }
+        std::cout << "Multiplication complete" << std::endl;
         Ciphertext<DCRTPoly> merged = cc->EvalMerge(ct);
+        std::cout << "Merged" << std::endl;
         return merged;
 
     }
