@@ -29,19 +29,6 @@ fhe::Matrix *dsigmoid(const fhe::Matrix *M) {
     return sig;
 }
 
-Ciphertext<DCRTPoly> sigmoid(const Ciphertext<DCRTPoly> v, CryptoContext<DCRTPoly> cc) {
-    Ciphertext<DCRTPoly> sig = cc->EvalPoly(v, {0.000186759, 0.0, -0.0098156, 0.0, 0.22769, 0.5});
-    //auto sig = cc->EvalMult(v5, 0.000186759) + cc->EvalMult(v3, -0.0098156) + cc->EvalMult(v, 0.22769) + 0.5;
-    return sig;
-}
-
-Ciphertext<DCRTPoly> dsigmoid(const Ciphertext<DCRTPoly> v, CryptoContext<DCRTPoly> cc) {
-    Ciphertext<DCRTPoly> dsig = cc->EvalPoly(v, {0.000933795, 0.0, -0.0294468, 0.0, 0.227692});
-    //auto v2 = cc->EvalMult(v, v);
-    //auto v4 = cc->EvalMult(v2, v2);
-    return dsig;
-}
-
 namespace ml {
     
     Network::Network(int i, int h, int o, double l_rate) {
@@ -225,8 +212,6 @@ namespace ml {
             CryptoContext<DCRTPoly> cc) {
         this->weights_ih = new fhe::FHEMatrix(h, i, cc);
         this->weights_ho = new fhe::FHEMatrix(o, h, cc);
-        //this->bias_h = new fhe::FHEMatrix(h, 1, cc);
-        //this->bias_o = new fhe::FHEMatrix(o, 1, cc);
         this->l_rate = l_rate;
         this->cc = cc;
     }
@@ -262,8 +247,6 @@ namespace ml {
     FHENetwork::~FHENetwork() {
         delete this->weights_ih;
         delete this->weights_ho;
-        //delete this->bias_h;
-        //delete this->bias_o;
     }
 
     Ciphertext<DCRTPoly> FHENetwork::predict_first_layer(Ciphertext<DCRTPoly> input) {
@@ -271,24 +254,12 @@ namespace ml {
         std::cout << "Multiplied input with weights" << std::endl;
         hidden = cc->EvalAdd(bias_h, hidden);
         std::cout << "Added biases" << std::endl;
-        //Ciphertext<DCRTPoly> hidden_sigmoid = sigmoid(hidden, cc);
-        //std::cout << "Performed sigmoid" << std::endl;
-        //Ciphertext<DCRTPoly> output = weights_ho->multiply(hidden_sigmoid);
-        //std::cout << "Multiplied with weights" << std::endl;
-        //output = cc->EvalAdd(bias_o, hidden);
-        //std::cout << "Added biases" << std::endl;
-        //Ciphertext<DCRTPoly> output_sigmoid = sigmoid(output, cc);
-        //std::cout << "Sigmoid" << std::endl;
-        //delete hidden;
-        //delete hidden_sigmoid;
-        //delete output;
         return hidden;
     }
 
     Ciphertext<DCRTPoly> FHENetwork::predict_second_layer(Ciphertext<DCRTPoly> input) {
         Ciphertext<DCRTPoly> hidden = weights_ho->multiply(input);
         std::cout << "Multiplied by weights round 2" << std::endl;
-
         hidden = cc->EvalAdd(bias_o, hidden);
         std::cout << "Added second bias" << std::endl;
         return hidden;

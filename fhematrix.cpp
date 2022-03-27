@@ -145,13 +145,6 @@ namespace fhe {
             Plaintext ptxt = cc->MakeCKKSPackedPlaintext(v);
             this->mat[i] = cc->Encrypt(key.publicKey, ptxt);
             v.clear();
-            //this->mat[i] = new Ciphertext_t[cols];
-            /*for(int j = 0; j < cols; j++){
-                vector<double> v = {mat->at(i,j)};
-                Plaintext ptxt = cc->MakeCKKSPackedPlaintext(v);
-                this->mat[i][j] = cc->Encrypt(key.publicKey, ptxt);
-                v.clear();
-            }*/
         }
         
     }
@@ -201,16 +194,6 @@ namespace fhe {
             mat[i] = cc->EvalSub(mat[i], M->at(i));
     }
 
-    /*FHEMatrix *FHEMatrix::T() {
-        FHEMatrix *transpose = new FHEMatrix(cols, rows, cc);
-        
-        for(int i = 0; i < cols; i++)
-            for(int j = 0; j < rows; j++)
-                transpose->set(i,j,mat[j][i]);
-
-        return transpose;
-    }*/
-
     void FHEMatrix::multiply(double scalar) {
         for(int i = 0; i < rows; i++)
             mat[i] = cc->EvalMult(mat[i], scalar);
@@ -226,7 +209,6 @@ namespace fhe {
         for(int i = 0; i < rows; i++){
             Ciphertext<DCRTPoly> cipherrow = at(i);
             Ciphertext<DCRTPoly> result = cc->EvalInnerProduct(cipherrow, v, cols);
-            //ct[i] = result;
             ct.push_back(result);
         }
         std::cout << "Multiplication complete" << std::endl;
@@ -235,25 +217,6 @@ namespace fhe {
         return merged;
 
     }
-    /*FHEMatrix *FHEMatrix::multiply(FHEMatrix *M) const {
-        if(cols != M->get_rows())
-            throw -1;
-
-        FHEMatrix *temp = new FHEMatrix(rows, M->get_cols(), cc);
-
-        for(int i = 0; i < rows; i++) {
-            for(int j = 0; j < M->get_cols(); j++) {
-                Ciphertext_t sum = cc->EvalMult(mat[i][0], M->at(0,j));
-                for(int k = 1; k < cols; k++) {
-                    Ciphertext_t val = cc->EvalMult(mat[i][k], M->at(k,j));
-                    sum = cc->EvalAdd(sum, val);
-                }
-                temp->set(i,j,sum);
-            }
-        }
-
-        return temp;
-    }*/
 
     Ciphertext<DCRTPoly> FHEMatrix::at(int m) const {
         return mat[m];
@@ -263,18 +226,5 @@ namespace fhe {
         mat[m] = c;
     }
 
-    /*Matrix *FHEMatrix::decrypt(Key_t key) const {
-        Matrix *temp = new Matrix(rows, cols);
-
-        for(int i = 0; i < rows; i++) {
-            for(int j = 0; j < cols; j++) {
-                Plaintext result;
-                cc->Decrypt(key.secretKey, mat[i][j], &result);
-                result->SetLength(1);
-                temp->set(i,j,result->GetRealPackedValue()[0]);
-            }
-        }
-        return temp;
-    }*/
 }
 
