@@ -134,7 +134,7 @@ namespace fhe {
         return val;
     }
 
-    FHEMatrix::FHEMatrix(Matrix *mat, CryptoContext<DCRTPoly> cc, Key_t key) {
+    FHEMatrix::FHEMatrix(Matrix *mat, CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> key) {
         this->rows = mat->get_rows();
         this->cols = mat->get_cols();
         this->cc = cc;

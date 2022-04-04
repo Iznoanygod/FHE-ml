@@ -30,7 +30,7 @@ namespace ml {
     class FHENetwork {
         public:
             FHENetwork(int, int, int, double, CryptoContext<DCRTPoly>);
-            FHENetwork(Network *, CryptoContext<DCRTPoly>, Key_t);
+            FHENetwork(Network *, CryptoContext<DCRTPoly>, LPKeyPair<DCRTPoly>);
             ~FHENetwork();
             Ciphertext<DCRTPoly> predict_first_layer(Ciphertext<DCRTPoly>);
             Ciphertext<DCRTPoly> predict_second_layer(Ciphertext<DCRTPoly>);

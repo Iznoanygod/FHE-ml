@@ -216,7 +216,7 @@ namespace ml {
         this->cc = cc;
     }
 
-    FHENetwork::FHENetwork(Network *n, CryptoContext<DCRTPoly> cc, Key_t key){
+    FHENetwork::FHENetwork(Network *n, CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> key){
         this->weights_ih = new fhe::FHEMatrix(n->get_weights_ih(), cc, key);
         this->weights_ho = new fhe::FHEMatrix(n->get_weights_ho(), cc, key);
         

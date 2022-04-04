@@ -9,8 +9,6 @@
 
 using namespace lbcrypto;
 
-#define Key_t LPKeyPair<DCRTPolyImpl<bigintfxd::BigVectorImpl<bigintfxd::BigInteger<unsigned int, BigIntegerBitLength>>>>
-
 namespace fhe {
     class Matrix {
         public:
@@ -42,7 +40,7 @@ namespace fhe {
 
     class FHEMatrix {
         public:
-            FHEMatrix(Matrix *, CryptoContext<DCRTPoly>, Key_t);
+            FHEMatrix(Matrix *, CryptoContext<DCRTPoly>, LPKeyPair<DCRTPoly>);
             FHEMatrix(int, int, CryptoContext<DCRTPoly>);
             ~FHEMatrix();
             int get_rows() const;
@@ -62,7 +60,7 @@ namespace fhe {
             Ciphertext<DCRTPoly> at(int) const;
             void set(int, Ciphertext<DCRTPoly>);
         
-            Matrix *decrypt(Key_t) const;
+            Matrix *decrypt(LPKeyPair<DCRTPoly>) const;
         private:
             int rows;
             int cols;

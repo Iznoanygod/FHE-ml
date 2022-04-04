@@ -101,9 +101,9 @@ int main(int argc, char** argv) {
     delete M_d;
     */
     ml::Network *net = new ml::Network(784,200,10,0.005);
-    //net->randomize_weights();
-    //net->save("net.nf");
-    net->load("net1.nf");
+    net->randomize_weights();
+    net->save("net.nf");
+    //net->load("net1.nf");
     std::string line;
     ml::FHENetwork *fhenet = new ml::FHENetwork(net, cc, keys);
     std::cout << "Created Network" << std::endl;
