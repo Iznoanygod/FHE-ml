@@ -238,7 +238,7 @@ namespace ml {
     
     FHENetwork::FHENetwork(Network *net) {
         uint32_t multDepth = 10;
-        uint32_t scaleFactorBits = 90;
+        uint32_t scaleFactorBits = 50;
         uint32_t batchSize = 784;
         SecurityLevel securityLevel = HEStd_128_classic;
 
@@ -259,6 +259,8 @@ namespace ml {
         for(int i = 1; i < 201; i++)
             rotations[i] = -i;
         this->cc->EvalAtIndexKeyGen(this->key.secretKey, rotations);
+        
+        std::cout << "asd" << std::endl;
 
         this->weights_ih = new mat::FHEMatrix(net->get_weights_ih(), this->cc, this->key);
         this->weights_ho = new mat::FHEMatrix(net->get_weights_ho(), this->cc, this->key);

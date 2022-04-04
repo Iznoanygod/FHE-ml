@@ -9,5 +9,5 @@ int main() {
     std::ifstream test_file("../mnist_train.csv");
     net->load("net.nf");
     ml::FHENetwork *fhenet = new ml::FHENetwork(net);
-    
+    auto cc = fhenet->get_cc();
 }
