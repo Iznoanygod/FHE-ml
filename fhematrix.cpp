@@ -127,6 +127,7 @@ namespace mat {
         this->rows = mat->get_rows();
         this->cols = mat->get_cols();
         this->cc = cc;
+        this->mat.resize(this->rows);
         vector<vector<double>> vecs = mat->get_mat();
         for(int i = 0; i < this->rows; i++) {
             Plaintext ptxt = cc->MakeCKKSPackedPlaintext(vecs[i]);
