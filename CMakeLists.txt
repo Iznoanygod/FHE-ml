@@ -55,7 +55,4 @@ target_link_libraries( fheclient fheml)
 target_compile_options( fhematrix PRIVATE -g)
 target_compile_options( fheml PRIVATE -g)
 target_compile_options( fheclient PRIVATE -g)
-if(AVX)
-    target_compile_options ( fhematrix PRIVATE -mavx2)
-endif()
 
