@@ -4,6 +4,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <unistd.h>
 
 int socket_connect(char* ip, int port) {
     struct sockaddr_in serv_addr;
@@ -11,7 +12,11 @@ int socket_connect(char* ip, int port) {
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(port);
     inet_pton(AF_INET, ip, &serv_addr.sin_addr);
-    connect(sock, (struct sockaddr*) &serv_addr, sizeof(serv_addr));
+    int val = connect(sock, (struct sockaddr*) &serv_addr, sizeof(serv_addr));
+    if(val < 0){
+        close(sock);
+        return -1;
+    }
     return sock;
 }
 

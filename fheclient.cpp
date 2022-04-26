@@ -3,6 +3,7 @@
 #include <fstream>
 #include "bmpparse.h"
 #include "socketio.h"
+#include <unistd.h>
 
 #include "ciphertext-ser.h"
 #include "cryptocontext-ser.h"
@@ -30,7 +31,9 @@ int predict(char *image_name, int sockfd,
     fread(inputbuff, 1, file_length, inputctxt);
     fclose(inputctxt);
     socket_send(sockfd, inputbuff, file_length);
-
+    free(inputbuff);
+//receive file from server
+    
 
     Plaintext in_between;
     cc->Decrypt(key.secretKey, ctxt, &in_between);
@@ -44,7 +47,19 @@ int predict(char *image_name, int sockfd,
     ctxt = cc->Encrypt(key.publicKey, in_between);
     
     //send to server, perform round 2
+    message = (char*) "inference_2";
+    socket_send(sockfd, message, strlen(message));
     Serial::SerializeToFile("inter.ctxt", ctxt, SerType::BINARY);
+    FILE *interctxt = fopen("inter.ctxt", "r");
+    fseek(inputctxt, 0, SEEK_END);
+    file_length = ftell(interctxt);
+    rewind(interctxt);
+    char* interbuff = (char*) malloc(file_length);
+    fread(interbuff, 1, file_length, interctxt);
+    fclose(interctxt);
+    socket_send(sockfd, interbuff, file_length);
+    free(interbuff);
+    //receive file from server
 
     Plaintext result;
     cc->Decrypt(key.secretKey, ctxt, &result);
@@ -58,60 +73,42 @@ int predict(char *image_name, int sockfd,
 }
 
 int main(int argc, char **argv) {
-    /*usint m = 8192;
-    usint init_size = 3;
-    usint dcrtBits = 40;
-    auto cc =
-        CryptoContextFactory<DCRTPoly>::genCryptoContextCKKSWithParamsGen(
-            m, init_size,
-            dcrtBits, 10,
-            784,
-            OPTIMIZED, 20, 10,
-            FIRSTMODSIZE, BV, APPROXAUTO);
-        
-    cc->Enable(ENCRYPTION);
-    cc->Enable(SHE);
-    cc->Enable(LEVELEDSHE);
-     
-    auto key = cc->KeyGen();
-
-    cc->EvalMultKeyGen(key.secretKey);
-    cc->EvalSumKeyGen(key.secretKey);
-
-    vector<int> rotations(200);
-    for(int i = 1; i < 201; i++)
-        rotations[i-1] = -i;
-    cc->EvalAtIndexKeyGen(key.secretKey, rotations);
-    */
-    /*Serial::SerializeToFile("cryptocontext.cf", cc, SerType::BINARY);
-    Serial::SerializeToFile("public.kf", key.publicKey, SerType::BINARY);
-    Serial::SerializeToFile("private.kf", key.secretKey, SerType::BINARY);
-    std::ofstream multKeyFile("multkey.kf", std::ios::out | std::ios::binary);
-    cc->SerializeEvalMultKey(multKeyFile, SerType::BINARY);
-    std::ofstream rotationKeyFile("rotkey.kf", std::ios::out | std::ios::binary);
-    cc->SerializeEvalAutomorphismKey(rotationKeyFile, SerType::BINARY);
-    std::ofstream sumKeyFile("sumkey.kf", std::ios::out | std::ios::binary);
-    cc->SerializeEvalSumKey(sumKeyFile, SerType::BINARY);
-    */
+    if(argc != 3) {
+        printf("Usage: fheclient ip port\n");
+        return 0;
+    }
+    printf("Loading contexts...");
     CryptoContext<DCRTPoly> cc;
     cc->ClearEvalMultKeys();
     cc->ClearEvalAutomorphismKeys();
+    cc->ClearEvalSumKeys();
     lbcrypto::CryptoContextFactory<lbcrypto::DCRTPoly>::ReleaseAllContexts();
     Serial::DeserializeFromFile("cryptocontext.cf", cc, SerType::BINARY);
-    cc->Enable(ENCRYPTION);
-    cc->Enable(SHE);
-    cc->Enable(LEVELEDSHE);
     LPKeyPair<DCRTPoly> keys;
     Serial::DeserializeFromFile("public.kf", keys.publicKey, SerType::BINARY);
     Serial::DeserializeFromFile("private.kf", keys.secretKey, SerType::BINARY);
-    ml::Network *net = new ml::Network(784, 200, 10, 0.005);
-    net->load("net.nf");
 
-    ml::FHENetwork *fhenet = new ml::FHENetwork(net, cc, keys);
-    fhenet->save("netweights");
+    //std::ifstream multKeyFile("multkey.kf", std::ios::in | std::ios::binary);
+    //std::ifstream rotKeyFile("rotkey.kf", std::ios::in | std::ios::binary);
+    //std::ifstream sumKeyFile("sumkey.kf", std::ios::in | std::ios::binary);
+    //cc->DeserializeEvalMultKey(multKeyFile, SerType::BINARY);
+    //cc->DeserializeEvalAutomorphismKey(rotKeyFile, SerType::BINARY);
+    //cc->DeserializeEvalSumKey(sumKeyFile, SerType::BINARY);
+    printf("Done\n");
+
+    printf("Connecting to server...\n");
+    int sockfd;
+    do{
+        sockfd = socket_connect(argv[1], atoi(argv[2]));
+        if(sockfd < 0)
+            sleep(5);
+    }while(sockfd < 0);
+    printf("Connected\n");
     while(1) {
         char line[4096];
+        printf(">");
         scanf("%[^\n]%*c", line);
+        
         break;    
     }
 

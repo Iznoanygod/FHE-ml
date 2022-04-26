@@ -18,8 +18,31 @@ int main(int argc, char **argv) {
         printf("Usage: fheserver port netdir\n");
         return 0;
     }
+    
+    std::string net_dir = argv[2];
+    printf("Loading contexts...");
+    CryptoContext<DCRTPoly> cc;
+    cc->ClearEvalMultKeys();
+    cc->ClearEvalAutomorphismKeys();
+    cc->ClearEvalSumKeys();
+    lbcrypto::CryptoContextFactory<lbcrypto::DCRTPoly>::ReleaseAllContexts();
+    Serial::DeserializeFromFile("cryptocontext.cf", cc, SerType::BINARY);
+    LPKeyPair<DCRTPoly> keys;
+    Serial::DeserializeFromFile("public.kf", keys.publicKey, SerType::BINARY);
+
+    std::ifstream multKeyFile("multkey.kf", std::ios::in | std::ios::binary);
+    std::ifstream rotKeyFile("rotkey.kf", std::ios::in | std::ios::binary);
+    std::ifstream sumKeyFile("sumkey.kf", std::ios::in | std::ios::binary);
+    cc->DeserializeEvalMultKey(multKeyFile, SerType::BINARY);
+    cc->DeserializeEvalAutomorphismKey(rotKeyFile, SerType::BINARY);
+    cc->DeserializeEvalSumKey(sumKeyFile, SerType::BINARY);
+    printf("Done\n");
+
+    printf("Creating encrypted network...");
+    ml::FHENetwork *fhenet = new ml::FHENetwork(net_dir, cc, keys, 784, 200, 10, 0.005);
+    printf("Done\n");
+
     int port = atoi(argv[1]);
-    //char *directory = argv[2];
     int opt = 0;
     struct sockaddr_in address;
     int addrlen = sizeof(address);
@@ -50,6 +73,7 @@ int main(int argc, char **argv) {
     } 
 
     while(1) {
+ACCEPTCLIENT:
         printf("Waiting for client...\n");
         int sock = accept(serverFD, (struct sockaddr*) &address, (socklen_t*)&addrlen);
         if(sock < 0){
@@ -58,7 +82,37 @@ int main(int argc, char **argv) {
         }
         printf("Accepted connection\n");
         while(1) {
-            
+            char *input_message;
+            socket_read(sock, &input_message);
+            if(!strcmp(input_message, "inference_1")) {
+                char *ctxt_message;
+                int length = socket_read(sock, &ctxt_message);
+                FILE *ctxt_file = fopen("input.ctxt", "w+");
+                fwrite(ctxt_message, 1, length, ctxt_file);
+                fclose(ctxt_file);
+                Ciphertext<DCRTPoly> input;
+                Serial::DeserializeFromFile("input.ctxt", input, SerType::BINARY);
+                Ciphertext<DCRTPoly> inter = fhenet->first_predict(input);
+                Serial::SerializeToFile("inter.ctxt", inter, SerType::BINARY);
+                delete ctxt_message;
+            }
+            else if(!strcmp(input_message, "inference_2")) {
+                char *ctxt_message;
+                int length = socket_read(sock, &ctxt_message);
+                FILE *ctxt_file = fopen("input.ctxt", "w+");
+                fwrite(ctxt_message, 1, length, ctxt_file);
+                fclose(ctxt_file);
+                Ciphertext<DCRTPoly> input;
+                Serial::DeserializeFromFile("input.ctxt", input, SerType::BINARY);
+                Ciphertext<DCRTPoly> inter = fhenet->second_predict(input);
+                Serial::SerializeToFile("inter.ctxt", inter, SerType::BINARY);
+                delete ctxt_message;
+            }
+            else if(!strcmp(input_message, "disconnect")) {
+                close(sock);
+                goto ACCEPTCLIENT;
+            }
+            delete input_message;
         }
     }
 }

@@ -3,6 +3,11 @@
 #include <cstdio>
 #include <sys/stat.h>
 
+#include "ciphertext-ser.h"
+#include "cryptocontext-ser.h"
+#include "scheme/ckks/ckks-ser.h"
+#include "pubkeylp-ser.h"
+
 vector<double> sigmoid(vector<double> vec) {
     vector<double> v(vec.size());
     for(int i = 0; i < (int) vec.size(); i++) {
@@ -285,6 +290,30 @@ namespace ml {
         this->bias_o = cc->Encrypt(this->key.publicKey, pbias_o);
 
         this->l_rate = net->get_l_rate();
+    }
+
+    FHENetwork::FHENetwork(std::string dir_path,
+            CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> keys,
+            int input, int hidden, int output, double l_rate) {
+        this->cc = cc;
+        this->key = keys;
+        vector<Ciphertext<DCRTPoly>> wih;
+        for(int i = 0; i < hidden; i++) {
+            Ciphertext<DCRTPoly> temp;
+            Serial::DeserializeFromFile(dir_path + "/weightsih" + std::to_string(i) + ".nw", temp, SerType::BINARY);
+            wih.push_back(temp);
+        }
+        this->weights_ih = new mat::FHEMatrix(hidden, input, wih, cc);
+        vector<Ciphertext<DCRTPoly>> who;
+        for(int i = 0; i < output; i++) {
+            Ciphertext<DCRTPoly> temp;
+            Serial::DeserializeFromFile(dir_path + "/weightsho" + std::to_string(i) + ".nw", temp, SerType::BINARY);
+            who.push_back(temp);
+        }
+        this->weights_ho = new mat::FHEMatrix(output, hidden, who, cc);
+        Serial::DeserializeFromFile(dir_path + "/biash.nw", this->bias_h, SerType::BINARY);
+        Serial::DeserializeFromFile(dir_path + "/biaso.nw", this->bias_o, SerType::BINARY);
+        this->l_rate = l_rate;
     }
 
     FHENetwork::~FHENetwork() {

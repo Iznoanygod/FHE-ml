@@ -33,6 +33,9 @@ namespace ml {
     class FHENetwork {
         public:
             FHENetwork(Network *net, CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> keys);
+            FHENetwork(std::string dir_path,
+                    CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> keys,
+                    int input, int hidden, int output, double l_rate);
             ~FHENetwork();
             
             Ciphertext<DCRTPoly> first_predict(Ciphertext<DCRTPoly> input) const;
