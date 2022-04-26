@@ -35,8 +35,9 @@ namespace ml {
             FHENetwork(Network *net);
             ~FHENetwork();
             
-            Ciphertext<DCRTPoly> predict(Ciphertext<DCRTPoly> input) const;
-            
+            Ciphertext<DCRTPoly> first_predict(Ciphertext<DCRTPoly> input) const;
+            Ciphertext<DCRTPoly> second_predict(Ciphertext<DCRTPoly> input) const;
+
             CryptoContext<DCRTPoly> get_cc();
             LPKeyPair<DCRTPoly> get_key();
         private:

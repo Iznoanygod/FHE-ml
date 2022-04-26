@@ -152,6 +152,10 @@ namespace mat {
         return cols;
     }
 
+    vector<Ciphertext<DCRTPoly>> FHEMatrix::get_mat() const {
+        return mat;
+    }
+
     void FHEMatrix::add(double val) {
         for(int i = 0; i < rows; i++) {
             Ciphertext<DCRTPoly> ctxt = cc->EvalAdd(mat[i], val);
@@ -198,8 +202,7 @@ namespace mat {
         vector<Ciphertext<DCRTPoly>> ct;
         
         for(int i = 0; i < rows; i++) {
-            Ciphertext<DCRTPoly> crow = mat[i];
-            Ciphertext<DCRTPoly> result = cc->EvalInnerProduct(crow, vec, cols);
+            Ciphertext<DCRTPoly> result = cc->EvalInnerProduct(vec, mat[i], cols);
             ct.push_back(result);
         }
 

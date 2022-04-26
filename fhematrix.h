@@ -43,6 +43,7 @@ namespace mat {
                     CryptoContext<DCRTPoly> cc);
             int get_rows() const;
             int get_cols() const;
+            vector<Ciphertext<DCRTPoly>> get_mat() const;
 
             void add(double val);
             void add(FHEMatrix *M);

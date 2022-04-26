@@ -248,7 +248,7 @@ namespace ml {
                     multDepth, scaleFactorBits, batchSize, securityLevel, 0, APPROXAUTO);
         */
         usint m = 8192;
-        usint init_size = 20;
+        usint init_size = 10;
         usint dcrtBits = 50;
         this->cc =
             CryptoContextFactory<DCRTPoly>::genCryptoContextCKKSWithParamsGen(
@@ -289,17 +289,25 @@ namespace ml {
         delete this->weights_ho;
     }
 
-    Ciphertext<DCRTPoly> FHENetwork::predict(Ciphertext<DCRTPoly> input) const {
+    Ciphertext<DCRTPoly> FHENetwork::first_predict(Ciphertext<DCRTPoly> input) const {
         Ciphertext<DCRTPoly> hidden = weights_ih->multiply(input);
-        hidden = cc->EvalAdd(bias_h, hidden);
+        Ciphertext<DCRTPoly> hidden_bias = cc->EvalAdd(bias_h, hidden);
+        Ciphertext<DCRTPoly> hidden_sigmoid = cc->EvalPoly(hidden_bias, {0.5, 0.164128, 0, -0.00260371, 0, 0.000014906});
         std::cout << "checkpoint 1" << std::endl;
-        Ciphertext<DCRTPoly> hidden_sigmoid = cc->EvalPoly(hidden, {0.5, 0.164128, 0, -0.00260371, 0, 0.000014906});
-        std::cout << "checkpoint 2" << std::endl;
+        /*std::cout << "checkpoint 2" << std::endl;
         Ciphertext<DCRTPoly> output = weights_ho->multiply(hidden_sigmoid);
         output = cc->EvalAdd(bias_o, output);
         std::cout << "checkpoint 3" << std::endl;
         Ciphertext<DCRTPoly> output_sigmoid = cc->EvalPoly(output, {0.5, 0.164128, 0, -0.00260371, 0, 0.000014906});
-        return output_sigmoid;
+        return output_sigmoid;*/
+        return hidden_bias;
+    }
+
+    Ciphertext<DCRTPoly> FHENetwork::second_predict(Ciphertext<DCRTPoly> input) const {
+        Ciphertext<DCRTPoly> hidden = weights_ho->multiply(input);
+        auto hidden_bias = cc->EvalAdd(bias_o, hidden);
+        //Ciphertext<DCRTPoly> hidden_sigmoid = cc->EvalPoly(hidden_bias, {0.5, 0.164128, 0, -0.00260371, 0, 0.000014906});
+        return hidden_bias;
     }
     
     CryptoContext<DCRTPoly> FHENetwork::get_cc() {

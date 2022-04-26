@@ -37,7 +37,12 @@ int main() {
         Ciphertext<DCRTPoly> cinput = cc->Encrypt(key.publicKey, pinput);
         
         vector<double> standard_predict = net->predict(input);
-        Ciphertext<DCRTPoly> encrypt_predict = fhenet->predict(cinput);
+        Ciphertext<DCRTPoly> encrypt_predict = fhenet->first_predict(cinput);
+        Plaintext in_between;
+        cc->Decrypt(key.secretKey, encrypt_predict, &in_between);
+        encrypt_predict = cc->Encrypt(key.publicKey, in_between);
+        //encrypt_predict = cc->EvalPoly(encrypt_predict, {0.5, 0.164128, 0, -0.00260371, 0, 0.000014906});
+        encrypt_predict = fhenet->second_predict(encrypt_predict);
         std::cout << "Prediction done" << std::endl;
         int max = 0;
         for(int i = 1; i < 10; i++)
@@ -46,12 +51,13 @@ int main() {
         Plaintext decrypt;
         cc->Decrypt(key.secretKey, encrypt_predict, &decrypt);
         decrypt->SetLength(10);
+        std::cout << decrypt << std::endl;
         vector<double> uvec = decrypt->GetRealPackedValue();
         int cmax = 0;
         for(int i = 1; i < 10; i++)
             if(uvec[i] > uvec[cmax])
                 cmax = i;
         std::cout << "Target:" +std::to_string(target) + " | Prediction:" + std::to_string(max)  + " | Encrypted:" + std::to_string(cmax) << std::endl;
-
+        
     }
 }
