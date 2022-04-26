@@ -21,7 +21,7 @@ double *parse_bmp(char *file_name) {
     //each row is 4 bytes, but only uses 28 bits(28 first bits, last 4 bits are 0 padding)
     fseek(input_file, offset, SEEK_SET);
 
-    double *vector = malloc(sizeof(double) * 28*28);
+    double *vector = new double[28*28];
 
     double mat[28][28];
     for(int i = 0; i < 28; i++) {
