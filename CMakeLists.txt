@@ -47,11 +47,13 @@ endif()
 ### EXAMPLE:
 add_library( fhematrix SHARED fhematrix.cpp)
 add_library( fheml SHARED fheml.cpp )
+add_library( bmpparse SHARED bmpparse.c)
 add_executable( fheclient fheclient.cpp )
 
 target_link_libraries( fheml fhematrix)
 target_link_libraries( fheclient fhematrix)
 target_link_libraries( fheclient fheml)
+target_link_libraries( fheclient bmpparse)
 target_compile_options( fhematrix PRIVATE -g)
 target_compile_options( fheml PRIVATE -g)
 target_compile_options( fheclient PRIVATE -g)
