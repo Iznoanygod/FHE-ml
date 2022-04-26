@@ -41,6 +41,7 @@ double *parse_bmp(char *file_name) {
     for(int i = 0; i < 28*28; i++) {
         vector[i] = mat[i%28][i/28];
     }
+    fclose(input_file);
     return vector;
 }
 

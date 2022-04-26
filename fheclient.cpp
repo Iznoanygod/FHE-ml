@@ -1,82 +1,118 @@
 #include "fheml.h"
 #include <iostream>
 #include <fstream>
+#include "bmpparse.h"
+#include "socketio.h"
 
-int main() {
-    std::string line;
-    ml::Network *net = new ml::Network(784,200,10,0.005);
-    net->randomize_weights();
-    std::ifstream test_file("../mnist_train.csv");
+#include "ciphertext-ser.h"
+#include "cryptocontext-ser.h"
+#include "scheme/ckks/ckks-ser.h"
+#include "pubkeylp-ser.h"
+
+
+int predict(char *image_name, int sockfd,
+        CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> key) {
+    double *pixels = parse_bmp(image_name);
+    vector<double> pixel_vector (pixels, pixels + 784);
+    Plaintext ptxt = cc->MakeCKKSPackedPlaintext(pixel_vector);
+    Ciphertext<DCRTPoly> ctxt = cc->Encrypt(key.publicKey, ptxt);
+    //send to server, perform round 1
+    
+    char *message = (char*) "inference_1";
+    socket_send(sockfd, message, strlen(message));
+    Serial::SerializeToFile("input.ctxt", ctxt, SerType::BINARY);
+    int file_length;
+    FILE *inputctxt = fopen("input.ctxt", "r");
+    fseek(inputctxt, 0, SEEK_END);
+    file_length = ftell(inputctxt);
+    rewind(inputctxt);
+    char* inputbuff = (char*) malloc(file_length);
+    fread(inputbuff, 1, file_length, inputctxt);
+    fclose(inputctxt);
+    socket_send(sockfd, inputbuff, file_length);
+
+
+    Plaintext in_between;
+    cc->Decrypt(key.secretKey, ctxt, &in_between);
+    in_between->SetLength(200);
+    vector<double> in_b = in_between->GetRealPackedValue();
+    
+    for(int i = 0; i < 200; i++)
+        in_b[i] = 1 / (1 + exp(-in_b[i]));
+
+    in_between = cc->MakeCKKSPackedPlaintext(in_b);
+    ctxt = cc->Encrypt(key.publicKey, in_between);
+    
+    //send to server, perform round 2
+    Serial::SerializeToFile("inter.ctxt", ctxt, SerType::BINARY);
+
+    Plaintext result;
+    cc->Decrypt(key.secretKey, ctxt, &result);
+    result->SetLength(10);
+    vector<double> result_vector = result->GetRealPackedValue();
+    int max = 0;
+    for(int i = 0; i < 10; i++)
+        if(result_vector[i] > result_vector[max])
+            max = 1;
+    return max;
+}
+
+int main(int argc, char **argv) {
+    /*usint m = 8192;
+    usint init_size = 3;
+    usint dcrtBits = 40;
+    auto cc =
+        CryptoContextFactory<DCRTPoly>::genCryptoContextCKKSWithParamsGen(
+            m, init_size,
+            dcrtBits, 10,
+            784,
+            OPTIMIZED, 20, 10,
+            FIRSTMODSIZE, BV, APPROXAUTO);
+        
+    cc->Enable(ENCRYPTION);
+    cc->Enable(SHE);
+    cc->Enable(LEVELEDSHE);
+     
+    auto key = cc->KeyGen();
+
+    cc->EvalMultKeyGen(key.secretKey);
+    cc->EvalSumKeyGen(key.secretKey);
+
+    vector<int> rotations(200);
+    for(int i = 1; i < 201; i++)
+        rotations[i-1] = -i;
+    cc->EvalAtIndexKeyGen(key.secretKey, rotations);
+    */
+    /*Serial::SerializeToFile("cryptocontext.cf", cc, SerType::BINARY);
+    Serial::SerializeToFile("public.kf", key.publicKey, SerType::BINARY);
+    Serial::SerializeToFile("private.kf", key.secretKey, SerType::BINARY);
+    std::ofstream multKeyFile("multkey.kf", std::ios::out | std::ios::binary);
+    cc->SerializeEvalMultKey(multKeyFile, SerType::BINARY);
+    std::ofstream rotationKeyFile("rotkey.kf", std::ios::out | std::ios::binary);
+    cc->SerializeEvalAutomorphismKey(rotationKeyFile, SerType::BINARY);
+    std::ofstream sumKeyFile("sumkey.kf", std::ios::out | std::ios::binary);
+    cc->SerializeEvalSumKey(sumKeyFile, SerType::BINARY);
+    */
+    CryptoContext<DCRTPoly> cc;
+    cc->ClearEvalMultKeys();
+    cc->ClearEvalAutomorphismKeys();
+    lbcrypto::CryptoContextFactory<lbcrypto::DCRTPoly>::ReleaseAllContexts();
+    Serial::DeserializeFromFile("cryptocontext.cf", cc, SerType::BINARY);
+    cc->Enable(ENCRYPTION);
+    cc->Enable(SHE);
+    cc->Enable(LEVELEDSHE);
+    LPKeyPair<DCRTPoly> keys;
+    Serial::DeserializeFromFile("public.kf", keys.publicKey, SerType::BINARY);
+    Serial::DeserializeFromFile("private.kf", keys.secretKey, SerType::BINARY);
+    ml::Network *net = new ml::Network(784, 200, 10, 0.005);
     net->load("net.nf");
-    std::cout << "created network" << std::endl;
-    ml::FHENetwork *fhenet = new ml::FHENetwork(net);
-    std::cout << "created encrypted network" << std::endl;
-    auto cc = fhenet->get_cc();
-    auto key = fhenet->get_key();
-    while(getline(test_file, line)) {
-        std::stringstream s_stream(line);
-        std::string tar;
-        getline(s_stream, tar, ',');
-        int target = std::stoi(tar);
 
-        vector<double> target_vector;
-        target_vector.resize(10);
-        target_vector[target] = 1.0;
-
-        vector<double> input;
-        input.resize(784);
-        for(int i = 0; i < 784; i++) {
-            std::string val;
-            getline(s_stream, tar, ',');
-            int ta = std::stoi(tar);
-            input[i] = ta/255.;
-        }
-        //vector<double> predict = net->predict(input);
-        //int max = 0;
-        //for(int i = 1; i < 10; i++)
-        //    if(predict[i] > predict[max])
-        //        max = i;
-        //if(max == target){
-        //    correct++;
-        //}
-        //net->train(input, target_vector);
-        //i++;
-        //if(i % 1000 == 0)
-        //    std::cout << i << std::endl;
-        
-        Plaintext pinput = cc->MakeCKKSPackedPlaintext(input);
-        Ciphertext<DCRTPoly> cinput = cc->Encrypt(key.publicKey, pinput);
-        
-        vector<double> standard_predict = net->predict(input);
-        Ciphertext<DCRTPoly> encrypt_predict = fhenet->first_predict(cinput);
-        Plaintext in_between;
-        cc->Decrypt(key.secretKey, encrypt_predict, &in_between);
-        in_between->SetLength(200);
-        vector<double> in_b = in_between->GetRealPackedValue();
-        for(int k = 0; k < 200; k++) {
-            in_b[k] = 1 / (1 + exp(-in_b[k]));
-        }
-        in_between = cc->MakeCKKSPackedPlaintext(in_b);
-        encrypt_predict = cc->Encrypt(key.publicKey, in_between);
-        //encrypt_predict = cc->EvalPoly(encrypt_predict, {0.5, 0.164128, 0, -0.00260371, 0, 0.000014906});
-        encrypt_predict = fhenet->second_predict(encrypt_predict);
-        std::cout << "Prediction done" << std::endl;
-        int max = 0;
-        for(int i = 1; i < 10; i++)
-            if(standard_predict[i] > standard_predict[max])
-                max = i;
-        Plaintext decrypt;
-        cc->Decrypt(key.secretKey, encrypt_predict, &decrypt);
-        decrypt->SetLength(10);
-        std::cout << decrypt << std::endl;
-        vector<double> uvec = decrypt->GetRealPackedValue();
-        int cmax = 0;
-        for(int i = 1; i < 10; i++)
-            if(uvec[i] > uvec[cmax])
-                cmax = i;
-        std::cout << "Target:" +std::to_string(target) + " | Prediction:" + std::to_string(max)  + " | Encrypted:" + std::to_string(cmax) << std::endl;
-
+    ml::FHENetwork *fhenet = new ml::FHENetwork(net, cc, keys);
+    fhenet->save("netweights");
+    while(1) {
+        char line[4096];
+        scanf("%[^\n]%*c", line);
+        break;    
     }
-    //printf("%d\n", correct);
-    //net->save("net.nf");
+
 }

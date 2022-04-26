@@ -32,7 +32,7 @@ namespace ml {
 
     class FHENetwork {
         public:
-            FHENetwork(Network *net);
+            FHENetwork(Network *net, CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> keys);
             ~FHENetwork();
             
             Ciphertext<DCRTPoly> first_predict(Ciphertext<DCRTPoly> input) const;
@@ -40,6 +40,7 @@ namespace ml {
 
             CryptoContext<DCRTPoly> get_cc();
             LPKeyPair<DCRTPoly> get_key();
+            void save(std::string dir_path) const;
         private:
             mat::FHEMatrix *weights_ih;
             mat::FHEMatrix *weights_ho;

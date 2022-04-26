@@ -1,6 +1,7 @@
 #include "fheml.h"
 #include <math.h>
 #include <cstdio>
+#include <sys/stat.h>
 
 vector<double> sigmoid(vector<double> vec) {
     vector<double> v(vec.size());
@@ -236,7 +237,7 @@ namespace ml {
         return l_rate;
     }
     
-    FHENetwork::FHENetwork(Network *net) {
+    FHENetwork::FHENetwork(Network *net, CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> keys) {
         
         /*uint32_t multDepth = 10;
         uint32_t scaleFactorBits = 20;
@@ -247,7 +248,7 @@ namespace ml {
             CryptoContextFactory<DCRTPoly>::genCryptoContextCKKS(
                     multDepth, scaleFactorBits, batchSize, securityLevel, 0, APPROXAUTO);
         */
-        usint m = 8192;
+        /*usint m = 8192;
         usint init_size = 3;
         usint dcrtBits = 40;
         this->cc =
@@ -271,7 +272,9 @@ namespace ml {
         for(int i = 1; i < 201; i++)
             rotations[i-1] = -i;
         this->cc->EvalAtIndexKeyGen(this->key.secretKey, rotations);
-
+        */
+        this->cc = cc;
+        this->key = keys;
         this->weights_ih = new mat::FHEMatrix(net->get_weights_ih(), this->cc, this->key);
         this->weights_ho = new mat::FHEMatrix(net->get_weights_ho(), this->cc, this->key);
 
@@ -316,6 +319,20 @@ namespace ml {
 
     LPKeyPair<DCRTPoly> FHENetwork::get_key() {
         return key;
+    }
+
+    void FHENetwork::save(std::string dir_path) const {
+        mkdir(dir_path.c_str(), 0777);
+        Serial::SerializeToFile(dir_path + "/biash.nw", bias_h, SerType::BINARY);
+        Serial::SerializeToFile(dir_path + "/biaso.nw", bias_o, SerType::BINARY);
+        vector<Ciphertext<DCRTPoly>> ihv = weights_ih->get_mat();
+        for(int i = 0; i < weights_ih->get_rows(); i++){
+            Serial::SerializeToFile(dir_path + "/weightsih" + std::to_string(i) + ".nw", ihv[i], SerType::BINARY);
+        }
+        vector<Ciphertext<DCRTPoly>> hov = weights_ho->get_mat();
+        for(int i = 0; i < weights_ho->get_rows(); i++) {
+            Serial::SerializeToFile(dir_path + "/weightsho" + std::to_string(i) + ".nw", hov[i], SerType::BINARY);
+        }
     }
 }
 
