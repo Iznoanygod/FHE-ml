@@ -237,7 +237,7 @@ namespace ml {
     }
     
     FHENetwork::FHENetwork(Network *net) {
-        /*
+        
         uint32_t multDepth = 10;
         uint32_t scaleFactorBits = 50;
         uint32_t batchSize = 784;
@@ -246,8 +246,8 @@ namespace ml {
         this->cc =
             CryptoContextFactory<DCRTPoly>::genCryptoContextCKKS(
                     multDepth, scaleFactorBits, batchSize, securityLevel, 0, APPROXAUTO);
-        */
-        usint m = 8192;
+        
+        /*usint m = 8192;
         usint init_size = 10;
         usint dcrtBits = 50;
         this->cc =
@@ -257,7 +257,7 @@ namespace ml {
                 784,
                 OPTIMIZED, 20, 10,
                 FIRSTMODSIZE, BV, APPROXAUTO);
-        
+        */
         this->cc->Enable(ENCRYPTION);
         this->cc->Enable(SHE);
         this->cc->Enable(LEVELEDSHE);
