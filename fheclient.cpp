@@ -77,7 +77,6 @@ int predict(char *image_name, int sockfd,
     Plaintext result;
     cc->Decrypt(key.secretKey, ctxt, &result);
     result->SetLength(10);
-    std::cout << result << std::endl;
     vector<double> result_vector = result->GetRealPackedValue();
     int max = 0;
     for(int i = 0; i < 10; i++)

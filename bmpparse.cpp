@@ -25,7 +25,7 @@ double *parse_bmp(char *file_name) {
             mat[27-i][j] = pixel_value;
         }
     }
-    for(int i = 0; i < 28; i++){
+    /*for(int i = 0; i < 28; i++){
         for(int j = 0; j < 28; j++) {
             if(mat[i][j] < 0.1)
                 printf(" ");
@@ -36,7 +36,7 @@ double *parse_bmp(char *file_name) {
                 printf("#");
         }
         printf("\n");
-    }
+    }*/
     for(int i = 0; i < 28*28; i++) {
         vector[i] = mat[i/28][i%28];
     }
