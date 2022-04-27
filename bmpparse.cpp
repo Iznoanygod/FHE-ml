@@ -16,7 +16,7 @@ double *parse_bmp(char *file_name) {
 
     fseek(input_file, 0xA, SEEK_SET);
     int offset;
-    (void) fread(&offset, 4, 1, input_file);
+    (void)!fread(&offset, 4, 1, input_file);
     
     //each row is 4 bytes, but only uses 28 bits(28 first bits, last 4 bits are 0 padding)
     fseek(input_file, offset, SEEK_SET);
@@ -26,7 +26,7 @@ double *parse_bmp(char *file_name) {
     double mat[28][28];
     for(int i = 0; i < 28; i++) {
         int row;
-        (void) fread(&row, 4, 1, input_file);
+        (void)!fread(&row, 4, 1, input_file);
         row = reverse_bytes(row);
         row = row >> 4;
         for(int j = 0; j < 28; j++) {

@@ -193,16 +193,16 @@ namespace ml {
         int hidden_size;
         int output_size;
 
-        fread(&input_size, sizeof(input_size), 1, fp);
-        fread(&hidden_size, sizeof(hidden_size), 1, fp);
-        fread(&output_size, sizeof(output_size), 1, fp);
-        fread(&l_rate, sizeof(l_rate), 1, fp);
+        (void) !fread(&input_size, sizeof(input_size), 1, fp);
+        (void) !fread(&hidden_size, sizeof(hidden_size), 1, fp);
+        (void) !fread(&output_size, sizeof(output_size), 1, fp);
+        (void) !fread(&l_rate, sizeof(l_rate), 1, fp);
 
         vector<vector<double>> ih_mat = weights_ih->get_mat();
         for(int i = 0; i < weights_ih->get_rows(); i++) {
             for(int j = 0; j < weights_ih->get_cols(); j++) {
                 double in;
-                fread(&in, sizeof(double), 1, fp);
+                (void) !fread(&in, sizeof(double), 1, fp);
                 weights_ih->set(i, j, in);
             }
         }
@@ -211,14 +211,14 @@ namespace ml {
         for(int i = 0; i < weights_ho->get_rows(); i++) {
             for(int j = 0; j < weights_ho->get_cols(); j++) {
                 double in;
-                fread(&in, sizeof(double), 1, fp);
+                (void) !fread(&in, sizeof(double), 1, fp);
                 weights_ho->set(i, j, in);
             }
         }
         for(int i = 0; i < hidden_size; i++)
-            fread(&bias_h[i], sizeof(double), 1, fp);
+            (void) !fread(&bias_h[i], sizeof(double), 1, fp);
         for(int i = 0; i < output_size; i++)
-            fread(&bias_o[i], sizeof(double), 1, fp);
+            (void) !fread(&bias_o[i], sizeof(double), 1, fp);
         fclose(fp);
     }
 
