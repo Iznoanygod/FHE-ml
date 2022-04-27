@@ -244,40 +244,6 @@ namespace ml {
     
     FHENetwork::FHENetwork(Network *net, CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> keys) {
         
-        /*uint32_t multDepth = 10;
-        uint32_t scaleFactorBits = 20;
-        uint32_t batchSize = 784;
-        SecurityLevel securityLevel = HEStd_128_classic;
-
-        this->cc =
-            CryptoContextFactory<DCRTPoly>::genCryptoContextCKKS(
-                    multDepth, scaleFactorBits, batchSize, securityLevel, 0, APPROXAUTO);
-        */
-        /*usint m = 8192;
-        usint init_size = 3;
-        usint dcrtBits = 40;
-        this->cc =
-            CryptoContextFactory<DCRTPoly>::genCryptoContextCKKSWithParamsGen(
-                m, init_size,
-                dcrtBits, 10,
-                784,
-                OPTIMIZED, 20, 10,
-                FIRSTMODSIZE, BV, APPROXAUTO);
-        
-        this->cc->Enable(ENCRYPTION);
-        this->cc->Enable(SHE);
-        this->cc->Enable(LEVELEDSHE);
-        
-        this->key = this->cc->KeyGen();
-
-        this->cc->EvalMultKeyGen(this->key.secretKey);
-        this->cc->EvalSumKeyGen(this->key.secretKey);
-
-        vector<int> rotations(200);
-        for(int i = 1; i < 201; i++)
-            rotations[i-1] = -i;
-        this->cc->EvalAtIndexKeyGen(this->key.secretKey, rotations);
-        */
         this->cc = cc;
         this->key = keys;
         this->weights_ih = new mat::FHEMatrix(net->get_weights_ih(), this->cc, this->key);
@@ -324,20 +290,12 @@ namespace ml {
     Ciphertext<DCRTPoly> FHENetwork::first_predict(Ciphertext<DCRTPoly> input) const {
         Ciphertext<DCRTPoly> hidden = weights_ih->multiply(input);
         Ciphertext<DCRTPoly> hidden_bias = cc->EvalAdd(bias_h, hidden);
-        //Ciphertext<DCRTPoly> hidden_sigmoid = cc->EvalPoly(hidden_bias, {0.5, 0.164128, 0, -0.00260371, 0, 0.000014906});
-        /*std::cout << "checkpoint 2" << std::endl;
-        Ciphertext<DCRTPoly> output = weights_ho->multiply(hidden_sigmoid);
-        output = cc->EvalAdd(bias_o, output);
-        std::cout << "checkpoint 3" << std::endl;
-        Ciphertext<DCRTPoly> output_sigmoid = cc->EvalPoly(output, {0.5, 0.164128, 0, -0.00260371, 0, 0.000014906});
-        return output_sigmoid;*/
         return hidden_bias;
     }
 
     Ciphertext<DCRTPoly> FHENetwork::second_predict(Ciphertext<DCRTPoly> input) const {
         Ciphertext<DCRTPoly> hidden = weights_ho->multiply(input);
         auto hidden_bias = cc->EvalAdd(bias_o, hidden);
-        //Ciphertext<DCRTPoly> hidden_sigmoid = cc->EvalPoly(hidden_bias, {0.5, 0.164128, 0, -0.00260371, 0, 0.000014906});
         return hidden_bias;
     }
     

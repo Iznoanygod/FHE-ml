@@ -18,7 +18,6 @@ int predict(char *image_name, int sockfd,
     vector<double> pixel_vector (pixels, pixels + 784);
     Plaintext ptxt = cc->MakeCKKSPackedPlaintext(pixel_vector);
     Ciphertext<DCRTPoly> ctxt = cc->Encrypt(key.publicKey, ptxt);
-    //send to server, perform round 1
     
     char *message = (char*) "inference_1";
     socket_send(sockfd, message, strlen(message));
@@ -33,7 +32,7 @@ int predict(char *image_name, int sockfd,
     fclose(inputctxt);
     socket_send(sockfd, inputbuff, file_length);
     free(inputbuff);
-//receive file from server
+    
     char *inter_buffer;
     int inter_length = socket_read(sockfd, &inter_buffer);
     FILE *inter_file = fopen("inter.ctxt", "w+");
@@ -52,7 +51,6 @@ int predict(char *image_name, int sockfd,
     in_between = cc->MakeCKKSPackedPlaintext(in_b);
     ctxt = cc->Encrypt(key.publicKey, in_between);
     
-    //send to server, perform round 2
     message = (char*) "inference_2";
     socket_send(sockfd, message, strlen(message));
     Serial::SerializeToFile("inter.ctxt", ctxt, SerType::BINARY);
@@ -65,7 +63,7 @@ int predict(char *image_name, int sockfd,
     fclose(interctxt);
     socket_send(sockfd, interbuff, file_length);
     free(interbuff);
-    //receive file from server
+    
     char *final_buffer;
     int final_length = socket_read(sockfd, &final_buffer);
     FILE *final_file = fopen("final.ctxt", "w+");
@@ -101,12 +99,6 @@ int main(int argc, char **argv) {
     Serial::DeserializeFromFile("public.kf", keys.publicKey, SerType::BINARY);
     Serial::DeserializeFromFile("private.kf", keys.secretKey, SerType::BINARY);
 
-    //std::ifstream multKeyFile("multkey.kf", std::ios::in | std::ios::binary);
-    //std::ifstream rotKeyFile("rotkey.kf", std::ios::in | std::ios::binary);
-    //std::ifstream sumKeyFile("sumkey.kf", std::ios::in | std::ios::binary);
-    //cc->DeserializeEvalMultKey(multKeyFile, SerType::BINARY);
-    //cc->DeserializeEvalAutomorphismKey(rotKeyFile, SerType::BINARY);
-    //cc->DeserializeEvalSumKey(sumKeyFile, SerType::BINARY);
     printf("Done\n");
 
     printf("Connecting to server...\n");
@@ -118,8 +110,7 @@ int main(int argc, char **argv) {
     }while(sockfd < 0);
     printf("Connected\n");
     char *disconnect_message = (char*) "disconnect";
-    ml::Network *net = new ml::Network(784, 200, 10, 0.005);
-    net->load("net.nf");
+    
     while(1) {
         char line[4096];
         printf(">");
@@ -137,12 +128,6 @@ int main(int argc, char **argv) {
             printf("prediction: %d\n", prediction);
             double *pixels = parse_bmp(option);
             vector<double> pixel_vector (pixels, pixels + 784);
-            vector<double> reg_pred = net->predict(pixel_vector);
-            int rmax = 0;
-            for(int i = 1; i < 10; i++)
-                if(reg_pred[i] > reg_pred[rmax])
-                    rmax = i;
-            printf("unencrypted net result: %d\n", rmax);
         }
     }
 

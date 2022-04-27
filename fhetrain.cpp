@@ -66,7 +66,6 @@ int main(int argc, char **argv) {
                 std::string val;
                 getline(s_stream, tar, ',');
                 int ta = std::stoi(tar);
-            //input->set(i,0,ta / 255.);
                 input[i] = ta / 255.;
             }
             vector<double> result = net->predict(input);
