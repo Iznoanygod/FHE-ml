@@ -102,7 +102,7 @@ ACCEPTCLIENT:
                 length = ftell(int_file);
                 rewind(int_file);
                 char *inter_buffer = new char[length];
-                fread(inter_buffer, 1, length, int_file);
+                (void) !fread(inter_buffer, 1, length, int_file);
                 fclose(int_file);
                 socket_send(sock, inter_buffer, length);
                 printf("Result sent\n");
@@ -127,7 +127,7 @@ ACCEPTCLIENT:
                 length = ftell(int_file);
                 rewind(int_file);
                 char *inter_buffer = new char[length];
-                fread(inter_buffer, 1, length, int_file);
+                (void) !fread(inter_buffer, 1, length, int_file);
                 fclose(int_file);
                 socket_send(sock, inter_buffer, length);
                 printf("Result sent\n");

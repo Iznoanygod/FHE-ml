@@ -28,7 +28,7 @@ int predict(char *image_name, int sockfd,
     file_length = ftell(inputctxt);
     rewind(inputctxt);
     char* inputbuff = (char*) malloc(file_length);
-    fread(inputbuff, 1, file_length, inputctxt);
+    (void) !fread(inputbuff, 1, file_length, inputctxt);
     fclose(inputctxt);
     socket_send(sockfd, inputbuff, file_length);
     free(inputbuff);
@@ -60,7 +60,7 @@ int predict(char *image_name, int sockfd,
     file_length = ftell(interctxt);
     rewind(interctxt);
     char* interbuff = (char*) malloc(file_length);
-    fread(interbuff, 1, file_length, interctxt);
+    (void) !fread(interbuff, 1, file_length, interctxt);
     fclose(interctxt);
     socket_send(sockfd, interbuff, file_length);
     free(interbuff);
@@ -122,7 +122,7 @@ int main(int argc, char **argv) {
     while(1) {
         char line[4096];
         printf(">");
-        scanf("%[^\n]%*c", line);
+        (void) !scanf("%[^\n]%*c", line);
         char command[4096];
         char option[4096];
         sscanf(line, "%s %s", command, option);
