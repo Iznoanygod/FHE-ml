@@ -33,7 +33,12 @@ int predict(char *image_name, int sockfd,
     socket_send(sockfd, inputbuff, file_length);
     free(inputbuff);
 //receive file from server
-    
+    char *inter_buffer;
+    int inter_length = socket_read(sockfd, &inter_buffer);
+    FILE *inter_file = fopen("inter.ctxt", "w+");
+    fwrite(inter_buffer, 1, inter_length, inter_file);
+    fclose(inter_file);
+    Serial::DeserializeFromFile("inter.ctxt", ctxt, SerType::BINARY);
 
     Plaintext in_between;
     cc->Decrypt(key.secretKey, ctxt, &in_between);
@@ -60,7 +65,14 @@ int predict(char *image_name, int sockfd,
     socket_send(sockfd, interbuff, file_length);
     free(interbuff);
     //receive file from server
-
+    char *final_buffer;
+    int final_length = socket_read(sockfd, &final_buffer);
+    FILE *final_file = fopen("final.ctxt", "w+");
+    fwrite(final_buffer, 1, final_length, final_file);
+    fclose(final_file);
+    Serial::DeserializeFromFile("final.ctxt", ctxt, SerType::BINARY);
+    delete final_buffer;
+    delete inter_buffer;
     Plaintext result;
     cc->Decrypt(key.secretKey, ctxt, &result);
     result->SetLength(10);
@@ -68,7 +80,7 @@ int predict(char *image_name, int sockfd,
     int max = 0;
     for(int i = 0; i < 10; i++)
         if(result_vector[i] > result_vector[max])
-            max = 1;
+            max = i;
     return max;
 }
 
@@ -104,12 +116,33 @@ int main(int argc, char **argv) {
             sleep(5);
     }while(sockfd < 0);
     printf("Connected\n");
+    char *disconnect_message = (char*) "disconnect";
+    ml::Network *net = new ml::Network(784, 200, 10, 0.005);
+    net->load("net.nf");
     while(1) {
         char line[4096];
         printf(">");
         scanf("%[^\n]%*c", line);
-        
-        break;    
+        char command[4096];
+        char option[4096];
+        sscanf(line, "%s %s", command, option);
+        if(!strcmp(command, "disconnect")) {
+            socket_send(sockfd, disconnect_message, strlen(disconnect_message));
+            close(sockfd);
+            break;
+        }
+        else if(!strcmp(command, "predict")) {
+            int prediction = predict(option, sockfd, cc, keys);
+            printf("prediction: %d\n", prediction);
+            double *pixels = parse_bmp(option);
+            vector<double> pixel_vector (pixels, pixels + 784);
+            vector<double> reg_pred = net->predict(pixel_vector);
+            int rmax = 0;
+            for(int i = 1; i < 10; i++)
+                if(reg_pred[i] > reg_pred[rmax])
+                    rmax = i;
+            printf("unencrypted net result: %d\n", rmax);
+        }
     }
 
 }

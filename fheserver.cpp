@@ -85,6 +85,7 @@ ACCEPTCLIENT:
             char *input_message;
             socket_read(sock, &input_message);
             if(!strcmp(input_message, "inference_1")) {
+                printf("Performing first inference\n");
                 char *ctxt_message;
                 int length = socket_read(sock, &ctxt_message);
                 FILE *ctxt_file = fopen("input.ctxt", "w+");
@@ -92,11 +93,24 @@ ACCEPTCLIENT:
                 fclose(ctxt_file);
                 Ciphertext<DCRTPoly> input;
                 Serial::DeserializeFromFile("input.ctxt", input, SerType::BINARY);
+                printf("Received input ciphertext\n");
                 Ciphertext<DCRTPoly> inter = fhenet->first_predict(input);
+                printf("Inference complete\n");
                 Serial::SerializeToFile("inter.ctxt", inter, SerType::BINARY);
+                FILE *int_file = fopen("inter.ctxt", "r");
+                fseek(int_file, 0, SEEK_END);
+                length = ftell(int_file);
+                rewind(int_file);
+                char *inter_buffer = new char[length];
+                fread(inter_buffer, 1, length, int_file);
+                fclose(int_file);
+                socket_send(sock, inter_buffer, length);
+                printf("Result sent\n");
+                delete inter_buffer;
                 delete ctxt_message;
             }
             else if(!strcmp(input_message, "inference_2")) {
+                printf("Performing second inference\n");
                 char *ctxt_message;
                 int length = socket_read(sock, &ctxt_message);
                 FILE *ctxt_file = fopen("input.ctxt", "w+");
@@ -104,8 +118,20 @@ ACCEPTCLIENT:
                 fclose(ctxt_file);
                 Ciphertext<DCRTPoly> input;
                 Serial::DeserializeFromFile("input.ctxt", input, SerType::BINARY);
+                printf("Received input ciphertext\n");
                 Ciphertext<DCRTPoly> inter = fhenet->second_predict(input);
+                printf("Inference complete\n");
                 Serial::SerializeToFile("inter.ctxt", inter, SerType::BINARY);
+                FILE *int_file = fopen("inter.ctxt", "r");
+                fseek(int_file, 0, SEEK_END);
+                length = ftell(int_file);
+                rewind(int_file);
+                char *inter_buffer = new char[length];
+                fread(inter_buffer, 1, length, int_file);
+                fclose(int_file);
+                socket_send(sock, inter_buffer, length);
+                printf("Result sent\n");
+                delete inter_buffer;
                 delete ctxt_message;
             }
             else if(!strcmp(input_message, "disconnect")) {

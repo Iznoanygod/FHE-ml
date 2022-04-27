@@ -325,7 +325,6 @@ namespace ml {
         Ciphertext<DCRTPoly> hidden = weights_ih->multiply(input);
         Ciphertext<DCRTPoly> hidden_bias = cc->EvalAdd(bias_h, hidden);
         //Ciphertext<DCRTPoly> hidden_sigmoid = cc->EvalPoly(hidden_bias, {0.5, 0.164128, 0, -0.00260371, 0, 0.000014906});
-        std::cout << "checkpoint 1" << std::endl;
         /*std::cout << "checkpoint 2" << std::endl;
         Ciphertext<DCRTPoly> output = weights_ho->multiply(hidden_sigmoid);
         output = cc->EvalAdd(bias_o, output);
