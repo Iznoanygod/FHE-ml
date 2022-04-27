@@ -10,7 +10,7 @@
 
 int main(int argc, char **argv) {
     if(!strcmp(argv[1], "train")) {
-        ml::Network *net = new ml::Network(784, 200, 10, 0.005);
+        ml::Network *net = new ml::Network(784, 200, 10, 0.001);
         net->load(argv[2]);
         int epoch = atoi(argv[3]);
         std::string line;
@@ -43,12 +43,12 @@ int main(int argc, char **argv) {
         net->save(argv[2]);
     }
     else if(!strcmp(argv[1], "create")) {
-        ml::Network *net = new ml::Network(784, 200, 10, 0.005);
+        ml::Network *net = new ml::Network(784, 200, 10, 0.001);
         net->randomize_weights();
         net->save(argv[2]);
     }
     else if(!strcmp(argv[1], "test")) {
-        ml::Network *net = new ml::Network(784, 200, 10, 0.005);
+        ml::Network *net = new ml::Network(784, 200, 10, 0.001);
         net->load(argv[2]);
         std::string line;
         std::ifstream test_file("../mnist_test.csv");
@@ -86,7 +86,7 @@ int main(int argc, char **argv) {
         LPKeyPair<DCRTPoly> keys;
         Serial::DeserializeFromFile("public.kf", keys.publicKey, SerType::BINARY);
         Serial::DeserializeFromFile("private.kf", keys.secretKey, SerType::BINARY);
-        ml::Network *net = new ml::Network(784, 200, 10, 0.005);
+        ml::Network *net = new ml::Network(784, 200, 10, 0.001);
         net->load(argv[2]);
         std::string weight_dir = argv[3];
         ml::FHENetwork *fhenet = new ml::FHENetwork(net, cc, keys);

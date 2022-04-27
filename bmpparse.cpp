@@ -18,15 +18,27 @@ double *parse_bmp(char *file_name) {
     double mat[28][28];
     for(int i = 0; i < 28; i++) {
         for(int j = 0; j < 28; j++) {
-            char pixel;
+            unsigned char pixel;
             (void)!fread(&pixel, 1, 1, input_file);
             pixel = 0xFF - pixel;
             double pixel_value = pixel / 255.0;
             mat[27-i][j] = pixel_value;
         }
     }
+    for(int i = 0; i < 28; i++){
+        for(int j = 0; j < 28; j++) {
+            if(mat[i][j] < 0.1)
+                printf(" ");
+            else if(mat[i][j] < 0.5) {
+                printf("%%");
+            }
+            else
+                printf("#");
+        }
+        printf("\n");
+    }
     for(int i = 0; i < 28*28; i++) {
-        vector[i] = mat[i%28][i/28];
+        vector[i] = mat[i/28][i%28];
     }
     fclose(input_file);
     return vector;
