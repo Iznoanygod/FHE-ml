@@ -1,142 +1,136 @@
 #include "fheml.h"
 #include <math.h>
-#include <numeric>
 #include <cstdio>
+#include <sys/stat.h>
 
-fhe::Matrix *sigmoid(const fhe::Matrix *M) {
-    fhe::Matrix *temp = new fhe::Matrix(M->get_rows(), M->get_cols());
-    
-    for(int i = 0; i < temp->get_rows(); i++) {
-        for(int j = 0; j < temp->get_cols(); j++) {
-            double sig = 1. / (1 + exp(-M->at(i,j)));
-            temp->set(i,j,sig);
-        }
+#include "ciphertext-ser.h"
+#include "cryptocontext-ser.h"
+#include "scheme/ckks/ckks-ser.h"
+#include "pubkeylp-ser.h"
+
+vector<double> sigmoid(vector<double> vec) {
+    vector<double> v(vec.size());
+    for(int i = 0; i < (int) vec.size(); i++) {
+        v[i] = 1 / (1 + exp(-vec[i]));
     }
-    
-    return temp;
+    return v;
 }
 
-fhe::Matrix *dsigmoid(const fhe::Matrix *M) {
-    fhe::Matrix *sig = sigmoid(M);
-    
-    for(int i = 0; i < sig->get_rows(); i++){
-        for(int j = 0; j < sig->get_cols(); j++){
-            double s = sig->at(i,j);
-            sig->set(i,j,s * (1.0 - s));
-        }
+vector<double> dsigmoid(vector<double> vec) {
+    vector<double> v(vec.size());
+    for(int i = 0; i < (int) vec.size(); i++) {
+        double x = 1 / (1 + exp(-vec[i]));
+        v[i] = x * (1 - x);
     }
-    
-    return sig;
+    return v;
 }
 
-fhe::FHEMatrix *sigmoid(const fhe::FHEMatrix *M) {
-    fhe::FHEMatrix *temp = new fhe::FHEMatrix(M->get_rows(), M->get_cols(), M->get_cc());
-    
-    for(int i = 0; i < temp->get_rows(); i++) {
-        for(int j = 0; j < temp->get_cols(); j++) {
-            Ciphertext_t ct = M->at(i,j);
-            Ciphertext_t sig = M->get_cc()->EvalPoly(ct, {0.000186759, 0.0, -0.0098156, 0.0, 0.22769, 0.5});
-            temp->set(i,j,sig);
-        }
+vector<double> add(vector<double> a, vector<double> b) {
+    vector<double> v(a.size());
+    for(int i = 0; i < (int) a.size(); i++) {
+        v[i] = a[i] + b[i];
     }
-
-    return temp;
+    return v;
 }
 
-fhe::FHEMatrix *dsigmoid(const fhe::FHEMatrix *M) {
-    fhe::FHEMatrix *temp = new fhe::FHEMatrix(M->get_rows(), M->get_cols(), M->get_cc());
-
-    for(int i = 0; i < temp->get_rows(); i++) {
-        for(int j = 0; j < temp->get_cols(); j++) {
-            CryptoContext<DCRTPoly> cc = M->get_cc();
-            Ciphertext_t ct = M->at(i,j);
-
-            Ciphertext_t dsig = cc->EvalPoly(ct, {0.000933795, 0.0, -0.0294468, 0.0, 0.227692});
-            
-        }
+vector<double> subtract(vector<double> a, vector<double> b) {
+    vector<double> v(a.size());
+    for(int i = 0; i < (int) a.size(); i++) {
+        v[i] = a[i] - b[i];
     }
+    return v;
+}
 
-    return temp;
+vector<double> multiply(vector<double> a, vector<double> b) {
+    vector<double> v(a.size());
+    for(int i = 0; i < (int) a.size(); i++) {
+        v[i] = a[i] * b[i];
+    }
+    return v;
+}
+
+vector<double> multiply(vector<double> a, double val) {
+    vector<double> v(a.size());
+    for(int i = 0; i < (int) a.size(); i++) {
+        v[i] = a[i] * val;
+    }
+    return v;
+}
+
+mat::Matrix *product(vector<double> a, vector<double> b) {
+    int row = a.size();
+    int col = b.size();
+
+    mat::Matrix *mat = new mat::Matrix(row, col);
+    for(int i = 0; i < row; i++)
+        for(int j = 0; j < col; j++)
+            mat->set(i, j, a[i] * b[j]);
+    return mat;
+
 }
 
 namespace ml {
-    
-    Network::Network(int i, int h, int o, double l_rate) {
-        this->weights_ih = new fhe::Matrix(h, i);
-        this->weights_ho = new fhe::Matrix(o, h);
-        this->bias_h = new fhe::Matrix(h, 1);
-        this->bias_o = new fhe::Matrix(o, 1);
+    Network::Network(int input, int hidden, int output, double l_rate) {
         this->l_rate = l_rate;
+
+        this->weights_ih = new mat::Matrix(hidden, input);
+        this->weights_ho = new mat::Matrix(output, hidden);
+        this->bias_h.resize(hidden);
+        this->bias_o.resize(output);
     }
 
     Network::~Network() {
         delete this->weights_ih;
         delete this->weights_ho;
-        delete this->bias_h;
-        delete this->bias_o;
     }
 
-    fhe::Matrix *Network::predict(fhe::Matrix *input) {
-        fhe::Matrix *hidden = weights_ih->multiply(input);
-        hidden->add(bias_h);
-        fhe::Matrix *hidden_sigmoid = sigmoid(hidden);
-
-        fhe::Matrix *output = weights_ho->multiply(hidden_sigmoid);
-        output->add(bias_o);
-        fhe::Matrix *output_sigmoid = sigmoid(output);
-
-        delete hidden;
-        delete hidden_sigmoid;
-        delete output;
+    vector<double> Network::predict(vector<double> input) const {
+        vector<double> hidden = weights_ih->multiply(input);
+        hidden = add(bias_h, hidden);
+        vector<double> hidden_sigmoid = sigmoid(hidden);
+        
+        vector<double> output = weights_ho->multiply(hidden_sigmoid);
+        output = add(bias_o, output);
+        vector<double> output_sigmoid = sigmoid(output);
+        
         return output_sigmoid;
     }
 
-    void Network::train(fhe::Matrix *input, fhe::Matrix *target) {
-        fhe::Matrix *hidden = weights_ih->multiply(input);
-        hidden->add(bias_h);
-        fhe::Matrix *hidden_sigmoid = sigmoid(hidden);
-
-        fhe::Matrix *output = weights_ho->multiply(hidden_sigmoid);
-        output->add(bias_o);
-        fhe::Matrix *output_sigmoid = sigmoid(output);
-
-        fhe::Matrix *error = target->copy();
-        error->subtract(output_sigmoid);
-        fhe::Matrix *gradient = dsigmoid(output_sigmoid);
-        gradient->element_multiply(error);
-        gradient->multiply(l_rate);
-
-        fhe::Matrix *hidden_T = hidden->T();
-        fhe::Matrix *who_delta = gradient->multiply(hidden_T);
-
+    void Network::train(vector<double> input, vector<double> target) {
+        vector<double> hidden = weights_ih->multiply(input);
+        hidden = add(bias_h, hidden);
+        vector<double> hidden_sigmoid = sigmoid(hidden);
+        
+        vector<double> output = weights_ho->multiply(hidden_sigmoid);
+        output = add(bias_o, output);
+        vector<double> output_sigmoid = sigmoid(output);
+        
+        vector<double> error;
+        for(int i = 0; i < (int) target.size(); i++)
+            error.push_back(target[i]);
+        
+        error = subtract(error, output_sigmoid);
+        vector<double> gradient = dsigmoid(output_sigmoid);
+        gradient = multiply(gradient, error);
+        gradient = multiply(gradient, l_rate);
+        
+        mat::Matrix *who_delta = product(gradient, hidden);
         weights_ho->add(who_delta);
-        bias_o->add(gradient);
+        bias_o = add(bias_o, gradient);
+        
+        mat::Matrix *who_T = weights_ho->T();
+        vector<double> hidden_errors = who_T->multiply(error);
+        vector<double> h_gradient = dsigmoid(hidden);
+        h_gradient = multiply(h_gradient, hidden_errors);
+        h_gradient = multiply(h_gradient, l_rate);
 
-        fhe::Matrix *who_T = weights_ho->T();
-        fhe::Matrix *hidden_errors = who_T->multiply(error);
-
-        fhe::Matrix *h_gradient = dsigmoid(hidden);
-        h_gradient->element_multiply(hidden_errors);
-        h_gradient->multiply(l_rate);
-
-        fhe::Matrix *i_T = input->T();
-        fhe::Matrix *wih_delta = h_gradient->multiply(i_T);
+        mat::Matrix *wih_delta = product(h_gradient, input);
 
         weights_ih->add(wih_delta);
-        bias_h->add(h_gradient);
+        bias_h = add(bias_h, h_gradient);
 
-        delete hidden;
-        delete hidden_sigmoid;
-        delete output;
-        delete output_sigmoid;
-        delete error;
-        delete gradient;
-        delete hidden_T;
         delete who_delta;
         delete who_T;
-        delete hidden_errors;
-        delete h_gradient;
-        delete i_T;
         delete wih_delta;
     }
 
@@ -150,140 +144,181 @@ namespace ml {
             for(int j = 0; j < weights_ho->get_cols(); j++)
                 weights_ho->set(i,j,((double)rand()/(double)RAND_MAX) * 2 - 1);
 
-        for(int i = 0; i < bias_h->get_rows(); i++)
-            for(int j = 0; j < bias_h->get_cols(); j++)
-                bias_h->set(i,j,((double)rand()/(double)RAND_MAX) * 2 - 1);
+        for(int i = 0; i < (int) bias_h.size(); i++)
+            bias_h[i] = ((double)rand()/(double)RAND_MAX) * 2 - 1;
 
-        for(int i = 0; i < bias_o->get_rows(); i++)
-            for(int j = 0; j < bias_o->get_cols(); j++)
-                bias_o->set(i,j,((double)rand()/(double)RAND_MAX) * 2 - 1);
+        for(int i = 0; i < (int) bias_o.size(); i++)
+            bias_o[i] = ((double)rand()/(double)RAND_MAX) * 2 - 1;
     }
-    
-    void Network::save(std::string file_name) {
-        FILE *fp = fopen(file_name.c_str(), "w");
+
+    void Network::save(std::string file_path) const {
+        FILE *fp = fopen(file_path.c_str(), "w");
+
         int input_size = weights_ih->get_cols();
         int hidden_size = weights_ih->get_rows();
         int output_size = weights_ho->get_rows();
+
         fwrite(&input_size, sizeof(input_size), 1, fp);
         fwrite(&hidden_size, sizeof(hidden_size), 1, fp);
         fwrite(&output_size, sizeof(output_size), 1, fp);
         fwrite(&l_rate, sizeof(l_rate), 1, fp);
-        double **ih_mat = weights_ih->get_mat();
-        double **ho_mat = weights_ho->get_mat();
-        for(int i = 0; i < weights_ih->get_rows(); i++) {
-            fwrite(ih_mat[i], sizeof(*ih_mat[i]), weights_ih->get_cols(), fp);
-        }
-        for(int i = 0; i < weights_ho->get_rows(); i++) {
-            fwrite(ho_mat[i], sizeof(*ho_mat[i]), weights_ho->get_cols(), fp);
-        }
-        double **bh_mat = bias_h->get_mat();
-        double **bo_mat = bias_o->get_mat();
-        for(int i = 0; i < bias_h->get_rows(); i++) {
-            fwrite(bh_mat[i], sizeof(*bh_mat[i]), bias_h->get_cols(), fp);
-        }
-        for(int i = 0; i < bias_o->get_rows(); i++) {
-            fwrite(bo_mat[i], sizeof(*bh_mat[i]), bias_o->get_cols(), fp);
-        }
+        
+        vector<vector<double>> ih_mat = weights_ih->get_mat();
+        vector<vector<double>> ho_mat = weights_ho->get_mat();
+        for(int i = 0; i < weights_ih->get_rows(); i++)
+            for(int j = 0; j < weights_ih->get_cols(); j++)
+                fwrite(&ih_mat[i][j], sizeof(double), 1, fp);
 
+        for(int i = 0; i < weights_ho->get_rows(); i++)
+            for(int j = 0; j < weights_ho->get_cols(); j++)
+                fwrite(&ho_mat[i][j], sizeof(double), 1, fp);
+
+        for(int i = 0; i < hidden_size; i++)
+            fwrite(&bias_h[i], sizeof(double), 1, fp);
+        
+        for(int i = 0; i < output_size; i++)
+            fwrite(&bias_o[i], sizeof(double), 1, fp);
+        
         fclose(fp);
     }
 
-    void Network::load(std::string file_name) {
-        FILE *fp = fopen(file_name.c_str(), "r");
-        if(fp == NULL){
+    void Network::load(std::string file_path) {
+        FILE *fp = fopen(file_path.c_str(), "r");
+        if(fp == NULL) {
             std::cout << "Error: file doesn't exist" << std::endl;
-            throw -1;
+            return;
         }
+
         int input_size;
         int hidden_size;
         int output_size;
-        double l_rate;
 
-        fread(&input_size, sizeof(input_size), 1, fp);
-        fread(&hidden_size, sizeof(hidden_size), 1, fp);
-        fread(&output_size, sizeof(output_size), 1, fp);
-        fread(&l_rate, sizeof(l_rate), 1, fp);
-        double **ih_mat = weights_ih->get_mat();
-        double **ho_mat = weights_ho->get_mat();
+        (void) !fread(&input_size, sizeof(input_size), 1, fp);
+        (void) !fread(&hidden_size, sizeof(hidden_size), 1, fp);
+        (void) !fread(&output_size, sizeof(output_size), 1, fp);
+        (void) !fread(&l_rate, sizeof(l_rate), 1, fp);
+
+        vector<vector<double>> ih_mat = weights_ih->get_mat();
         for(int i = 0; i < weights_ih->get_rows(); i++) {
-            fread(ih_mat[i], sizeof(*ih_mat[i]), weights_ih->get_cols(), fp);
+            for(int j = 0; j < weights_ih->get_cols(); j++) {
+                double in;
+                (void) !fread(&in, sizeof(double), 1, fp);
+                weights_ih->set(i, j, in);
+            }
         }
+
+        vector<vector<double>> ho_mat = weights_ho->get_mat();
         for(int i = 0; i < weights_ho->get_rows(); i++) {
-            fread(ho_mat[i], sizeof(*ho_mat[i]), weights_ho->get_cols(), fp);
+            for(int j = 0; j < weights_ho->get_cols(); j++) {
+                double in;
+                (void) !fread(&in, sizeof(double), 1, fp);
+                weights_ho->set(i, j, in);
+            }
         }
-        double **bh_mat = bias_h->get_mat();
-        double **bo_mat = bias_o->get_mat();
-        for(int i = 0; i < bias_h->get_rows(); i++) {
-            fread(bh_mat[i], sizeof(*bh_mat[i]), bias_h->get_cols(), fp);
-        }
-        for(int i = 0; i < bias_o->get_rows(); i++) {
-            fread(bo_mat[i], sizeof(*bh_mat[i]), bias_o->get_cols(), fp);
-        }
+        for(int i = 0; i < hidden_size; i++)
+            (void) !fread(&bias_h[i], sizeof(double), 1, fp);
+        for(int i = 0; i < output_size; i++)
+            (void) !fread(&bias_o[i], sizeof(double), 1, fp);
         fclose(fp);
     }
 
-    fhe::Matrix *Network::get_weights_ih() {
+    mat::Matrix *Network::get_weights_ih() const {
         return weights_ih;
     }
 
-    fhe::Matrix *Network::get_weights_ho() {
+    mat::Matrix *Network::get_weights_ho() const {
         return weights_ho;
     }
 
-    fhe::Matrix *Network::get_bias_h() {
+    vector<double> Network::get_bias_h() const {
         return bias_h;
     }
 
-    fhe::Matrix *Network::get_bias_o() {
+    vector<double> Network::get_bias_o() const {
         return bias_o;
     }
 
-    FHENetwork::FHENetwork(int i, int h, int o, double l_rate,
-            CryptoContext<DCRTPoly> cc) {
-        this->weights_ih = new fhe::FHEMatrix(h, i, cc);
-        this->weights_ho = new fhe::FHEMatrix(o, h, cc);
-        this->bias_h = new fhe::FHEMatrix(h, 1, cc);
-        this->bias_o = new fhe::FHEMatrix(o, 1, cc);
+    double Network::get_l_rate() const {
+        return l_rate;
+    }
+    
+    FHENetwork::FHENetwork(Network *net, CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> keys) {
+        
+        this->cc = cc;
+        this->key = keys;
+        this->weights_ih = new mat::FHEMatrix(net->get_weights_ih(), this->cc, this->key);
+        this->weights_ho = new mat::FHEMatrix(net->get_weights_ho(), this->cc, this->key);
+
+        Plaintext pbias_h = cc->MakeCKKSPackedPlaintext(net->get_bias_h());
+        Plaintext pbias_o = cc->MakeCKKSPackedPlaintext(net->get_bias_o());
+        
+        this->bias_h = cc->Encrypt(this->key.publicKey, pbias_h);
+        this->bias_o = cc->Encrypt(this->key.publicKey, pbias_o);
+
+        this->l_rate = net->get_l_rate();
+    }
+
+    FHENetwork::FHENetwork(std::string dir_path,
+            CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> keys,
+            int input, int hidden, int output, double l_rate) {
+        this->cc = cc;
+        this->key = keys;
+        vector<Ciphertext<DCRTPoly>> wih;
+        for(int i = 0; i < hidden; i++) {
+            Ciphertext<DCRTPoly> temp;
+            Serial::DeserializeFromFile(dir_path + "/weightsih" + std::to_string(i) + ".nw", temp, SerType::BINARY);
+            wih.push_back(temp);
+        }
+        this->weights_ih = new mat::FHEMatrix(hidden, input, wih, cc);
+        vector<Ciphertext<DCRTPoly>> who;
+        for(int i = 0; i < output; i++) {
+            Ciphertext<DCRTPoly> temp;
+            Serial::DeserializeFromFile(dir_path + "/weightsho" + std::to_string(i) + ".nw", temp, SerType::BINARY);
+            who.push_back(temp);
+        }
+        this->weights_ho = new mat::FHEMatrix(output, hidden, who, cc);
+        Serial::DeserializeFromFile(dir_path + "/biash.nw", this->bias_h, SerType::BINARY);
+        Serial::DeserializeFromFile(dir_path + "/biaso.nw", this->bias_o, SerType::BINARY);
         this->l_rate = l_rate;
     }
 
     FHENetwork::~FHENetwork() {
         delete this->weights_ih;
         delete this->weights_ho;
-        delete this->bias_h;
-        delete this->bias_o;
     }
 
-    fhe::FHEMatrix *FHENetwork::predict(fhe::FHEMatrix *input) {
-        fhe::FHEMatrix *hidden = weights_ih->multiply(input);
-        hidden->add(bias_h);
-        fhe::FHEMatrix *hidden_sigmoid = sigmoid(hidden);
-
-        fhe::FHEMatrix *output = weights_ho->multiply(hidden_sigmoid);
-        output->add(bias_o);
-        fhe::FHEMatrix *output_sigmoid = sigmoid(output);
-
-        delete hidden;
-        delete hidden_sigmoid;
-        delete output;
-        return output_sigmoid;
+    Ciphertext<DCRTPoly> FHENetwork::first_predict(Ciphertext<DCRTPoly> input) const {
+        Ciphertext<DCRTPoly> hidden = weights_ih->multiply(input);
+        Ciphertext<DCRTPoly> hidden_bias = cc->EvalAdd(bias_h, hidden);
+        return hidden_bias;
     }
 
-    void FHENetwork::full_train(fhe::FHEMatrix *, fhe::FHEMatrix *) {
-
+    Ciphertext<DCRTPoly> FHENetwork::second_predict(Ciphertext<DCRTPoly> input) const {
+        Ciphertext<DCRTPoly> hidden = weights_ho->multiply(input);
+        auto hidden_bias = cc->EvalAdd(bias_o, hidden);
+        return hidden_bias;
     }
     
-    void FHENetwork::load_weights(fhe::FHEMatrix *ih, fhe::FHEMatrix *ho,
-            fhe::FHEMatrix *bh, fhe::FHEMatrix *bo) {
-        delete this->weights_ih;
-        delete this->weights_ho;
-        delete this->bias_h;
-        delete this->bias_o;
-
-        weights_ih = ih;
-        weights_ho = ho;
-        bias_h = bh;
-        bias_o = bo;
+    CryptoContext<DCRTPoly> FHENetwork::get_cc() {
+        return cc;
     }
 
+    LPKeyPair<DCRTPoly> FHENetwork::get_key() {
+        return key;
+    }
+
+    void FHENetwork::save(std::string dir_path) const {
+        mkdir(dir_path.c_str(), 0777);
+        Serial::SerializeToFile(dir_path + "/biash.nw", bias_h, SerType::BINARY);
+        Serial::SerializeToFile(dir_path + "/biaso.nw", bias_o, SerType::BINARY);
+        vector<Ciphertext<DCRTPoly>> ihv = weights_ih->get_mat();
+        for(int i = 0; i < weights_ih->get_rows(); i++){
+            Serial::SerializeToFile(dir_path + "/weightsih" + std::to_string(i) + ".nw", ihv[i], SerType::BINARY);
+        }
+        vector<Ciphertext<DCRTPoly>> hov = weights_ho->get_mat();
+        for(int i = 0; i < weights_ho->get_rows(); i++) {
+            Serial::SerializeToFile(dir_path + "/weightsho" + std::to_string(i) + ".nw", hov[i], SerType::BINARY);
+        }
+    }
 }
+

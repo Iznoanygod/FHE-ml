@@ -47,15 +47,26 @@ endif()
 ### EXAMPLE:
 add_library( fhematrix SHARED fhematrix.cpp)
 add_library( fheml SHARED fheml.cpp )
+add_library( bmpparse SHARED bmpparse.cpp)
+add_library( socketio SHARED socketio.cpp)
 add_executable( fheclient fheclient.cpp )
+add_executable( fheserver fheserver.cpp )
+add_executable( fhetrain fhetrain.cpp )
 
 target_link_libraries( fheml fhematrix)
 target_link_libraries( fheclient fhematrix)
 target_link_libraries( fheclient fheml)
+target_link_libraries( fheclient bmpparse)
+target_link_libraries( fheclient socketio)
+
+target_link_libraries(fheserver fhematrix)
+target_link_libraries(fheserver fheml)
+target_link_libraries(fheserver socketio)
+
+target_link_libraries(fhetrain fhematrix)
+target_link_libraries(fhetrain fheml)
+
 target_compile_options( fhematrix PRIVATE -g)
 target_compile_options( fheml PRIVATE -g)
 target_compile_options( fheclient PRIVATE -g)
-if(AVX)
-    target_compile_options ( fhematrix PRIVATE -mavx2)
-endif()
 

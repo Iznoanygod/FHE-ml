@@ -1,133 +1,134 @@
 #include "fheml.h"
+#include <iostream>
 #include <fstream>
+#include "bmpparse.h"
+#include "socketio.h"
+#include <unistd.h>
+#include <cmath>
 
-int main(int argc, char** argv) {
-    uint32_t multDepth = 1;
-    uint32_t scaleFactorBits = 20;
-    uint32_t batchSize = 1;
+#include "ciphertext-ser.h"
+#include "cryptocontext-ser.h"
+#include "scheme/ckks/ckks-ser.h"
+#include "pubkeylp-ser.h"
 
-    SecurityLevel securityLevel = HEStd_128_classic;
 
-	CryptoContext<DCRTPoly> cc =
-		CryptoContextFactory<DCRTPoly>::genCryptoContextCKKS(
-			multDepth, scaleFactorBits, batchSize, securityLevel);
-
-	cc->Enable(ENCRYPTION);
-	cc->Enable(SHE);
-
-    auto keys = cc->KeyGen();
+int predict(char *image_name, int sockfd,
+        CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> key) {
+    double *pixels = parse_bmp(image_name);
+    vector<double> pixel_vector (pixels, pixels + 784);
+    Plaintext ptxt = cc->MakeCKKSPackedPlaintext(pixel_vector);
+    Ciphertext<DCRTPoly> ctxt = cc->Encrypt(key.publicKey, ptxt);
     
-    cc->EvalMultKeyGen(keys.secretKey);
+    char *message = (char*) "inference_1";
+    socket_send(sockfd, message, strlen(message));
+    Serial::SerializeToFile("input.ctxt", ctxt, SerType::BINARY);
+    int file_length;
+    FILE *inputctxt = fopen("input.ctxt", "r");
+    fseek(inputctxt, 0, SEEK_END);
+    file_length = ftell(inputctxt);
+    rewind(inputctxt);
+    char* inputbuff = (char*) malloc(file_length);
+    (void) !fread(inputbuff, 1, file_length, inputctxt);
+    fclose(inputctxt);
+    socket_send(sockfd, inputbuff, file_length);
+    free(inputbuff);
     
-    //vector<double> vectxt = {0.1, 0.2, 0.3};
+    char *inter_buffer;
+    int inter_length = socket_read(sockfd, &inter_buffer);
+    FILE *inter_file = fopen("inter.ctxt", "w+");
+    fwrite(inter_buffer, 1, inter_length, inter_file);
+    fclose(inter_file);
+    Serial::DeserializeFromFile("inter.ctxt", ctxt, SerType::BINARY);
 
-    //auto ptxt = cc->MakeCKKSPackedPlaintext(vectxt);
-
-    //auto ctxt = cc->Encrypt(keys.publicKey, ptxt);
-
-    //std::cout << sizeof(ctxt) << std::endl;
-    /*fhe::Matrix *M = new fhe::Matrix(2,2);
-    M->set(0,0,1);
-    M->set(0,1,2);
-    M->set(1,0,3);
-    M->set(1,1,4);
-
-    std::cout << M->toString() << std::endl;
+    Plaintext in_between;
+    cc->Decrypt(key.secretKey, ctxt, &in_between);
+    in_between->SetLength(200);
+    vector<double> in_b = in_between->GetRealPackedValue();
     
-    fhe::FHEMatrix *M_e = new fhe::FHEMatrix(M,cc, keys);
-    fhe::FHEMatrix *MM_e = M_e->multiply(M_e);
-    fhe::Matrix *M_d = MM_e->decrypt(keys);
+    for(int i = 0; i < 200; i++)
+        in_b[i] = 1 / (1 + exp(-in_b[i]));
 
-    std::cout << M_d->toString() << std::endl;
+    in_between = cc->MakeCKKSPackedPlaintext(in_b);
+    ctxt = cc->Encrypt(key.publicKey, in_between);
+    
+    message = (char*) "inference_2";
+    socket_send(sockfd, message, strlen(message));
+    Serial::SerializeToFile("inter.ctxt", ctxt, SerType::BINARY);
+    FILE *interctxt = fopen("inter.ctxt", "r");
+    fseek(inputctxt, 0, SEEK_END);
+    file_length = ftell(interctxt);
+    rewind(interctxt);
+    char* interbuff = (char*) malloc(file_length);
+    (void) !fread(interbuff, 1, file_length, interctxt);
+    fclose(interctxt);
+    socket_send(sockfd, interbuff, file_length);
+    free(interbuff);
+    
+    char *final_buffer;
+    int final_length = socket_read(sockfd, &final_buffer);
+    FILE *final_file = fopen("final.ctxt", "w+");
+    fwrite(final_buffer, 1, final_length, final_file);
+    fclose(final_file);
+    Serial::DeserializeFromFile("final.ctxt", ctxt, SerType::BINARY);
+    delete final_buffer;
+    delete inter_buffer;
+    Plaintext result;
+    cc->Decrypt(key.secretKey, ctxt, &result);
+    result->SetLength(10);
+    vector<double> result_vector = result->GetRealPackedValue();
+    int max = 0;
+    for(int i = 0; i < 10; i++)
+        if(result_vector[i] > result_vector[max])
+            max = i;
+    return max;
+}
 
-    delete M_e;
-    delete MM_e;
-    delete M;
-    delete M_d;
-    */
-    ml::Network *net = new ml::Network(784,200,10,0.005);
-    //net->randomize_weights();
-    //net->save("net.nf");
-    net->load("net1.nf");
-    std::string line;
-    /*for(int epochs = 0; epochs < 1; epochs++){
-    std::ifstream training_file("../mnist_train.csv");
-    int t_cout = 0;
-    while(getline(training_file, line)) {
-        //std::cout << line << std::endl; 
-        std::stringstream s_stream(line);
-        std::string tar;
-        getline(s_stream, tar, ',');
-        int target = std::stoi(tar);
-        
-        fhe::Matrix *target_vector = new fhe::Matrix(10,1);
-        for(int i = 0; i < 10; i++)
-            target_vector->set(i,0,0);
-        target_vector->set(target,0,1.0);
-
-        fhe::Matrix *input = new fhe::Matrix(784,1);
-        
-        for(int i = 0; i < 784; i++) {
-            std::string val;
-            getline(s_stream, tar, ',');
-            int ta = std::stoi(tar);
-            input->set(i,0,ta / 255.);
-        }
-        net->train(input, target_vector); 
-        delete input;
-        delete target_vector;
-        if(t_cout % 1000 == 0) {
-            std::cout << t_cout << std::endl;
-        }
-        t_cout++;
+int main(int argc, char **argv) {
+    if(argc != 3) {
+        printf("Usage: fheclient ip port\n");
+        return 0;
     }
-    }*/
-    std::ifstream test_file("../mnist_test.csv");
-    int correct = 0;
-    int total = 0;
-    while(getline(test_file, line)) {
-        std::stringstream s_stream(line);
-        std::string tar;
-        getline(s_stream, tar, ',');
-        int target = std::stoi(tar);
-        
-        fhe::Matrix *target_vector = new fhe::Matrix(10,1);
-        for(int i = 0; i < 10; i++)
-            target_vector->set(i,0,0);
-        target_vector->set(target,0,1.0);
+    printf("Loading contexts...");
+    CryptoContext<DCRTPoly> cc;
+    cc->ClearEvalMultKeys();
+    cc->ClearEvalAutomorphismKeys();
+    cc->ClearEvalSumKeys();
+    lbcrypto::CryptoContextFactory<lbcrypto::DCRTPoly>::ReleaseAllContexts();
+    Serial::DeserializeFromFile("cryptocontext.cf", cc, SerType::BINARY);
+    LPKeyPair<DCRTPoly> keys;
+    Serial::DeserializeFromFile("public.kf", keys.publicKey, SerType::BINARY);
+    Serial::DeserializeFromFile("private.kf", keys.secretKey, SerType::BINARY);
 
-        fhe::Matrix *input = new fhe::Matrix(784,1);
-        
-        for(int i = 0; i < 784; i++) {
-            std::string val;
-            getline(s_stream, tar, ',');
-            int ta = std::stoi(tar);
-            input->set(i,0,ta / 255.);
-        }
-        fhe::Matrix *prediction = net->predict(input);
-        std::cout << prediction->toString() << std::endl;
-        int max = 0;
-        for(int i = 0; i < 10; i++)
-            if(prediction->at(i,0) > prediction->at(max,0))
-                max = i;
-        std::cout << "predicted:"+std::to_string(max)+" | target:"+std::to_string(target) <<std::endl;
-        total++;
-        if(max == target)
-            correct++;
-    }
-    double percent = correct * 100. / total;
-    std::cout << percent <<std::endl;
-    net->save("net1.nf");
-    fhe::FHEMatrix *wih_e = new fhe::FHEMatrix(net->get_weights_ih(), cc, keys);
-    std::cout << "Matrix 1" << std::endl;
-    fhe::FHEMatrix *who_e = new fhe::FHEMatrix(net->get_weights_ho(), cc, keys);
-    std::cout << "Matrix 2" << std::endl;
-    fhe::FHEMatrix *bh_e = new fhe::FHEMatrix(net->get_bias_h(), cc, keys);
-    std::cout << "Matrix 3" << std::endl;
-    fhe::FHEMatrix *bo_e = new fhe::FHEMatrix(net->get_bias_o(), cc, keys);
-    std::cout << "Matrices created" << std::endl;
-    ml::FHENetwork *fhenet = new ml::FHENetwork(784,200,10,0.005,cc);
-    fhenet->load_weights(wih_e, who_e, bh_e, bo_e);
+    printf("Done\n");
+
+    printf("Connecting to server...\n");
+    int sockfd;
+    do{
+        sockfd = socket_connect(argv[1], atoi(argv[2]));
+        if(sockfd < 0)
+            sleep(5);
+    }while(sockfd < 0);
+    printf("Connected\n");
+    char *disconnect_message = (char*) "disconnect";
     
-    return 0;
+    while(1) {
+        char line[4096];
+        printf(">");
+        (void) !scanf("%[^\n]%*c", line);
+        char command[4096];
+        char option[4096];
+        sscanf(line, "%s %s", command, option);
+        if(!strcmp(command, "disconnect")) {
+            socket_send(sockfd, disconnect_message, strlen(disconnect_message));
+            close(sockfd);
+            break;
+        }
+        else if(!strcmp(command, "predict")) {
+            int prediction = predict(option, sockfd, cc, keys);
+            printf("prediction: %d\n", prediction);
+            double *pixels = parse_bmp(option);
+            vector<double> pixel_vector (pixels, pixels + 784);
+        }
+    }
+
 }

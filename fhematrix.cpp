@@ -1,54 +1,44 @@
 #include "fhematrix.h"
 
-namespace fhe {
+namespace mat {
     Matrix::Matrix(int rows, int cols) {
         this->rows = rows;
         this->cols = cols;
 
-        this->mat = new double *[rows];
-        for(int i = 0; i < rows; i++)
-            this->mat[i] = new double[cols];
+        this->mat.resize(rows, vector<double>(cols));
     }
 
-    Matrix::~Matrix() {
-        for(int i = 0; i < rows; i++)
-            delete[] this->mat[i];
-        delete[] mat;
-    }
-    
     int Matrix::get_rows() const {
         return rows;
     }
-
+    
     int Matrix::get_cols() const {
         return cols;
     }
 
-    void Matrix::add(double scalar) {
-        for(int i = 0; i < rows; i++)
-            for(int j = 0; j < cols; j++)
-                mat[i][j] += scalar;
+    vector<vector<double>> Matrix::get_mat() {
+        return mat;
+    }
+
+    void Matrix::add(double val) {
+        for(vector<double>& x : mat)
+            for(double& y: x)
+                y += val;
     }
 
     void Matrix::add(Matrix *M) {
-        if(rows != M->get_rows() || cols != M->get_cols())
-            throw -1;
-
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)
-                mat[i][j] += M->at(i,j);
+                mat[i][j] += M->at(i, j);
     }
 
-    void Matrix::subtract(double scalar) {
-        for(int i = 0; i < rows; i++)
-            for(int j = 0; j < cols; j++)
-                mat[i][j] -= scalar;
+    void Matrix::subtract(double val) {
+        for(vector<double>& x : mat)
+            for(double& y: x)
+                y -= val;
     }
 
     void Matrix::subtract(Matrix *M) {
-        if(rows != M->get_rows() || cols != M->get_cols())
-            throw -1;
-
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)
                 mat[i][j] -= M->at(i,j);
@@ -59,61 +49,60 @@ namespace fhe {
         for(int i = 0; i < cols; i++)
             for(int j = 0; j < rows; j++)
                 transpose->set(i, j, mat[j][i]);
-
         return transpose;
     }
 
-    void Matrix::multiply(double scalar) {
-        for(int i = 0; i < rows; i++)
-            for(int j = 0; j < cols; j++)
-                mat[i][j] *= scalar;
+    void Matrix::multiply(double val) {
+        for(vector<double>& x : mat)
+            for(double& y: x)
+                y *= val;
     }
 
     void Matrix::element_multiply(Matrix *M) {
-        if(rows != M->get_rows() || cols != M->get_cols())
-            throw -1;
-
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)
                 mat[i][j] *= M->at(i,j);
     }
-#ifdef __AVX2__
-#else
-    Matrix *Matrix::multiply(Matrix *M) const{
-        if(cols != M->get_rows())
-            throw -1;
 
+    Matrix *Matrix::multiply(Matrix *M) const {
         Matrix *temp = new Matrix(rows, M->get_cols());
         for(int i = 0; i < rows; i++) {
             for(int j = 0; j < M->get_cols(); j++) {
                 double sum = 0;
-                for(int k = 0; k < cols; k++)
+                for(int k = 0; k < cols; k++) {
                     sum += mat[i][k] * M->at(k,j);
+                }
                 temp->set(i,j,sum);
             }
         }
         return temp;
     }
-#endif
-    double Matrix::at(int m, int n) const {
-        return mat[m][n];
+
+    vector<double> Matrix::multiply(vector<double> vec) const {
+        vector<double> v(rows);
+        for(int i = 0; i < rows; i++) {
+            double sum = 0;
+            for(int j = 0; j < cols; j++) {
+                sum += mat[i][j] * vec[j];
+            }
+            v[i] = sum;
+        }
+        return v;
     }
 
-    void Matrix::set(int m, int n, double j) {
-        mat[m][n] = j;
+    double Matrix::at(int row, int col) const {
+        return mat[row][col];
     }
 
-    double **Matrix::get_mat() {
-        return mat;
+    void Matrix::set(int row, int col, double val) {
+        mat[row][col] = val;
     }
 
-    Matrix *Matrix::copy() {
+    Matrix *Matrix::copy() const {
         Matrix *temp = new Matrix(rows, cols);
-
         for(int i = 0; i < rows; i++)
             for(int j = 0; j < cols; j++)
                 temp->set(i,j,mat[i][j]);
-
         return temp;
     }
 
@@ -134,140 +123,103 @@ namespace fhe {
         return val;
     }
 
-    FHEMatrix::FHEMatrix(Matrix *mat, CryptoContext<DCRTPoly> cc, Key_t key) {
+    FHEMatrix::FHEMatrix(Matrix *mat, CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> keys) {
         this->rows = mat->get_rows();
         this->cols = mat->get_cols();
         this->cc = cc;
-        this->mat = new Ciphertext_t*[rows];
-        for(int i = 0; i < rows; i++) {
-            this->mat[i] = new Ciphertext_t[cols];
-            for(int j = 0; j < cols; j++){
-                vector<double> v = {mat->at(i,j)};
-                Plaintext ptxt = cc->MakeCKKSPackedPlaintext(v);
-                this->mat[i][j] = cc->Encrypt(key.publicKey, ptxt);
-                v.clear();
-            }
+        this->mat.resize(this->rows);
+        vector<vector<double>> vecs = mat->get_mat();
+        for(int i = 0; i < this->rows; i++) {
+            Plaintext ptxt = cc->MakeCKKSPackedPlaintext(vecs[i]);
+            Ciphertext<DCRTPoly> ctxt = cc->Encrypt(keys.publicKey, ptxt);
+            this->mat[i] = ctxt;
         }
-        
     }
 
-    FHEMatrix::FHEMatrix(int rows, int cols, CryptoContext<DCRTPoly> cc) {
+    FHEMatrix::FHEMatrix(int rows, int cols, vector<Ciphertext<DCRTPoly>> mat,
+            CryptoContext<DCRTPoly> cc) {
         this->rows = rows;
         this->cols = cols;
         this->cc = cc;
-
-        this->mat = new Ciphertext_t*[rows];
-        for(int i = 0; i < rows; i++)
-            this->mat[i] = new Ciphertext_t[cols];
-
-    }
-
-    FHEMatrix::~FHEMatrix() {
-        for(int i = 0 ; i < rows; i++)
-            delete[] mat[i];
-        delete[] mat;
+        this->mat = mat;
     }
 
     int FHEMatrix::get_rows() const {
         return rows;
     }
-    
+
     int FHEMatrix::get_cols() const {
         return cols;
     }
 
-    CryptoContext<DCRTPoly> FHEMatrix::get_cc() const {
-        return cc;
+    vector<Ciphertext<DCRTPoly>> FHEMatrix::get_mat() const {
+        return mat;
     }
 
-    void FHEMatrix::add(double scalar) {
-        for(int i = 0; i < rows; i++)
-            for(int j = 0; j < cols; j++)
-                mat[i][j] = cc->EvalAdd(mat[i][j], scalar);
+    void FHEMatrix::add(double val) {
+        for(int i = 0; i < rows; i++) {
+            Ciphertext<DCRTPoly> ctxt = cc->EvalAdd(mat[i], val);
+            mat[i] = ctxt;
+        }
     }
 
     void FHEMatrix::add(FHEMatrix *M) {
-        for(int i = 0; i < rows; i++)
-            for(int j = 0; j < cols; j++)
-                mat[i][j] = cc->EvalAdd(mat[i][j], M->at(i,j));
+        for(int i = 0; i < rows; i++) {
+            Ciphertext<DCRTPoly> ctxt = cc->EvalAdd(mat[i], M->at(i));
+            mat[i] = ctxt;
+        }
     }
 
-    void FHEMatrix::subtract(double scalar) {
-        for(int i = 0; i < rows; i++)
-            for(int j = 0; j < cols; j++)
-                mat[i][j] = cc->EvalSub(mat[i][j], scalar);
+    void FHEMatrix::subtract(double val) {
+        for(int i = 0; i < rows; i++) {
+            Ciphertext<DCRTPoly> ctxt = cc->EvalSub(mat[i], val);
+            mat[i] = ctxt;
+        }
     }
 
     void FHEMatrix::subtract(FHEMatrix *M) {
-        for(int i = 0; i < rows; i++)
-            for(int j = 0; j < cols; j++)
-                mat[i][j] = cc->EvalSub(mat[i][j], M->at(i,j));
+        for(int i = 0; i < rows; i++) {
+            Ciphertext<DCRTPoly> ctxt = cc->EvalSub(mat[i], M->at(i));
+            mat[i] = ctxt;
+        }
     }
 
-    FHEMatrix *FHEMatrix::T() {
-        FHEMatrix *transpose = new FHEMatrix(cols, rows, cc);
-        
-        for(int i = 0; i < cols; i++)
-            for(int j = 0; j < rows; j++)
-                transpose->set(i,j,mat[j][i]);
-
-        return transpose;
-    }
-
-    void FHEMatrix::multiply(double scalar) {
-        for(int i = 0; i < rows; i++)
-            for(int j = 0; j < cols; j++)
-                mat[i][j] = cc->EvalMult(mat[i][j], scalar);
+    void FHEMatrix::multiply(double val) {
+        for(int i = 0; i < rows; i++) {
+            Ciphertext<DCRTPoly> ctxt = cc->EvalMult(mat[i], val);
+            mat[i] = ctxt;
+        }
     }
 
     void FHEMatrix::element_multiply(FHEMatrix *M) {
         for(int i = 0; i < rows; i++) {
-            for(int j = 0; j < M->get_cols(); j++) {
-                mat[i][j] = cc->EvalMult(mat[i][j], M->at(i,j));
-            }
+            Ciphertext<DCRTPoly> ctxt = cc->EvalMult(mat[i], M->at(i));
+            mat[i] = ctxt;
         }
     }
 
-    FHEMatrix *FHEMatrix::multiply(FHEMatrix *M) const {
-        if(cols != M->get_rows())
-            throw -1;
-
-        FHEMatrix *temp = new FHEMatrix(rows, M->get_cols(), cc);
-
+    Ciphertext<DCRTPoly> FHEMatrix::multiply(Ciphertext<DCRTPoly> vec) const {
+        vector<Ciphertext<DCRTPoly>> ct;
+        
         for(int i = 0; i < rows; i++) {
-            for(int j = 0; j < M->get_cols(); j++) {
-                Ciphertext_t sum = cc->EvalMult(mat[i][0], M->at(0,j));
-                for(int k = 1; k < cols; k++) {
-                    Ciphertext_t val = cc->EvalMult(mat[i][k], M->at(k,j));
-                    sum = cc->EvalAdd(sum, val);
-                }
-                temp->set(i,j,sum);
-            }
+            Ciphertext<DCRTPoly> result = cc->EvalInnerProduct(vec, mat[i], cols);
+            ct.push_back(result);
         }
 
-        return temp;
+        Ciphertext<DCRTPoly> merged = cc->EvalMerge(ct);
+        return merged;
     }
 
-    Ciphertext_t FHEMatrix::at(int m, int n) const {
-        return mat[m][n];
+    Ciphertext<DCRTPoly> FHEMatrix::at(int row) const {
+        return mat[row];
     }
 
-    void FHEMatrix::set(int m, int n, Ciphertext_t c) {
-        mat[m][n] = c;
+    void FHEMatrix::set(int row, Ciphertext<DCRTPoly> vec) {
+        mat[row] = vec;
     }
 
-    Matrix *FHEMatrix::decrypt(Key_t key) const {
-        Matrix *temp = new Matrix(rows, cols);
-
-        for(int i = 0; i < rows; i++) {
-            for(int j = 0; j < cols; j++) {
-                Plaintext result;
-                cc->Decrypt(key.secretKey, mat[i][j], &result);
-                result->SetLength(1);
-                temp->set(i,j,result->GetRealPackedValue()[0]);
-            }
-        }
-        return temp;
+    Matrix *FHEMatrix::decrypt(LPKeyPair<DCRTPoly> keys) const {
+        Matrix *M = new Matrix(rows, cols);
+        return M;
     }
 }
-

@@ -3,71 +3,69 @@
 
 #include "palisade.h"
 
-#ifdef __AVX2__
-#include <x86intrin.h>
-#endif
-
 using namespace lbcrypto;
 
-#define Ciphertext_t Ciphertext<DCRTPolyImpl<bigintfxd::BigVectorImpl<bigintfxd::BigInteger<unsigned int, BigIntegerBitLength>>>>
-#define Key_t LPKeyPair<DCRTPolyImpl<bigintfxd::BigVectorImpl<bigintfxd::BigInteger<unsigned int, BigIntegerBitLength>>>>
-
-namespace fhe {
-    class Matrix {
+namespace mat {
+    class Matrix{ 
         public:
-            Matrix(int, int);
-            ~Matrix();
+            Matrix(int rows, int cols);
             int get_rows() const;
             int get_cols() const;
+            vector<vector<double>> get_mat();
 
-            void add(double);
-            void add(Matrix *);
-            void subtract(double);
-            void subtract(Matrix *);
+            void add(double val);
+            void add(Matrix *M);
+
+            void subtract(double val);
+            void subtract(Matrix *M);
+
             Matrix *T();
-            void multiply(double);
-            void element_multiply(Matrix *);
-            Matrix *multiply(Matrix *) const;
+            void multiply(double val);
+            void element_multiply(Matrix *M);
+            Matrix *multiply(Matrix *M) const;
+            vector<double> multiply(vector<double> vec) const;
 
-            double at(int, int) const;
-            void set(int, int, double);
-            
-            double **get_mat();
-            Matrix *copy();
+            double at(int row, int col) const;
+            void set(int row, int col, double val);
+
+            Matrix *copy() const;
             std::string toString() const;
         private:
             int rows;
             int cols;
-            double **mat;
+            vector<vector<double>> mat;
     };
 
     class FHEMatrix {
         public:
-            FHEMatrix(Matrix *, CryptoContext<DCRTPoly>, Key_t);
-            FHEMatrix(int, int, CryptoContext<DCRTPoly>);
-            ~FHEMatrix();
+            FHEMatrix(Matrix *mat, CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> keys);
+            FHEMatrix(int rows, int cols, vector<Ciphertext<DCRTPoly>> mat,
+                    CryptoContext<DCRTPoly> cc);
             int get_rows() const;
             int get_cols() const;
-            CryptoContext<DCRTPoly> get_cc() const;
+            vector<Ciphertext<DCRTPoly>> get_mat() const;
 
-            void add(double);
-            void add(FHEMatrix *);
-            void subtract(double);
-            void subtract(FHEMatrix *);
-            FHEMatrix *T();
-            void multiply(double);
-            void element_multiply(FHEMatrix *);
-            FHEMatrix *multiply(FHEMatrix *) const;
+            void add(double val);
+            void add(FHEMatrix *M);
 
-            Ciphertext_t at(int, int) const;
-            void set(int, int, Ciphertext_t);
-        
-            Matrix *decrypt(Key_t) const;
+            void subtract(double val);
+            void subtract(FHEMatrix *M);
+
+            void multiply(double val);
+            void element_multiply(FHEMatrix *M);
+            FHEMatrix *multiply(FHEMatrix *M) const;
+            Ciphertext<DCRTPoly> multiply(Ciphertext<DCRTPoly> vec) const;
+
+            Ciphertext<DCRTPoly> at(int row) const;
+            void set(int row, Ciphertext<DCRTPoly> vec);
+
+            Matrix *decrypt(LPKeyPair<DCRTPoly> keys) const;
+
         private:
             int rows;
             int cols;
             CryptoContext<DCRTPoly> cc;
-            Ciphertext_t **mat;
+            vector<Ciphertext<DCRTPoly>> mat;
     };
 }
 #endif

@@ -6,38 +6,56 @@
 namespace ml {
     class Network {
         public:
-            Network(int, int, int, double);
+            Network(int input, int hidden, int output, double l_rate);
             ~Network();
-            fhe::Matrix *predict(fhe::Matrix *);
-            void train(fhe::Matrix *, fhe::Matrix *);
+
+            vector<double> predict(vector<double> input) const;
+            void train(vector<double> input, vector<double> target);
+
             void randomize_weights();
-            void save(std::string);
-            void load(std::string);
-            fhe::Matrix *get_weights_ih();
-            fhe::Matrix *get_weights_ho();
-            fhe::Matrix *get_bias_h();
-            fhe::Matrix *get_bias_o();
+
+            void save(std::string file_path) const;
+            void load(std::string file_path);
+            
+            mat::Matrix *get_weights_ih() const;
+            mat::Matrix *get_weights_ho() const;
+            vector<double> get_bias_h() const;
+            vector<double> get_bias_o() const;
+            double get_l_rate() const;
         private:
-            fhe::Matrix *weights_ih;
-            fhe::Matrix *weights_ho;
-            fhe::Matrix *bias_h;
-            fhe::Matrix *bias_o;
+            mat::Matrix *weights_ih;
+            mat::Matrix *weights_ho;
+            vector<double> bias_h;
+            vector<double> bias_o;
             double l_rate;
     };
+
     class FHENetwork {
         public:
-            FHENetwork(int, int, int, double, CryptoContext<DCRTPoly>);
+            FHENetwork(Network *net, CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> keys);
+            FHENetwork(std::string dir_path,
+                    CryptoContext<DCRTPoly> cc, LPKeyPair<DCRTPoly> keys,
+                    int input, int hidden, int output, double l_rate);
             ~FHENetwork();
-            fhe::FHEMatrix *predict(fhe::FHEMatrix *);
-            void full_train(fhe::FHEMatrix *, fhe::FHEMatrix *);
-            void load_weights(fhe::FHEMatrix *, fhe::FHEMatrix*,
-                    fhe::FHEMatrix *, fhe::FHEMatrix *);
+            
+            Ciphertext<DCRTPoly> first_predict(Ciphertext<DCRTPoly> input) const;
+            Ciphertext<DCRTPoly> second_predict(Ciphertext<DCRTPoly> input) const;
+
+            CryptoContext<DCRTPoly> get_cc();
+            LPKeyPair<DCRTPoly> get_key();
+            void save(std::string dir_path) const;
         private:
-            fhe::FHEMatrix *weights_ih;
-            fhe::FHEMatrix *weights_ho;
-            fhe::FHEMatrix *bias_h;
-            fhe::FHEMatrix *bias_o;
+            mat::FHEMatrix *weights_ih;
+            mat::FHEMatrix *weights_ho;
+            
+            Ciphertext<DCRTPoly> bias_h;
+            Ciphertext<DCRTPoly> bias_o;
+
             double l_rate;
+
+            CryptoContext<DCRTPoly> cc;
+            LPKeyPair<DCRTPoly> key;
     };
 }
+
 #endif
