@@ -1,72 +1,51 @@
-cmake_minimum_required (VERSION 3.5.1)
+cmake_minimum_required(VERSION 3.16)
+project(fheml CXX)
 
-### To use gcc/g++ on a Macintosh, you must set the Compilers
-### here, not inside the project
-##if(APPLE)
-##       set(CMAKE_C_COMPILER "/usr/local/bin/gcc-7")
-##       set(CMAKE_CXX_COMPILER "/usr/local/bin/g++-7")
-##endif()
-### TODO: for now, we use CLang for Mac
-###
-### In order to create PALISADE's static libraries you should enable
-### the BUILD_STATIC option. For that, you run "cmake .. -DBUILD_STATIC=ON".
-### After having your link completed you will find static libs
-### with the suffix "_static" in ./build/libs/.
-### Examples: PALISADEpke_static.a, PALISADEcore_static.a, etc.
-### After you run "make install" in your build directory, you can build your custom application.
-### If you need your application to be linked statically, then run "cmake .. -DBUILD_STATIC=ON"
-
-project(FHE-ml CXX)
-set(CMAKE_CXX_STANDARD 11)
-option( BUILD_STATIC "Set to ON to include static versions of the library" OFF)
-
-find_package(Palisade)
-
-set( CMAKE_CXX_FLAGS ${PALISADE_CXX_FLAGS} )
-
-include_directories( ${OPENMP_INCLUDES} )
-include_directories( ${PALISADE_INCLUDE} )
-include_directories( ${PALISADE_INCLUDE}/third-party/include )
-include_directories( ${PALISADE_INCLUDE}/core )
-include_directories( ${PALISADE_INCLUDE}/pke )
-### add directories for other PALISADE modules as needed for your project
-
-link_directories( ${PALISADE_LIBDIR} )
-link_directories( ${OPENMP_LIBRARIES} )
-if(BUILD_STATIC)
-    set( CMAKE_EXE_LINKER_FLAGS "${PALISADE_EXE_LINKER_FLAGS} -static")
-    link_libraries( ${PALISADE_STATIC_LIBRARIES} )
-else()
-    set( CMAKE_EXE_LINKER_FLAGS ${PALISADE_EXE_LINKER_FLAGS} )
-    link_libraries( ${PALISADE_SHARED_LIBRARIES} )
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
 endif()
 
-### ADD YOUR EXECUTABLE(s) HERE
-### add_executable( EXECUTABLE-NAME SOURCES )
-###
-### EXAMPLE:
-add_library( fhematrix SHARED fhematrix.cpp)
-add_library( fheml SHARED fheml.cpp )
-add_library( bmpparse SHARED bmpparse.cpp)
-add_library( socketio SHARED socketio.cpp)
-add_executable( fheclient fheclient.cpp )
-add_executable( fheserver fheserver.cpp )
-add_executable( fhetrain fhetrain.cpp )
+# Point CMake at an OpenFHE install with -DOpenFHE_DIR=<prefix>/lib/OpenFHE
+# or -DCMAKE_PREFIX_PATH=<prefix>.
+find_package(OpenFHE 1.2 REQUIRED CONFIG)
+find_package(OpenMP)
+set(CMAKE_BUILD_RPATH ${OpenFHE_LIBDIR})
+set(CMAKE_INSTALL_RPATH ${OpenFHE_LIBDIR})
+# OpenFHE libraries depend on each other; DT_RPATH (unlike RUNPATH) covers that.
+add_link_options(-Wl,--disable-new-dtags)
 
-target_link_libraries( fheml fhematrix)
-target_link_libraries( fheclient fhematrix)
-target_link_libraries( fheclient fheml)
-target_link_libraries( fheclient bmpparse)
-target_link_libraries( fheclient socketio)
+# OpenFHE exports -Werror; keep its other flags (MATHBACKEND must match).
+string(REPLACE "-Werror" "" FHEML_OPENFHE_FLAGS "${OpenFHE_CXX_FLAGS}")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FHEML_OPENFHE_FLAGS}")
 
-target_link_libraries(fheserver fhematrix)
-target_link_libraries(fheserver fheml)
-target_link_libraries(fheserver socketio)
+add_library(fheml
+  src/context.cpp
+  src/linear.cpp
+  src/layers.cpp
+  src/network.cpp)
+target_include_directories(fheml PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(fheml SYSTEM PUBLIC
+  ${OpenFHE_INCLUDE}
+  ${OpenFHE_INCLUDE}/third-party/include
+  ${OpenFHE_INCLUDE}/core
+  ${OpenFHE_INCLUDE}/pke
+  ${OpenFHE_INCLUDE}/binfhe)
+target_link_directories(fheml PUBLIC ${OpenFHE_LIBDIR})
+target_link_libraries(fheml PUBLIC ${OpenFHE_SHARED_LIBRARIES})
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(fheml PUBLIC OpenMP::OpenMP_CXX)
+endif()
+target_compile_options(fheml PRIVATE -Wall -Wextra)
 
-target_link_libraries(fhetrain fhematrix)
-target_link_libraries(fhetrain fheml)
+add_executable(mnist_cnn examples/mnist_cnn.cpp)
+target_link_libraries(mnist_cnn fheml)
 
-target_compile_options( fhematrix PRIVATE -g)
-target_compile_options( fheml PRIVATE -g)
-target_compile_options( fheclient PRIVATE -g)
+add_executable(conv_demo examples/conv_demo.cpp)
+target_link_libraries(conv_demo fheml)
 
+enable_testing()
+add_executable(test_fheml tests/test_fheml.cpp)
+target_link_libraries(test_fheml fheml)
+add_test(NAME test_fheml COMMAND test_fheml)

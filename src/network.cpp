@@ -1,0 +1,241 @@
+#include "fheml/network.h"
+
+#include <algorithm>
+#include <chrono>
+#include <fstream>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+
+namespace fheml {
+
+namespace {
+
+std::vector<double> read_vec(std::istream& is, size_t n, const std::string& what) {
+  std::vector<double> v(n);
+  for (size_t i = 0; i < n; ++i)
+    if (!(is >> v[i])) throw std::runtime_error("model file: truncated " + what);
+  return v;
+}
+
+uint32_t next_pow2(size_t n) {
+  uint32_t p = 1;
+  while (p < n) p <<= 1;
+  return p;
+}
+
+}  // namespace
+
+Network Network::load(const std::string& path) {
+  std::ifstream is(path);
+  if (!is) throw std::runtime_error("cannot open model file " + path);
+  std::string tok;
+  int version = 0;
+  if (!(is >> tok >> version) || tok != "fheml" || version != 1) throw std::runtime_error("not an fheml v1 model file");
+  Shape in;
+  if (!(is >> tok >> in.c >> in.h >> in.w) || tok != "input") throw std::runtime_error("model file: missing input");
+  Network net(in);
+  while (is >> tok) {
+    if (tok == "end") break;
+    if (tok == "conv2d") {
+      int ic, oc, kh, kw, s, p, hb;
+      is >> ic >> oc >> kh >> kw >> s >> p >> hb;
+      auto w = read_vec(is, static_cast<size_t>(oc) * ic * kh * kw, "conv2d weights");
+      auto b = hb ? read_vec(is, oc, "conv2d bias") : std::vector<double>{};
+      net.emplace<Conv2d>(ic, oc, kh, kw, s, p, std::move(w), std::move(b));
+    } else if (tok == "dense") {
+      int i, o, hb;
+      is >> i >> o >> hb;
+      auto w = read_vec(is, static_cast<size_t>(i) * o, "dense weights");
+      auto b = hb ? read_vec(is, o, "dense bias") : std::vector<double>{};
+      net.emplace<Dense>(i, o, std::move(w), std::move(b));
+    } else if (tok == "avgpool2d") {
+      int k, s;
+      is >> k >> s;
+      net.emplace<AvgPool2d>(k, s);
+    } else if (tok == "affine") {
+      size_t c;
+      is >> c;
+      auto sc = read_vec(is, c, "affine scale");
+      auto sh = read_vec(is, c, "affine shift");
+      net.emplace<ChannelAffine>(std::move(sc), std::move(sh));
+    } else if (tok == "square") {
+      net.emplace<Square>();
+    } else if (tok == "poly") {
+      size_t n;
+      is >> n;
+      net.emplace<PolyActivation>(read_vec(is, n, "poly coefficients"));
+    } else if (tok == "chebyshev") {
+      std::string fn;
+      double a, b;
+      uint32_t d;
+      is >> fn >> a >> b >> d;
+      net.emplace<ChebyshevActivation>(fn, a, b, d);
+    } else if (tok == "bootstrap") {
+      net.emplace<Bootstrap>();
+    } else {
+      throw std::runtime_error("model file: unknown layer '" + tok + "'");
+    }
+    if (!is) throw std::runtime_error("model file: bad parameters for layer '" + tok + "'");
+  }
+  return net;
+}
+
+void Network::save(const std::string& path) const {
+  std::ofstream os(path);
+  if (!os) throw std::runtime_error("cannot write model file " + path);
+  os << "fheml 1\ninput " << input_.c << " " << input_.h << " " << input_.w << "\n";
+  for (const auto& l : layers_) l->save(os);
+  os << "end\n";
+}
+
+Network& Network::add(std::unique_ptr<Layer> layer) {
+  Shape in = output_shape();
+  layer->configure(in);
+  layers_.push_back(std::move(layer));
+  slots_ = 0;
+  return *this;
+}
+
+Shape Network::configure() {
+  Shape s = input_;
+  for (auto& l : layers_) s = l->configure(s);
+  return s;
+}
+
+void Network::fuse_linear() {
+  std::vector<std::unique_ptr<Layer>> out;
+  for (size_t i = 0; i < layers_.size();) {
+    if (!layers_[i]->is_linear() || i + 1 >= layers_.size() || !layers_[i + 1]->is_linear()) {
+      out.push_back(std::move(layers_[i++]));
+      continue;
+    }
+    // y = M_k (... (M_1 x + b_1) ...) + b_k
+    auto* first = static_cast<LinearLayer*>(layers_[i].get());
+    Shape in = first->in_shape();
+    SparseMatrix m = first->matrix();
+    std::vector<double> b = first->bias();
+    b.resize(m.rows(), 0.0);
+    std::string what = first->type();
+    Shape outs = first->out_shape();
+    size_t j = i + 1;
+    for (; j < layers_.size() && layers_[j]->is_linear(); ++j) {
+      auto* l = static_cast<LinearLayer*>(layers_[j].get());
+      SparseMatrix mj = l->matrix();
+      std::vector<double> bj = l->bias();
+      std::vector<double> nb = mj.multiply(b);
+      for (size_t k = 0; k < bj.size(); ++k) nb[k] += bj[k];
+      m = mj.multiply(m);
+      b = std::move(nb);
+      what += "+" + l->type();
+      outs = l->out_shape();
+    }
+    out.emplace_back(new FusedLinear(in, outs, std::move(m), std::move(b), what));
+    i = j;
+  }
+  layers_ = std::move(out);
+  slots_ = 0;
+}
+
+uint32_t Network::required_slots() const {
+  size_t n = input_.size();
+  for (const auto& l : layers_) n = std::max(n, l->out_shape().size());
+  return next_pow2(n);
+}
+
+void Network::compile(uint32_t slots) {
+  slots_ = slots ? slots : required_slots();
+  if (slots_ < required_slots()) throw std::invalid_argument("slot count too small for this network");
+  for (auto& l : layers_) l->compile(slots_);
+}
+
+uint32_t Network::depth() const {
+  uint32_t d = 0;
+  for (const auto& l : layers_) d += l->depth();
+  return d;
+}
+
+uint32_t Network::depth_between_bootstraps() const {
+  uint32_t best = 0, cur = 0;
+  for (const auto& l : layers_) {
+    if (l->is_bootstrap()) {
+      best = std::max(best, cur);
+      cur = 0;
+    } else {
+      cur += l->depth();
+    }
+  }
+  return std::max(best, cur);
+}
+
+uint32_t Network::depth_before_first_bootstrap() const {
+  uint32_t d = 0;
+  for (const auto& l : layers_) {
+    if (l->is_bootstrap()) break;
+    d += l->depth();
+  }
+  return d;
+}
+
+uint32_t Network::input_level(const FHEContext& ctx) const {
+  if (!uses_bootstrapping()) return 0;
+  // One spare level: EvalBootstrap first rescales a pending product.
+  const uint32_t need = depth_before_first_bootstrap() + 1;
+  return ctx.total_depth() > need ? ctx.total_depth() - need : 0;
+}
+
+bool Network::uses_bootstrapping() const {
+  return std::any_of(layers_.begin(), layers_.end(), [](const std::unique_ptr<Layer>& l) { return l->is_bootstrap(); });
+}
+
+std::vector<int32_t> Network::rotation_indices() const {
+  if (!slots_) throw std::logic_error("compile() the network first");
+  std::set<int32_t> s;
+  for (const auto& l : layers_)
+    for (int32_t r : l->rotation_indices()) s.insert(r);
+  return std::vector<int32_t>(s.begin(), s.end());
+}
+
+ContextOptions Network::context_options(bool secure) const {
+  if (!slots_) throw std::logic_error("compile() the network first");
+  ContextOptions o;
+  o.slots = slots_;
+  o.secure = secure;
+  o.bootstrapping = uses_bootstrapping();
+  o.mult_depth = o.bootstrapping ? depth_between_bootstraps() : depth();
+  return o;
+}
+
+std::vector<double> Network::forward_plain(const std::vector<double>& x) const {
+  if (x.size() != input_.size()) throw std::invalid_argument("input size does not match network input");
+  std::vector<double> v = x;
+  for (const auto& l : layers_) v = l->forward_plain(v);
+  return v;
+}
+
+Ctxt Network::forward(const FHEContext& ctx, const Ctxt& x, const LayerHook& hook) const {
+  if (!slots_) throw std::logic_error("compile() the network first");
+  if (ctx.slots() != slots_) throw std::invalid_argument("context slot count differs from compiled network");
+  Ctxt c = x;
+  for (size_t i = 0; i < layers_.size(); ++i) {
+    auto t0 = std::chrono::steady_clock::now();
+    c = layers_[i]->forward(ctx, c);
+    double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (hook) hook(i, *layers_[i], c, secs);
+  }
+  return c;
+}
+
+std::string Network::summary() const {
+  std::ostringstream os;
+  os << "input " << input_.str() << "\n";
+  for (size_t i = 0; i < layers_.size(); ++i)
+    os << "  [" << i << "] " << layers_[i]->describe() << "  -> " << layers_[i]->out_shape().str() << "  (depth "
+       << layers_[i]->depth() << ")\n";
+  os << "total depth " << depth();
+  if (uses_bootstrapping()) os << ", max between bootstraps " << depth_between_bootstraps();
+  if (slots_) os << ", slots " << slots_;
+  return os.str();
+}
+
+}  // namespace fheml
