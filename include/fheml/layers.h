@@ -97,6 +97,11 @@ class LinearLayer : public Layer {
   virtual int gap_stride() const { return 0; }
 
   const LinearTransform& transform() const { return lt_; }
+  // Encrypts this layer's weight diagonals and bias. Must follow one forward()
+  // with clear weights so the input/output levels are known (see
+  // Network::encrypt_weights).
+  void encrypt_weights(const FHEContext& ctx, bool drop_plaintext);
+  bool weights_encrypted() const { return lt_.weights_encrypted(); }
   void set_cache_plaintexts(bool on) {
     cache_ = on;
     lt_.set_cache_plaintexts(on);
@@ -107,6 +112,8 @@ class LinearLayer : public Layer {
   SparseMatrix m_;
   std::vector<double> b_;       // logical
   std::vector<double> b_slots_; // bias placed in output slots
+  Ctxt enc_bias_;
+  mutable uint32_t last_out_level_ = 0;
   bool cache_ = false;
 };
 

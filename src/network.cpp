@@ -149,6 +149,13 @@ void Network::set_cache_plaintexts(bool on) {
     if (l->is_linear()) static_cast<LinearLayer*>(l.get())->set_cache_plaintexts(on);
 }
 
+void Network::encrypt_weights(const FHEContext& ctx, bool drop_plaintext) {
+  if (!slots_) throw std::logic_error("compile() the network first");
+  forward(ctx, ctx.encrypt(std::vector<double>(input_.size(), 0.0), input_level(ctx)));
+  for (auto& l : layers_)
+    if (l->is_linear()) static_cast<LinearLayer*>(l.get())->encrypt_weights(ctx, drop_plaintext);
+}
+
 uint32_t Network::required_slots() const {
   size_t n = input_.size();
   for (const auto& l : layers_) n = std::max({n, l->out_shape().size(), l->out_layout().span(l->out_shape())});

@@ -49,6 +49,14 @@ class Network {
   // Keep encoded weight diagonals between inferences: much faster repeated
   // inference, at one plaintext (ring_dim * towers * 8 bytes) per diagonal.
   void set_cache_plaintexts(bool on);
+
+  // Encrypted-weights mode: encrypts the weights and biases of every linear
+  // layer under ctx's public key (activation polynomials stay public). Runs
+  // one inference on an encrypted zero input first to learn the level each
+  // layer works at, so every weight ciphertext is encrypted with no more
+  // towers than needed. drop_plaintext frees the clear diagonals of the
+  // compiled plans. Linear products become ciphertext x ciphertext.
+  void encrypt_weights(const FHEContext& ctx, bool drop_plaintext = true);
   // Merges runs of adjacent linear layers into one matrix each: saves one
   // level per merged layer at the cost of more diagonals.
   void fuse_linear();

@@ -116,11 +116,21 @@ std::vector<double> LinearLayer::forward_plain(const std::vector<double>& x) con
 
 Ctxt LinearLayer::forward(const FHEContext& ctx, const Ctxt& x) const {
   Ctxt y = lt_.eval(ctx, x);
-  if (!b_slots_.empty()) {
+  last_out_level_ = y->GetLevel() + (y->GetNoiseScaleDeg() > 1 ? 1 : 0);
+  if (enc_bias_) {
+    ctx.cc()->EvalAddInPlace(y, enc_bias_);
+  } else if (!b_slots_.empty()) {
     Ptxt pb = ctx.encode(b_slots_, y->GetLevel(), y->GetNoiseScaleDeg());
     ctx.cc()->EvalAddInPlace(y, pb);
   }
   return y;
+}
+
+void LinearLayer::encrypt_weights(const FHEContext& ctx, bool drop_plaintext) {
+  lt_.encrypt_weights(ctx, lt_.input_level(), drop_plaintext);
+  // The sum of products is rescaled before the bias is added, so the bias
+  // lives one level below the products.
+  if (!b_slots_.empty()) enc_bias_ = ctx.encrypt(b_slots_, last_out_level_);
 }
 
 std::string LinearLayer::describe() const {
@@ -128,6 +138,7 @@ std::string LinearLayer::describe() const {
   os << " [" << in_.str() << " -> " << out_.str() << ", " << lt_.num_diagonals() << " diagonals, "
      << lt_.num_baby_steps() << " baby x " << lt_.num_giant_steps() << " giant steps";
   if (lt_.fold_block()) os << ", folded R=" << lt_.fold_block();
+  if (lt_.weights_encrypted()) os << ", encrypted weights";
   if (!out_layout_.is_compact(out_)) os << ", gapped out";
   os << "]";
   return os.str();

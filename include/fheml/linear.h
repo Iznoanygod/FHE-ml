@@ -90,6 +90,15 @@ class LinearTransform {
   // big layers: one plaintext per diagonal).
   void set_cache_plaintexts(bool on) { cache_plaintexts_ = on; }
 
+  // Encrypted-weights mode: encrypts every (pre-rotated) diagonal at `level`,
+  // the level eval() will see its input at (see input_level()), and from then
+  // on multiplies ciphertext x ciphertext. drop_plaintext forgets the clear
+  // diagonals afterwards (eval_slots() then no longer works).
+  void encrypt_weights(const FHEContext& ctx, uint32_t level, bool drop_plaintext);
+  bool weights_encrypted() const { return !enc_.empty(); }
+  // Level (after any pending rescale) of the input seen by the last eval().
+  uint32_t input_level() const { return last_level_; }
+
  private:
   struct Term {
     int32_t baby;               // index into babies_
@@ -107,6 +116,8 @@ class LinearTransform {
   std::vector<Giant> giants_;
   uint32_t fold_ = 0;
   bool cache_plaintexts_ = false;
+  std::vector<std::vector<Ctxt>> enc_;  // [giant][term], when weights are encrypted
+  mutable uint32_t last_level_ = 0;
 
   struct Cache {
     std::mutex mu;

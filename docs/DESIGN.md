@@ -70,6 +70,33 @@ The plaintext reference evaluates the *same* approximation
 (`EvalChebyshevFunctionPtxt`). Encrypted-vs-plaintext error therefore measures
 only the CKKS noise. The approximation error is a training-time concern.
 
+## Encrypted weights
+
+`Network::encrypt_weights(ctx)` switches every linear layer to ciphertext
+weights.
+
+**How the weights are encrypted.**
+- It first runs one inference on an encrypted zero vector. That records the
+  level at which each layer's products and bias addition happen.
+- Each pre-rotated diagonal is then encrypted at its layer's level, so it
+  carries no more towers than needed. The bias is encrypted one level lower,
+  because the sum of products is rescaled before the bias is added.
+
+**How evaluation changes.**
+- Products use `EvalMultNoRelin`.
+- Relinearization runs once per giant step, not once per product.
+- Depth is unchanged.
+
+**Scope of the protection.**
+- Polynomial activations and average pooling are public functions, not
+  trained weights, so they stay in the clear.
+- The weights are encrypted under the evaluation key, as in the 2022
+  prototype. This hides them from the evaluating server but not from the key
+  holder.
+- Hiding the model from the client and the input from the model owner
+  requires threshold or multi-party CKKS. OpenFHE supports it, and it is on
+  the roadmap.
+
 ## Parameters and bootstrapping
 
 - `Network::context_options()` sets:
@@ -98,6 +125,7 @@ All of the following are tested under encryption:
 - Bootstrapping in the middle of a network.
 - The trained MNIST CNN at 128-bit security: about 3 s per image, with
   predictions identical to plaintext.
+- The same CNN with encrypted weights: about 3.6 s per image.
 
 ## Roadmap (suggested order)
 
@@ -106,10 +134,12 @@ All of the following are tested under encryption:
      ciphertexts (OpenFHE `Serial::`) so the server never holds the secret
      key.
    - Rebuild the legacy socket client/server on top of that.
-2. **Encrypted weights.** The legacy README promised encrypted model weights.
-   - The same BSGS schedule works with ciphertext diagonals: ct×ct
-     multiplication plus relinearization.
-   - Add a `LinearTransform` mode that stores encrypted diagonals.
+2. **Model privacy against the key holder.** Encrypted weights exist, but
+   they share the client's key.
+   - Use OpenFHE threshold CKKS so that neither party can decrypt the other's
+     data alone.
+   - Serialize the encrypted weights so the server never sees them in the
+     clear.
 3. **Multiplexed packing (Lee et al. ICML'22, Orion).** After stride-2 layers,
    re-pack gapped outputs densely so deep networks (ResNet-20 on CIFAR-10) fit
    in fewer slots and need fewer bootstraps.

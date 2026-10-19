@@ -28,6 +28,12 @@ That code is kept in [`legacy/`](legacy/) for reference.
   * Chebyshev approximations of `relu` / `silu` / `gelu` / `sigmoid` / `tanh`
     on a chosen interval and degree, via `EvalChebyshevSeries`.
 * **Bootstrapping layers** let you build deep networks.
+* **Optional encrypted weights.** `Network::encrypt_weights(ctx)` encrypts
+  every conv/dense weight diagonal and bias, so the linear layers multiply
+  ciphertext × ciphertext.
+  * Activation polynomials stay public.
+  * The weights are encrypted under the same key as the input, as in the 2022
+    prototype. Whoever holds the secret key can therefore decrypt the model.
 * **Parameter planning.** The compiled network reports its depth, slot count
   and the exact rotation keys it needs. `Network::context_options()` turns that
   into a CKKS context, at 128-bit security by default.
@@ -56,6 +62,11 @@ dense 64->10               25 diagonals (folded R=16)       depth 1
 * **Speed:** about 3 s per encrypted image on 4 cores.
 * **Agreement:** the encrypted logits match plaintext to about 1e-6, and the
   predicted class is the same.
+* **With `--encrypt-weights`:**
+  * The 279 weight and bias ciphertexts take about 6 s to encrypt.
+  * Inference takes about 3.6 s per image.
+  * Peak memory is about 2 GB.
+  * The logits match plaintext to about 1e-4.
 
 ## Building
 
@@ -100,6 +111,7 @@ net.compile();                                   // BSGS plans, slots, rotations
 FHEContext ctx(net.context_options());           // 128-bit CKKS sized for the network
 ctx.keygen(net.rotation_indices());
 
+// optional: net.encrypt_weights(ctx);         // ciphertext weights from here on
 Ctxt y = net.forward(ctx, ctx.encrypt(image, net.input_level(ctx)));
 std::vector<double> logits = net.decrypt_output(ctx, y);
 ```

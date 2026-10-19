@@ -155,10 +155,12 @@ FHEContext make_ctx(uint32_t depth, uint32_t slots, const std::vector<int32_t>& 
 
 // Encrypts x, runs the network, compares with the plaintext reference and the
 // number of levels actually consumed against Network::depth().
-void check_encrypted(const std::string& name, Network& net, double tol, double input_range = 1.0) {
+void check_encrypted(const std::string& name, Network& net, double tol, double input_range = 1.0,
+                     bool encrypted_weights = false) {
   net.compile();
   auto opts = net.context_options(false);
   FHEContext ctx = make_ctx(opts.mult_depth, opts.slots, net.rotation_indices(), opts.bootstrapping);
+  if (encrypted_weights) net.encrypt_weights(ctx, /*drop_plaintext=*/true);  // proves no clear weight is used
   auto x = rand_vec(net.input_shape().size(), -input_range, input_range);
   Ctxt c = ctx.encrypt(x, net.input_level(ctx));
   uint32_t lvl0 = c->GetLevel();
@@ -238,6 +240,22 @@ void encrypted_tests(bool quick) {
     n.fuse_linear();  // conv+avgpool... only adjacent linear layers merge
     check_encrypted("small cnn fused", n, 1e-3);
   }
+  {
+    // Encrypted weights: same networks, ciphertext x ciphertext products.
+    Network a(Shape{2, 8, 8});
+    a.emplace<Conv2d>(2, 3, 3, 3, 2, 1, rand_vec(54), rand_vec(3));
+    check_encrypted("enc-weights conv2d stride 2", a, 1e-4, 1.0, true);
+    Network b(Shape{300, 1, 1});
+    b.emplace<Dense>(300, 10, rand_vec(3000, -0.2, 0.2), rand_vec(10));
+    check_encrypted("enc-weights dense folded", b, 1e-4, 1.0, true);
+    Network c(Shape{1, 10, 10});
+    c.emplace<Conv2d>(1, 3, 3, 3, 2, 1, rand_vec(27, -0.5, 0.5), rand_vec(3, -0.1, 0.1));
+    c.emplace<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25});
+    c.emplace<Dense>(75, 6, rand_vec(450, -0.3, 0.3), rand_vec(6));
+    c.emplace<Square>();
+    c.emplace<Dense>(6, 3, rand_vec(18), rand_vec(3));
+    check_encrypted("enc-weights small cnn", c, 1e-3, 1.0, true);
+  }
   if (!quick) {
     // Bootstrapping in the middle of a network (insecure toy ring).
     Network n(Shape{1, 8, 8});
@@ -247,6 +265,7 @@ void encrypted_tests(bool quick) {
     n.emplace<Dense>(128, 8, rand_vec(1024, -0.1, 0.1), rand_vec(8, -0.1, 0.1));
     n.emplace<ChebyshevActivation>("relu", -2, 2, 15);
     check_encrypted("bootstrap mid-network", n, 1e-3);
+    check_encrypted("enc-weights bootstrap mid-network", n, 1e-3, 1.0, true);
   }
 }
 

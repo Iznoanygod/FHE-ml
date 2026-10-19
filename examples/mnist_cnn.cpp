@@ -1,7 +1,10 @@
 // Encrypted MNIST inference with a CNN trained by tools/train_mnist.py.
 //
 //   mnist_cnn [--model F] [--samples F] [--encrypted N] [--insecure] [--fuse] [--cache]
+//             [--encrypt-weights]
 //
+//   --encrypt-weights  encrypt the conv/dense weights and biases too
+//                      (ciphertext x ciphertext products)
 //   --fuse   merge adjacent linear layers (none in the default model)
 //   --cache  keep encoded weights between samples (faster after the first)
 //
@@ -55,7 +58,7 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
 int main(int argc, char** argv) {
   std::string model_path = "models/mnist_cnn.fheml", samples_path = "models/mnist_test_samples.txt";
   size_t n_enc = 5;
-  bool secure = true, fuse = false, cache = false;
+  bool secure = true, fuse = false, cache = false, enc_weights = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--model" && i + 1 < argc) model_path = argv[++i];
@@ -64,8 +67,9 @@ int main(int argc, char** argv) {
     else if (a == "--insecure") secure = false;
     else if (a == "--fuse") fuse = true;
     else if (a == "--cache") cache = true;
+    else if (a == "--encrypt-weights") enc_weights = true;
     else {
-      std::fprintf(stderr, "usage: %s [--model F] [--samples F] [--encrypted N] [--insecure] [--fuse] [--cache]\n", argv[0]);
+      std::fprintf(stderr, "usage: %s [--model F] [--samples F] [--encrypted N] [--insecure] [--fuse] [--cache] [--encrypt-weights]\n", argv[0]);
       return 2;
     }
   }
@@ -93,7 +97,16 @@ int main(int argc, char** argv) {
   FHEContext ctx(opts);
   ctx.keygen(net.rotation_indices());
   std::printf("%s\n", ctx.describe().c_str());
-  std::printf("rotation keys: %zu, setup + keygen %.2fs\n\n", net.rotation_indices().size(), seconds_since(t0));
+  std::printf("rotation keys: %zu, setup + keygen %.2fs\n", net.rotation_indices().size(), seconds_since(t0));
+  if (enc_weights) {
+    t0 = std::chrono::steady_clock::now();
+    net.encrypt_weights(ctx);
+    size_t n_ct = 0;
+    for (const auto& l : net.layers())
+      if (l->is_linear()) n_ct += static_cast<const LinearLayer*>(l.get())->transform().num_diagonals() + 1;
+    std::printf("encrypted weights: %zu ciphertexts in %.2fs\n", n_ct, seconds_since(t0));
+  }
+  std::printf("\n");
 
   size_t agree = 0, enc_correct = 0;
   double worst = 0.0, total_time = 0.0;

@@ -173,6 +173,9 @@ std::vector<int32_t> LinearTransform::rotation_indices() const {
 }
 
 std::vector<double> LinearTransform::eval_slots(const std::vector<double>& x_in) const {
+  for (const auto& g : giants_)
+    for (const auto& t : g.terms)
+      if (t.diag.empty()) throw std::logic_error("eval_slots: plaintext diagonals were dropped");
   std::vector<double> x(x_in);
   x.resize(slots_, 0.0);
   std::vector<std::vector<double>> baby(babies_.size());
@@ -193,6 +196,21 @@ std::vector<double> LinearTransform::eval_slots(const std::vector<double>& x_in)
   return y;
 }
 
+void LinearTransform::encrypt_weights(const FHEContext& ctx, uint32_t level, bool drop_plaintext) {
+  if (ctx.slots() != slots_) throw std::invalid_argument("LinearTransform: slot count mismatch with context");
+  if (!enc_.empty()) throw std::logic_error("LinearTransform: weights already encrypted");
+  std::vector<std::vector<Ctxt>> enc(giants_.size());
+  for (size_t gi = 0; gi < giants_.size(); ++gi) enc[gi].resize(giants_[gi].terms.size());
+#pragma omp parallel for schedule(dynamic)
+  for (size_t gi = 0; gi < giants_.size(); ++gi)
+    for (size_t ti = 0; ti < giants_[gi].terms.size(); ++ti) enc[gi][ti] = ctx.encrypt(giants_[gi].terms[ti].diag, level);
+  enc_ = std::move(enc);
+  if (drop_plaintext)
+    for (auto& g : giants_)
+      for (auto& t : g.terms) std::vector<double>().swap(t.diag);
+  cache_->by_level.clear();
+}
+
 Ctxt LinearTransform::eval(const FHEContext& ctx, const Ctxt& x) const {
   const CC& cc = ctx.cc();
   if (ctx.slots() != slots_) throw std::invalid_argument("LinearTransform: slot count mismatch with context");
@@ -211,8 +229,10 @@ Ctxt LinearTransform::eval(const FHEContext& ctx, const Ctxt& x) const {
 
   // Plaintext diagonals are encoded at the level the products will live at.
   const uint32_t level = x->GetLevel() + (x->GetNoiseScaleDeg() > 1 ? 1 : 0);
+  last_level_ = level;
+  const bool encrypted = !enc_.empty();
   const std::vector<std::vector<Ptxt>>* cached = nullptr;
-  if (cache_plaintexts_) {
+  if (cache_plaintexts_ && !encrypted) {
     std::lock_guard<std::mutex> lock(cache_->mu);
     auto it = cache_->by_level.find(level);
     if (it == cache_->by_level.end()) {
@@ -231,13 +251,20 @@ Ctxt LinearTransform::eval(const FHEContext& ctx, const Ctxt& x) const {
     Ctxt inner;
     for (size_t ti = 0; ti < g.terms.size(); ++ti) {
       const Term& t = g.terms[ti];
-      Ptxt p = cached ? (*cached)[gi][ti] : ctx.encode(t.diag, level);
-      Ctxt prod = cc->EvalMult(baby[t.baby], p);
+      Ctxt prod;
+      if (encrypted) {
+        // Relinearize once per giant step instead of once per product.
+        prod = cc->EvalMultNoRelin(baby[t.baby], enc_[gi][ti]);
+      } else {
+        Ptxt p = cached ? (*cached)[gi][ti] : ctx.encode(t.diag, level);
+        prod = cc->EvalMult(baby[t.baby], p);
+      }
       if (!inner)
         inner = prod;
       else
         cc->EvalAddInPlace(inner, prod);
     }
+    if (encrypted) cc->RelinearizeInPlace(inner);
     if (g.step) inner = cc->EvalRotate(inner, g.step);
     partial[gi] = inner;
   }
