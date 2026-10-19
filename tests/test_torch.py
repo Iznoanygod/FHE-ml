@@ -1,0 +1,78 @@
+"""PyTorch exporter test: exports small torch models and checks the fheml
+plaintext reference and encrypted inference against torch (toy parameters).
+
+    PYTHONPATH=build/python python3 tests/test_torch.py
+"""
+import numpy as np
+import torch
+from torch import nn
+
+import fheml
+from fheml import nn as hnn
+
+torch.manual_seed(0)
+rng = np.random.default_rng(0)
+
+
+def run(name, model, shape, tol=1e-3):
+    model = model.double().eval()
+    with torch.no_grad():
+        for m in model.modules():  # non-trivial batch-norm statistics
+            if isinstance(m, nn.modules.batchnorm._BatchNorm):
+                m.running_mean.uniform_(-0.2, 0.2)
+                m.running_var.uniform_(0.5, 1.5)
+                m.weight.uniform_(0.5, 1.5)
+                m.bias.uniform_(-0.2, 0.2)
+    net = fheml.from_torch(model, shape)  # also checks plaintext vs torch
+    net.compile()
+    print(f"--- {name}\n{net.summary()}")
+    ctx = fheml.make_context(net, secure=False)
+    x = rng.uniform(-1, 1, shape)
+    with torch.no_grad():
+        ref = model(torch.as_tensor(x[None])).numpy().ravel()
+    enc = fheml.infer(net, ctx, x)
+    err = np.abs(enc - ref).max()
+    print(f"torch {np.round(ref, 4)}\nfheml {np.round(enc, 4)}\nmax err {err:.1e}")
+    assert err < tol, name
+    return net
+
+
+cnn = nn.Sequential(
+    nn.Conv2d(2, 4, 3, stride=2, padding=1), nn.BatchNorm2d(4), hnn.Poly([0, 0.5, 0.25]),
+    nn.Conv2d(4, 4, 3, padding=1, bias=False), nn.AvgPool2d(2), hnn.Chebyshev("silu", -3, 3, 13),
+    nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(4, 6), nn.BatchNorm1d(6), hnn.Square(), nn.Dropout(0.1),
+    nn.Linear(6, 3))
+run("cnn", cnn, (2, 8, 8))
+
+n, d, h = 4, 8, 16
+vit = nn.Sequential(
+    nn.Linear(6, d), hnn.PosEmbedding(n, d),
+    hnn.Residual(hnn.Attention(d, n)),
+    hnn.Residual(nn.Linear(d, h), hnn.Poly([0, 0.5, 0.25], trainable=True), nn.Linear(h, d)),
+    hnn.TokenMean(), nn.Linear(d, 3))
+net = run("transformer", vit, (n, 6))
+assert net.input_shape.w == h, "tokens are padded to the widest per-token layer"
+
+# Errors name the offending module.
+for bad, msg in ((nn.Sequential(nn.Linear(4, 4), nn.ReLU()), "Chebyshev"),
+                 (nn.Sequential(nn.Conv2d(1, 1, 3), nn.Linear(6, 2)), "Flatten")):
+    try:
+        fheml.from_torch(bad, (4,) if isinstance(bad[0], nn.Linear) else (1, 8, 8))
+        raise AssertionError("expected an error")
+    except ValueError as e:
+        assert msg in str(e), e
+
+# A short training run: the exported model reproduces the trained one.
+x = torch.rand(256, 1, 8, 8, dtype=torch.float64)
+y = (x[:, 0, :4].mean((1, 2)) > x[:, 0, 4:].mean((1, 2))).long()
+model = nn.Sequential(nn.Conv2d(1, 3, 3, stride=2), hnn.Poly([0, 0.5, 0.25]), nn.Flatten(), nn.Linear(27, 2)).double()
+opt = torch.optim.Adam(model.parameters(), 0.05)
+for _ in range(100):
+    opt.zero_grad()
+    loss = nn.functional.cross_entropy(model(x), y)
+    loss.backward()
+    opt.step()
+acc = (model(x).argmax(1) == y).double().mean().item()
+print(f"trained toy model: loss {loss.item():.3f}, accuracy {acc:.2f}")
+run("trained", model, (1, 8, 8))
+print("PASSED")

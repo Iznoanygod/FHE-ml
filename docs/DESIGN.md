@@ -175,6 +175,8 @@ All of the following are tested under encryption:
 - The same CNN with encrypted weights: about 3.6 s per image.
 - A one-block MNIST vision transformer (95.6%): about 15 s per image.
 - Python bindings for all of the above.
+- PyTorch export (`fheml.from_torch`): torch-trained CNN and ViT run
+  encrypted with logits matching torch to about 1e-6.
 
 ## Roadmap (suggested order)
 
@@ -203,10 +205,10 @@ All of the following are tested under encryption:
 6. **Batch-norm and residual connections.**
    - Fold BN into the convolutions at load time.
    - Add a residual `Add` layer that aligns levels and layouts.
-7. **Training/export from PyTorch.** torch could not be installed in the
-   development environment, so the trainers use numpy with hand-written
-   backprop. An exporter for `torch.nn.Sequential`
-   models with polynomial activations, next to the numpy trainer.
+7. **More PyTorch export.** `fheml.from_torch` covers `nn.Sequential` models
+   (see the README). Next: tracing arbitrary `forward` code with `torch.fx`,
+   multi-head attention, and a range penalty during training so Chebyshev
+   activations stay inside their interval.
 8. **Performance.**
    - Reduce `scale_mod_bits` / depth so the MNIST net fits ring 2^14.
    - Use `EvalFastRotationExt` to keep giant-step sums in the extended basis.

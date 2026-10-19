@@ -171,6 +171,7 @@ class AvgPool2d : public LinearLayer {
  public:
   AvgPool2d(int k, int stride);
   std::string type() const override { return "avgpool2d"; }
+  std::string describe() const override { return type() + LinearLayer::describe(); }
   Shape configure(const Shape& in) override;
   SparseMatrix matrix() const override;
   int gap_stride() const override { return stride_; }
@@ -185,6 +186,7 @@ class ChannelAffine : public LinearLayer {
  public:
   ChannelAffine(std::vector<double> scale, std::vector<double> shift);
   std::string type() const override { return "affine"; }
+  std::string describe() const override { return type() + LinearLayer::describe(); }
   Shape configure(const Shape& in) override;
   SparseMatrix matrix() const override;
   std::vector<double> bias() const override;

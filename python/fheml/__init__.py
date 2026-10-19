@@ -9,6 +9,9 @@ C order, i.e. [out][in] for dense maps)::
     net.compile()
     ctx = fheml.make_context(net)               # 128-bit CKKS sized for net
     y = fheml.infer(net, ctx, image)            # encrypt -> forward -> decrypt
+
+Models trained in PyTorch (with the HE-friendly modules in ``fheml.nn``)
+convert with ``fheml.from_torch(model, input_shape)``.
 """
 import numpy as np
 
@@ -58,6 +61,24 @@ def _flat(a):
     return np.ascontiguousarray(a, dtype=np.float64).ravel().tolist()
 
 
+def _prepare(net, x):
+    # Token inputs narrower than the network's token stride (from_torch pads
+    # the first per-token layer) are zero-padded to it.
+    x = np.asarray(x, dtype=np.float64)
+    s = net.input_shape
+    if x.size != s.size() and x.ndim >= 1 and x.shape[-1] < s.w and x.size // x.shape[-1] == s.c * s.h:
+        x = np.concatenate([x.reshape(-1, x.shape[-1]), np.zeros((s.c * s.h, s.w - x.shape[-1]))], axis=1)
+    return _flat(x)
+
+
+def __getattr__(name):
+    # The torch exporter is imported on first use so fheml does not need torch.
+    if name in ("from_torch", "save_torch"):
+        from . import export
+        return getattr(export, name)
+    raise AttributeError(f"module 'fheml' has no attribute {name!r}")
+
+
 def make_context(net, secure=True, **overrides):
     """Create a CKKS context with keys for a compiled network.
 
@@ -73,7 +94,7 @@ def make_context(net, secure=True, **overrides):
 
 def encrypt(net, ctx, x):
     """Encrypt an input array (any shape, flattened C-order) for ``net``."""
-    return ctx.encrypt(_flat(x), net.input_level(ctx))
+    return ctx.encrypt(_prepare(net, x), net.input_level(ctx))
 
 
 def decrypt(net, ctx, y):
@@ -88,4 +109,4 @@ def infer(net, ctx, x):
 
 def plain(net, x):
     """Plaintext reference forward pass (same approximations as encrypted)."""
-    return np.asarray(net.forward_plain(_flat(x)))
+    return np.asarray(net.forward_plain(_prepare(net, x)))

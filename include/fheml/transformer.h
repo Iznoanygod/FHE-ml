@@ -55,6 +55,7 @@ class TokenMean : public LinearLayer {
  public:
   TokenMean(int n, int d);
   std::string type() const override { return "tokenmean"; }
+  std::string describe() const override { return type() + LinearLayer::describe(); }
   Shape configure(const Shape& in) override;
   SparseMatrix matrix() const override;
   void save(std::ostream& os) const override;

@@ -35,6 +35,9 @@ That code is kept in [`legacy/`](legacy/) for reference.
   * See [docs/DESIGN.md](docs/DESIGN.md#transformers).
 * **A Python package**, `import fheml`, wraps the same API with numpy in and
   numpy out.
+* **A PyTorch exporter.** Train with `torch.nn` layers plus the HE-friendly
+  modules in `fheml.nn` (polynomial activations, polynomial attention), then
+  `fheml.from_torch(model, input_shape)` gives the encrypted network.
 * **Bootstrapping layers** let you build deep networks.
 * **Optional encrypted weights.** `Network::encrypt_weights(ctx)` encrypts
   every conv/dense weight diagonal and bias, so the linear layers multiply
@@ -141,6 +144,57 @@ assert np.allclose(logits, fheml.plain(net, x), atol=1e-3)
 
 Weight arguments can be numpy arrays of any shape. They are flattened in C order, so dense weights are `[out][in]`. `tests/test_python.py` is a complete runnable version of this snippet.
 
+## PyTorch
+
+Build the model from `nn.Sequential`, the supported `torch.nn` layers and
+`fheml.nn`, train it as usual, and export it. torch is only needed for this
+(`pip install torch`).
+
+```python
+import torch, fheml
+from torch import nn
+from fheml import nn as hnn
+
+model = nn.Sequential(
+    nn.Conv2d(1, 5, 5, stride=2, padding=1), nn.BatchNorm2d(5), hnn.Poly([0, 0.5, 0.25]),
+    nn.Flatten(), nn.Linear(845, 64), hnn.Poly([0, 0.5, 0.25]), nn.Linear(64, 10))
+# ... train ...
+net = fheml.from_torch(model, (1, 28, 28))   # also checks fheml == torch on a random input
+net.compile()
+ctx = fheml.make_context(net)
+logits = fheml.infer(net, ctx, image)        # image: (1, 28, 28) numpy array
+```
+
+| torch | fheml |
+| --- | --- |
+| `nn.Conv2d` (square kernel, zero padding, groups=1) | `conv2d` |
+| `nn.Linear` | `dense` on vectors; `tokendense` on `(tokens, dim)` inputs |
+| `nn.AvgPool2d`, `nn.AdaptiveAvgPool2d(1)` | `avgpool2d` |
+| `nn.BatchNorm2d` / `nn.BatchNorm1d` | folded into the preceding conv/linear, else `affine` |
+| `nn.Flatten`, `nn.Dropout`, `nn.Identity` | nothing |
+| `hnn.Poly`, `hnn.Square`, `hnn.Chebyshev` | `poly`, `square`, `chebyshev` |
+| `hnn.Attention`, `hnn.Residual`, `hnn.TokenMean`, `hnn.PosEmbedding` | `attention`, `residual`, `tokenmean`, per-token bias |
+| `hnn.Bootstrap` | `bootstrap` |
+
+`nn.ReLU`, softmax, LayerNorm and max pooling have no exact encrypted form
+and are rejected with a message naming the replacement. `hnn.Chebyshev`
+evaluates the same polynomial approximation in torch that runs encrypted,
+so training sees what inference computes. For token inputs the exporter pads
+each token to the widest per-token layer, which makes those layers much cheaper
+under encryption; `fheml.infer` pads inputs to match.
+
+`examples/python/train_torch_mnist.py` trains, exports and runs both MNIST
+models encrypted. With 128-bit security:
+
+* **CNN:** 98.4% after 3 epochs, about 3 s per encrypted image.
+* **ViT:** 94.8% after 15 epochs, about 16 s per encrypted image.
+* **Agreement:** the encrypted logits match torch to about 1e-6.
+
+```sh
+PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch cnn --n 3
+PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch vit --out models/vit_torch.fheml
+```
+
 ## Using the library
 
 ```cpp
@@ -173,9 +227,9 @@ std::vector<double> logits = net.decrypt_output(ctx, y);
 | --- | --- |
 | `include/fheml/`, `src/` | the library: context, linear transforms, layers, network |
 | `examples/` | `mnist_cnn` (encrypted MNIST) and `conv_demo` (network built in code) |
-| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting |
-| `python/` | pybind11 bindings and the `fheml` Python package |
-| `examples/python/` | encrypted MNIST CNN and transformer from Python |
+| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting; `test_python.py`, `test_torch.py` |
+| `python/` | pybind11 bindings and the `fheml` Python package (`fheml.nn` + `fheml.from_torch`: PyTorch export) |
+| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted |
 | `tools/train_mnist.py`, `tools/train_transformer.py` | HE-friendly CNN / transformer training and export (numpy) |
 | `models/` | trained example models and 200 test images |
 | `legacy/` | the original PALISADE capstone code |
