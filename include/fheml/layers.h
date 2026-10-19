@@ -1,6 +1,10 @@
-// Network layers. Activations are flattened channel-major (C, H, W), the same
-// order as torch.flatten, and stored in the first C*H*W slots of a single
-// ciphertext. Every linear layer is lowered to a LinearTransform.
+// Network layers. Logically, activations are flattened channel-major (C, H, W),
+// the same order as torch.flatten. In the ciphertext, element (c, y, x) lives
+// in slot c*cs + y*ys + x*xs (a strided Layout). Strided convolutions and
+// pooling keep their outputs "gapped" at the input positions instead of
+// compacting them, which keeps their diagonals constant (k*k*(Ci+Co-1) of
+// them); the next linear layer absorbs the gaps into its matrix. Every linear
+// layer is lowered to a LinearTransform.
 #ifndef FHEML_LAYERS_H_
 #define FHEML_LAYERS_H_
 
@@ -21,6 +25,16 @@ struct Shape {
   std::string str() const;
 };
 
+struct Layout {
+  size_t cs = 0, ys = 0, xs = 0;
+  static Layout compact(const Shape& s) { return Layout{static_cast<size_t>(s.h) * s.w, static_cast<size_t>(s.w), 1}; }
+  size_t slot(size_t c, size_t y, size_t x) const { return c * cs + y * ys + x * xs; }
+  size_t slot(const Shape& s, size_t logical) const;
+  // Number of slots needed: highest slot used + 1.
+  size_t span(const Shape& s) const { return slot(s.c - 1, s.h - 1, s.w - 1) + 1; }
+  bool is_compact(const Shape& s) const { return cs == static_cast<size_t>(s.h) * s.w && ys == static_cast<size_t>(s.w) && xs == 1; }
+};
+
 // Multiplicative depth OpenFHE uses for a polynomial of the given degree
 // (Paterson-Stockmeyer for EvalPoly / EvalChebyshevSeries).
 uint32_t poly_depth(uint32_t degree);
@@ -33,7 +47,13 @@ class Layer {
 
   // Fixes the input shape, returns the output shape.
   virtual Shape configure(const Shape& in) = 0;
-  // Lowers the layer for a given slot count (after configure).
+  // Picks the slot layout of the output given the input's (after configure).
+  // gapped = allow strided outputs (see the top of this file).
+  virtual Layout configure_layout(const Layout& in, bool gapped) {
+    (void)gapped;
+    return in_layout_ = out_layout_ = in;
+  }
+  // Lowers the layer for a given slot count (after configure_layout).
   virtual void compile(uint32_t slots) { (void)slots; }
 
   virtual std::vector<double> forward_plain(const std::vector<double>& x) const = 0;
@@ -49,9 +69,12 @@ class Layer {
 
   const Shape& in_shape() const { return in_; }
   const Shape& out_shape() const { return out_; }
+  const Layout& in_layout() const { return in_layout_; }
+  const Layout& out_layout() const { return out_layout_; }
 
  protected:
   Shape in_, out_;
+  Layout in_layout_, out_layout_;
 };
 
 // y = M x + b. Subclasses only describe M and b.
@@ -59,22 +82,31 @@ class LinearLayer : public Layer {
  public:
   bool is_linear() const override { return true; }
   uint32_t depth() const override { return 1; }
+  Layout configure_layout(const Layout& in, bool gapped) override;
   void compile(uint32_t slots) override;
   std::vector<double> forward_plain(const std::vector<double>& x) const override;
   Ctxt forward(const FHEContext& ctx, const Ctxt& x) const override;
   std::vector<int32_t> rotation_indices() const override { return lt_.rotation_indices(); }
   std::string describe() const override;
 
+  // Logical matrix (out_shape().size() x in_shape().size()) and bias.
   virtual SparseMatrix matrix() const = 0;
   virtual std::vector<double> bias() const { return {}; }
+  // Spatial stride applied to the input layout when outputs stay gapped;
+  // 0 = this layer always produces a compact output.
+  virtual int gap_stride() const { return 0; }
 
   const LinearTransform& transform() const { return lt_; }
-  void set_cache_plaintexts(bool on) { cache_ = on; }
+  void set_cache_plaintexts(bool on) {
+    cache_ = on;
+    lt_.set_cache_plaintexts(on);
+  }
 
  private:
   LinearTransform lt_;
   SparseMatrix m_;
-  std::vector<double> b_;
+  std::vector<double> b_;       // logical
+  std::vector<double> b_slots_; // bias placed in output slots
   bool cache_ = false;
 };
 
@@ -88,6 +120,7 @@ class Conv2d : public LinearLayer {
   Shape configure(const Shape& in) override;
   SparseMatrix matrix() const override;
   std::vector<double> bias() const override;
+  int gap_stride() const override { return stride_; }
   void save(std::ostream& os) const override;
 
  private:
@@ -117,6 +150,7 @@ class AvgPool2d : public LinearLayer {
   std::string type() const override { return "avgpool2d"; }
   Shape configure(const Shape& in) override;
   SparseMatrix matrix() const override;
+  int gap_stride() const override { return stride_; }
   void save(std::ostream& os) const override;
 
  private:
@@ -131,6 +165,7 @@ class ChannelAffine : public LinearLayer {
   Shape configure(const Shape& in) override;
   SparseMatrix matrix() const override;
   std::vector<double> bias() const override;
+  int gap_stride() const override { return 1; }
   void save(std::ostream& os) const override;
 
  private:

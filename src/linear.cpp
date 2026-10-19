@@ -102,7 +102,28 @@ uint32_t choose_baby_step(const std::vector<uint32_t>& diags, uint32_t slots) {
 
 }  // namespace
 
-LinearTransform::LinearTransform(const SparseMatrix& m, uint32_t slots, uint32_t baby_step) : slots_(slots) {
+SparseMatrix LinearTransform::fold_rows(const SparseMatrix& m, uint32_t slots, uint32_t block) {
+  if (m.rows() > block || slots % block) throw std::invalid_argument("fold_rows: bad block size");
+  SparseMatrix out(slots, m.cols());
+  for (size_t r = 0; r < m.rows(); ++r)
+    for (const auto& e : m.row(r)) out.add(r + (e.first / block) * block, e.first, e.second);
+  return out;
+}
+
+size_t LinearTransform::count_diagonals(const SparseMatrix& m, uint32_t slots) {
+  std::vector<char> seen(slots, 0);
+  size_t n = 0;
+  for (size_t r = 0; r < m.rows(); ++r)
+    for (const auto& e : m.row(r)) {
+      int32_t d = normalize_rotation(static_cast<int64_t>(e.first) - static_cast<int64_t>(r), slots);
+      if (!seen[d]) { seen[d] = 1; ++n; }
+    }
+  return n;
+}
+
+LinearTransform::LinearTransform(const SparseMatrix& m, uint32_t slots, uint32_t baby_step, uint32_t fold_block)
+    : slots_(slots), fold_(fold_block) {
+  if (fold_ && (slots % fold_ || fold_ >= slots)) throw std::invalid_argument("LinearTransform: bad fold block");
   if (m.rows() > slots || m.cols() > slots)
     throw std::invalid_argument("LinearTransform: matrix larger than slot count");
 
@@ -146,6 +167,8 @@ std::vector<int32_t> LinearTransform::rotation_indices() const {
     if (b) out.push_back(b);
   for (const auto& g : giants_)
     if (g.step) out.push_back(g.step);
+  if (fold_)
+    for (uint32_t s = fold_; s < slots_; s *= 2) out.push_back(static_cast<int32_t>(s));
   return out;
 }
 
@@ -162,6 +185,11 @@ std::vector<double> LinearTransform::eval_slots(const std::vector<double>& x_in)
     inner = rotate_vec(inner, g.step);
     for (uint32_t i = 0; i < slots_; ++i) y[i] += inner[i];
   }
+  if (fold_)
+    for (uint32_t s = fold_; s < slots_; s *= 2) {
+      auto r = rotate_vec(y, s);
+      for (uint32_t i = 0; i < slots_; ++i) y[i] += r[i];
+    }
   return y;
 }
 
@@ -216,6 +244,8 @@ Ctxt LinearTransform::eval(const FHEContext& ctx, const Ctxt& x) const {
 
   Ctxt y = partial[0];
   for (size_t gi = 1; gi < partial.size(); ++gi) cc->EvalAddInPlace(y, partial[gi]);
+  if (fold_)
+    for (uint32_t s = fold_; s < slots_; s *= 2) cc->EvalAddInPlace(y, cc->EvalRotate(y, static_cast<int32_t>(s)));
   return y;
 }
 

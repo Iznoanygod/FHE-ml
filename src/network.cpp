@@ -91,7 +91,9 @@ void Network::save(const std::string& path) const {
 
 Network& Network::add(std::unique_ptr<Layer> layer) {
   Shape in = output_shape();
+  Layout lin = layers_.empty() ? Layout::compact(input_) : layers_.back()->out_layout();
   layer->configure(in);
+  layer->configure_layout(lin, gapped_);
   layers_.push_back(std::move(layer));
   slots_ = 0;
   return *this;
@@ -99,7 +101,12 @@ Network& Network::add(std::unique_ptr<Layer> layer) {
 
 Shape Network::configure() {
   Shape s = input_;
-  for (auto& l : layers_) s = l->configure(s);
+  Layout lay = Layout::compact(input_);
+  for (auto& l : layers_) {
+    s = l->configure(s);
+    lay = l->configure_layout(lay, gapped_);
+  }
+  slots_ = 0;
   return s;
 }
 
@@ -134,16 +141,22 @@ void Network::fuse_linear() {
     i = j;
   }
   layers_ = std::move(out);
-  slots_ = 0;
+  configure();
+}
+
+void Network::set_cache_plaintexts(bool on) {
+  for (auto& l : layers_)
+    if (l->is_linear()) static_cast<LinearLayer*>(l.get())->set_cache_plaintexts(on);
 }
 
 uint32_t Network::required_slots() const {
   size_t n = input_.size();
-  for (const auto& l : layers_) n = std::max(n, l->out_shape().size());
+  for (const auto& l : layers_) n = std::max({n, l->out_shape().size(), l->out_layout().span(l->out_shape())});
   return next_pow2(n);
 }
 
 void Network::compile(uint32_t slots) {
+  configure();
   slots_ = slots ? slots : required_slots();
   if (slots_ < required_slots()) throw std::invalid_argument("slot count too small for this network");
   for (auto& l : layers_) l->compile(slots_);
@@ -224,6 +237,19 @@ Ctxt Network::forward(const FHEContext& ctx, const Ctxt& x, const LayerHook& hoo
     if (hook) hook(i, *layers_[i], c, secs);
   }
   return c;
+}
+
+std::vector<double> Network::decrypt_layer(const FHEContext& ctx, const Ctxt& y, size_t i) const {
+  const Layer& l = *layers_.at(i);
+  auto v = ctx.decrypt(y, l.out_layout().span(l.out_shape()));
+  std::vector<double> out(l.out_shape().size());
+  for (size_t k = 0; k < out.size(); ++k) out[k] = v[l.out_layout().slot(l.out_shape(), k)];
+  return out;
+}
+
+std::vector<double> Network::decrypt_output(const FHEContext& ctx, const Ctxt& y) const {
+  if (layers_.empty()) return ctx.decrypt(y, input_.size());
+  return decrypt_layer(ctx, y, layers_.size() - 1);
 }
 
 std::string Network::summary() const {

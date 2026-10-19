@@ -17,6 +17,11 @@ std::string Shape::str() const {
   return os.str();
 }
 
+size_t Layout::slot(const Shape& s, size_t logical) const {
+  const size_t hw = static_cast<size_t>(s.h) * s.w;
+  return slot(logical / hw, (logical % hw) / s.w, logical % s.w);
+}
+
 uint32_t poly_depth(uint32_t degree) {
   // Levels consumed by OpenFHE v1.4 EvalPoly / EvalChebyshevSeries on [-1, 1]
   // (Paterson-Stockmeyer), measured; tests/test_fheml.cpp re-checks them.
@@ -38,12 +43,66 @@ void write_vec(std::ostream& os, const std::vector<double>& v) {
 
 // ----------------------------------------------------------------- LinearLayer
 
+Layout LinearLayer::configure_layout(const Layout& in, bool gapped) {
+  in_layout_ = in;
+  const size_t s = static_cast<size_t>(gap_stride());
+  out_layout_ = Layout::compact(out_);
+  if (gapped && s) {
+    // Gapped output: same channel stride as the input, spatial strides scaled,
+    // as long as no two outputs land in the same slot.
+    Layout cand{in.cs, in.ys * s, in.xs * s};
+    std::vector<char> used(cand.span(out_), 0);
+    bool ok = true;
+    for (size_t i = 0; i < out_.size() && ok; ++i) {
+      size_t sl = cand.slot(out_, i);
+      ok = !used[sl];
+      used[sl] = 1;
+    }
+    if (ok) out_layout_ = cand;
+  }
+  return out_layout_;
+}
+
 void LinearLayer::compile(uint32_t slots) {
   m_ = matrix();
   b_ = bias();
   if (m_.rows() != out_.size() || m_.cols() != in_.size())
     throw std::logic_error(type() + ": matrix shape does not match layer shapes");
-  lt_ = LinearTransform(m_, slots);
+
+  // Logical matrix -> slot matrix: columns move to the input layout, rows to
+  // the output layout (only rows are compact when the output is compact).
+  const bool compact_out = out_layout_.is_compact(out_);
+  SparseMatrix ms(compact_out ? out_.size() : slots, slots);
+  for (size_t r = 0; r < m_.rows(); ++r) {
+    size_t rs = compact_out ? r : out_layout_.slot(out_, r);
+    for (const auto& e : m_.row(r)) ms.add(rs, in_layout_.slot(in_, e.first), e.second);
+  }
+  b_slots_.clear();
+  if (!b_.empty()) {
+    b_slots_.assign(out_layout_.span(out_), 0.0);
+    for (size_t r = 0; r < b_.size(); ++r) b_slots_[out_layout_.slot(out_, r)] = b_[r];
+  }
+
+  // Few outputs: the folded (hybrid) form has at most 2R-1 diagonals instead
+  // of ~#inputs. Pick whichever needs fewer plaintext products + rotations.
+  uint32_t fold = 0;
+  if (compact_out) {
+    uint32_t block = 1;
+    while (block < out_.size()) block <<= 1;
+    if (block < slots) {
+      SparseMatrix folded = LinearTransform::fold_rows(ms, slots, block);
+      size_t d_plain = LinearTransform::count_diagonals(ms, slots);
+      size_t d_fold = LinearTransform::count_diagonals(folded, slots);
+      auto cost = [](size_t diags, size_t extra) { return static_cast<double>(diags) + 4.0 * (2.0 * std::sqrt(static_cast<double>(diags)) + extra); };
+      size_t log_steps = 0;
+      for (uint32_t s = block; s < slots; s *= 2) ++log_steps;
+      if (cost(d_fold, log_steps) < cost(d_plain, 0)) {
+        fold = block;
+        ms = std::move(folded);
+      }
+    }
+  }
+  lt_ = LinearTransform(ms, slots, 0, fold);
   lt_.set_cache_plaintexts(cache_);
 }
 
@@ -57,8 +116,8 @@ std::vector<double> LinearLayer::forward_plain(const std::vector<double>& x) con
 
 Ctxt LinearLayer::forward(const FHEContext& ctx, const Ctxt& x) const {
   Ctxt y = lt_.eval(ctx, x);
-  if (!b_.empty()) {
-    Ptxt pb = ctx.encode(b_, y->GetLevel(), y->GetNoiseScaleDeg());
+  if (!b_slots_.empty()) {
+    Ptxt pb = ctx.encode(b_slots_, y->GetLevel(), y->GetNoiseScaleDeg());
     ctx.cc()->EvalAddInPlace(y, pb);
   }
   return y;
@@ -67,7 +126,10 @@ Ctxt LinearLayer::forward(const FHEContext& ctx, const Ctxt& x) const {
 std::string LinearLayer::describe() const {
   std::ostringstream os;
   os << " [" << in_.str() << " -> " << out_.str() << ", " << lt_.num_diagonals() << " diagonals, "
-     << lt_.num_baby_steps() << " baby x " << lt_.num_giant_steps() << " giant steps]";
+     << lt_.num_baby_steps() << " baby x " << lt_.num_giant_steps() << " giant steps";
+  if (lt_.fold_block()) os << ", folded R=" << lt_.fold_block();
+  if (!out_layout_.is_compact(out_)) os << ", gapped out";
+  os << "]";
   return os.str();
 }
 

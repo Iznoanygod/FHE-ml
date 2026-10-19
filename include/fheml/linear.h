@@ -14,6 +14,11 @@
 //   y = sum_g rot_g( sum_b rot_{-g}(diag_{g+b}) (*) rot_b(x) )
 //
 // so only |{b}| + |{g}| rotations are needed instead of |{d}|.
+//
+// For layers with few outputs (dense heads) the matrix can be lowered with the
+// hybrid method of Gazelle: output r is accumulated in the slots r + j*R of a
+// "folded" S x S matrix whose diagonals all fall in (-R, R), and a final
+// rotate-and-sum over log2(S/R) steps adds the partial sums into slots [0, R).
 #ifndef FHEML_LINEAR_H_
 #define FHEML_LINEAR_H_
 
@@ -58,7 +63,15 @@ class LinearTransform {
   LinearTransform() = default;
   // Compiles M for ciphertexts with `slots` slots. Requires rows, cols <= slots.
   // baby_step == 0 selects the step that minimises the rotation count.
-  LinearTransform(const SparseMatrix& m, uint32_t slots, uint32_t baby_step = 0);
+  // fold_block > 0: rows of `m` are partial sums to be added with a stride of
+  // fold_block (see fold_rows()); the result is valid in slots [0, fold_block).
+  LinearTransform(const SparseMatrix& m, uint32_t slots, uint32_t baby_step = 0, uint32_t fold_block = 0);
+
+  // Re-arranges an (rows x slots) matrix whose rows are compact outputs into
+  // the folded S x S form used with fold_block = R (R >= rows, power of two).
+  static SparseMatrix fold_rows(const SparseMatrix& m, uint32_t slots, uint32_t block);
+  // Number of diagonals of m (as an S x S slot matrix).
+  static size_t count_diagonals(const SparseMatrix& m, uint32_t slots);
 
   Ctxt eval(const FHEContext& ctx, const Ctxt& x) const;
   // Runs exactly the same BSGS schedule on cleartext slot vectors. Used to
@@ -71,6 +84,7 @@ class LinearTransform {
   size_t num_giant_steps() const { return giants_.size(); }
   uint32_t baby_step() const { return baby_step_; }
   uint32_t slots() const { return slots_; }
+  uint32_t fold_block() const { return fold_; }
 
   // Cache encoded plaintext diagonals per level (fast, but memory heavy for
   // big layers: one plaintext per diagonal).
@@ -91,6 +105,7 @@ class LinearTransform {
   size_t num_diagonals_ = 0;
   std::vector<int32_t> babies_;   // distinct baby rotations (0 allowed)
   std::vector<Giant> giants_;
+  uint32_t fold_ = 0;
   bool cache_plaintexts_ = false;
 
   struct Cache {

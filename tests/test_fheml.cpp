@@ -50,13 +50,20 @@ void check_plan(const std::string& name, Network& net) {
   auto* l = static_cast<const LinearLayer*>(net.layers()[0].get());
   auto x = rand_vec(net.input_shape().size());
   auto ref = l->matrix().multiply(x);
-  auto got = l->transform().eval_slots(x);
+  auto slots = l->transform().eval_slots(x);
+  std::vector<double> got(ref.size());
+  for (size_t i = 0; i < got.size(); ++i) got[i] = slots[l->out_layout().slot(l->out_shape(), i)];
   check_err("plan " + name + " " + l->describe(), max_err(ref, got, ref.size()), 1e-9);
-  // Slots beyond the output must stay zero (activations of garbage slots
-  // could otherwise blow up).
-  double tail = 0;
-  for (size_t i = ref.size(); i < got.size(); ++i) tail = std::max(tail, std::fabs(got[i]));
-  check(tail < 1e-12, "plan " + name + " zero tail");
+  if (!l->transform().fold_block()) {
+    // Unused slots must stay zero (activations of garbage slots could
+    // otherwise blow up). Folded layers leave bounded partial sums there.
+    std::vector<char> used(slots.size(), 0);
+    for (size_t i = 0; i < got.size(); ++i) used[l->out_layout().slot(l->out_shape(), i)] = 1;
+    double tail = 0;
+    for (size_t i = 0; i < slots.size(); ++i)
+      if (!used[i]) tail = std::max(tail, std::fabs(slots[i]));
+    check(tail < 1e-12, "plan " + name + " unused slots zero");
+  }
 }
 
 void cleartext_tests() {
@@ -79,6 +86,25 @@ void cleartext_tests() {
     Network n(Shape{50, 1, 1});
     n.emplace<Dense>(50, 13, rand_vec(650), rand_vec(13));
     check_plan("dense", n);
+  }
+  {
+    Network n(Shape{600, 1, 1});
+    n.emplace<Dense>(600, 10, rand_vec(6000), rand_vec(10));
+    check_plan("dense folded", n);
+  }
+  {
+    // Strided conv, gapped output, then a dense layer reading the gaps.
+    Network n(Shape{1, 12, 12});
+    // (no biases: eval_slots covers the matrix part only)
+    n.emplace<Conv2d>(1, 3, 3, 3, 2, 1, rand_vec(27), std::vector<double>{});
+    n.emplace<Dense>(108, 7, rand_vec(756), std::vector<double>{});
+    n.compile();
+    check(!n.layers()[0]->out_layout().is_compact(n.layers()[0]->out_shape()), "strided conv output is gapped");
+    auto x = rand_vec(144);
+    std::vector<double> slots(n.slots(), 0.0);
+    for (size_t i = 0; i < x.size(); ++i) slots[i] = x[i];
+    for (const auto& l : n.layers()) slots = static_cast<const LinearLayer*>(l.get())->transform().eval_slots(slots);
+    check_err("plan gapped conv -> dense", max_err(n.forward_plain(x), slots, 7), 1e-9);
   }
   {
     Network n(Shape{3, 8, 8});
@@ -137,7 +163,7 @@ void check_encrypted(const std::string& name, Network& net, double tol, double i
   Ctxt c = ctx.encrypt(x, net.input_level(ctx));
   uint32_t lvl0 = c->GetLevel();
   Ctxt y = net.forward(ctx, c);
-  auto got = ctx.decrypt(y, net.output_shape().size());
+  auto got = net.decrypt_output(ctx, y);
   auto ref = net.forward_plain(x);
   check_err("encrypted " + name, max_err(ref, got, ref.size()), tol);
   if (!opts.bootstrapping) {

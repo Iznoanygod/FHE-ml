@@ -41,8 +41,14 @@ class Network {
     return add(std::unique_ptr<Layer>(new L(std::forward<Args>(args)...)));
   }
 
-  // Propagates shapes. Called automatically by add().
+  // Propagates shapes and slot layouts. Called automatically by add().
   Shape configure();
+  // Strided conv/pool outputs stay gapped (default, fewer diagonals) or are
+  // compacted (fewer slots). Takes effect at the next configure()/compile().
+  void set_gapped_layouts(bool on) { gapped_ = on; }
+  // Keep encoded weight diagonals between inferences: much faster repeated
+  // inference, at one plaintext (ring_dim * towers * 8 bytes) per diagonal.
+  void set_cache_plaintexts(bool on);
   // Merges runs of adjacent linear layers into one matrix each: saves one
   // level per merged layer at the cost of more diagonals.
   void fuse_linear();
@@ -68,6 +74,11 @@ class Network {
 
   std::vector<double> forward_plain(const std::vector<double>& x) const;
 
+  // Decrypts the network output and maps it back to logical order.
+  std::vector<double> decrypt_output(const FHEContext& ctx, const Ctxt& y) const;
+  // Same for the output of layer i (e.g. from a LayerHook).
+  std::vector<double> decrypt_layer(const FHEContext& ctx, const Ctxt& y, size_t i) const;
+
   // Optional per-layer hook: (layer index, layer, output ciphertext, seconds).
   using LayerHook = std::function<void(size_t, const Layer&, const Ctxt&, double)>;
   Ctxt forward(const FHEContext& ctx, const Ctxt& x, const LayerHook& hook = nullptr) const;
@@ -82,6 +93,7 @@ class Network {
   Shape input_;
   std::vector<std::unique_ptr<Layer>> layers_;
   uint32_t slots_ = 0;
+  bool gapped_ = true;
 };
 
 }  // namespace fheml
