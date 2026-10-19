@@ -24,7 +24,8 @@ add_library(fheml
   src/context.cpp
   src/linear.cpp
   src/layers.cpp
-  src/network.cpp)
+  src/network.cpp
+  src/transformer.cpp)
 target_include_directories(fheml PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(fheml SYSTEM PUBLIC
   ${OpenFHE_INCLUDE}
@@ -49,3 +50,23 @@ enable_testing()
 add_executable(test_fheml tests/test_fheml.cpp)
 target_link_libraries(test_fheml fheml)
 add_test(NAME test_fheml COMMAND test_fheml)
+
+# Python bindings: build/python/fheml (add build/python to PYTHONPATH).
+option(FHEML_PYTHON "Build the Python module (needs pybind11)" ON)
+if(FHEML_PYTHON)
+  find_package(Python3 COMPONENTS Interpreter Development.Module)
+  if(Python3_FOUND)
+    execute_process(COMMAND ${Python3_EXECUTABLE} -c "import pybind11; print(pybind11.get_cmake_dir())"
+                    OUTPUT_VARIABLE FHEML_PYBIND11_DIR OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  endif()
+  find_package(pybind11 CONFIG HINTS ${FHEML_PYBIND11_DIR})
+  if(pybind11_FOUND)
+    set_target_properties(fheml PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    pybind11_add_module(_fheml python/bindings.cpp)
+    target_link_libraries(_fheml PRIVATE fheml)
+    set_target_properties(_fheml PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python/fheml)
+    configure_file(python/fheml/__init__.py ${CMAKE_BINARY_DIR}/python/fheml/__init__.py COPYONLY)
+  else()
+    message(STATUS "pybind11 not found: skipping the Python module (pip install pybind11)")
+  endif()
+endif()

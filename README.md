@@ -27,6 +27,14 @@ That code is kept in [`legacy/`](legacy/) for reference.
   * Trained polynomials `poly`.
   * Chebyshev approximations of `relu` / `silu` / `gelu` / `sigmoid` / `tanh`
     on a chosen interval and degree, via `EvalChebyshevSeries`.
+* **Small transformers.**
+  * `TokenDense` is a per-token linear layer.
+  * `Attention` is fully homomorphic self-attention: ct×ct QKᵀ and AV, with
+    a trainable quadratic in place of softmax.
+  * `Residual` and `TokenMean` complete the block.
+  * See [docs/DESIGN.md](docs/DESIGN.md#transformers).
+* **A Python package**, `import fheml`, wraps the same API with numpy in and
+  numpy out.
 * **Bootstrapping layers** let you build deep networks.
 * **Optional encrypted weights.** `Network::encrypt_weights(ctx)` encrypts
   every conv/dense weight diagonal and bias, so the linear layers multiply
@@ -68,6 +76,16 @@ dense 64->10               25 diagonals (folded R=16)       depth 1
   * Peak memory is about 2 GB.
   * The logits match plaintext to about 1e-4.
 
+Tiny vision transformer on MNIST, trained with `tools/train_transformer.py`.
+Each image is 16 tokens of 7×7 patches, with d = 32, one attention block and
+one MLP block:
+
+* **Accuracy:** 95.6% in plaintext on the 10k test set.
+* **Parameters:** 128-bit security, ring 2^15, depth 12.
+* **Speed:** about 15 s per encrypted image. With encrypted weights it is also
+  about 15 s, after a one-time 27 s to encrypt them.
+* **Agreement:** predictions match plaintext.
+
 ## Building
 
 You need CMake ≥ 3.16, a C++17 compiler and an OpenFHE install (tested with
@@ -88,11 +106,40 @@ cmake --build build -j
 ./build/conv_demo
 ```
 
-To retrain the model (numpy only; MNIST is downloaded into `data/`):
+To retrain the models (numpy only; MNIST is downloaded into `data/`):
 
 ```sh
 python3 tools/train_mnist.py --out models/mnist_cnn.fheml --samples models/mnist_test_samples.txt
+python3 tools/train_transformer.py --out models/mnist_transformer.fheml
 ```
+
+## Python
+
+The Python module is built automatically when pybind11 is installed
+(`pip install pybind11`). It ends up in `build/python/fheml`.
+
+```sh
+export PYTHONPATH=$PWD/build/python
+python3 examples/python/mnist_cnn.py --n 3
+python3 examples/python/mnist_transformer.py --n 3 [--encrypt-weights]
+```
+
+```python
+import numpy as np, fheml
+
+n, d = 16, 32
+net = fheml.Network(fheml.Shape(n, 1, d))
+net.add(fheml.Residual([fheml.Attention(n, d, wq, wk, wv, wo, score=[0.03, 0.03, 0.008])]))
+net.add(fheml.Residual([fheml.TokenDense(n, d, 64, w1, b1), fheml.Poly([0, 0.5, 0.25]),
+                        fheml.TokenDense(n, 64, d, w2, b2)]))
+net.add(fheml.TokenMean(n, d)).add(fheml.Dense(d, 10, wh, bh))
+net.compile()
+ctx = fheml.make_context(net)              # 128-bit CKKS + exactly the keys net needs
+logits = fheml.infer(net, ctx, x)          # x: (n, d) numpy array; encrypt -> run -> decrypt
+assert np.allclose(logits, fheml.plain(net, x), atol=1e-3)
+```
+
+Weight arguments can be numpy arrays of any shape. They are flattened in C order, so dense weights are `[out][in]`. `tests/test_python.py` is a complete runnable version of this snippet.
 
 ## Using the library
 
@@ -127,8 +174,10 @@ std::vector<double> logits = net.decrypt_output(ctx, y);
 | `include/fheml/`, `src/` | the library: context, linear transforms, layers, network |
 | `examples/` | `mnist_cnn` (encrypted MNIST) and `conv_demo` (network built in code) |
 | `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting |
-| `tools/train_mnist.py` | HE-friendly CNN training and export |
-| `models/` | trained example model and 200 test images |
+| `python/` | pybind11 bindings and the `fheml` Python package |
+| `examples/python/` | encrypted MNIST CNN and transformer from Python |
+| `tools/train_mnist.py`, `tools/train_transformer.py` | HE-friendly CNN / transformer training and export (numpy) |
+| `models/` | trained example models and 200 test images |
 | `legacy/` | the original PALISADE capstone code |
 
 The tests and `--insecure` runs use `HEStd_NotSet` toy parameters, which are

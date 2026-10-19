@@ -86,7 +86,7 @@ void LinearLayer::compile(uint32_t slots) {
   // Few outputs: the folded (hybrid) form has at most 2R-1 diagonals instead
   // of ~#inputs. Pick whichever needs fewer plaintext products + rotations.
   uint32_t fold = 0;
-  if (compact_out) {
+  if (compact_out && allow_fold_) {
     uint32_t block = 1;
     while (block < out_.size()) block <<= 1;
     if (block < slots) {

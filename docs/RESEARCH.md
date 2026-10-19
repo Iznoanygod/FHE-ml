@@ -125,3 +125,49 @@ were not confirmed.
       halved at each downsampling.
   - FHEON. Njungle, Jahns, Kinsy, arXiv:2510.03996, 2025 (venue unconfirmed).
     - A configurable OpenFHE CNN framework.
+
+## 4. Transformers under FHE
+
+Citations in this section were checked against abstracts or PDFs in
+October 2026, except where marked *(unverified)*.
+
+- **THE-X.** Chen et al. ACL Findings 2022, arXiv:2206.00216.
+  - Replaces LayerNorm with a learned affine map, and softmax with an
+    estimation network.
+  - ReLU is evaluated by the client, so it is not fully non-interactive.
+- **NEXUS.** Zhang et al. NDSS 2025, ePrint 2024/136.
+  - The first non-interactive BERT.
+  - Its ct×ct QKᵀ is a SIMD elementwise product followed by log-rotation
+    sums. fheml's attention follows this pattern.
+  - Softmax uses exp ≈ (1+x/2^r)^(2^r) and Goldschmidt division.
+  - LayerNorm uses a Newton 1/√x.
+- **Powerformer.** Park, Lee, Lee. ACL 2025, ePrint 2024/1429.
+  - BRPmax: ReLU(x+c)^p divided by a constant learned during training, so
+    there is no encrypted division.
+- **Rho et al., Encryption-Friendly LLM Architecture.** ICLR 2025, arXiv:2410.02486.
+  - Gaussian-kernel attention, plus LoRA to turn most ct×ct products into
+    ct×pt.
+- **Zimerman et al., Converting Transformers to Polynomial Form.** ICML 2024, arXiv:2311.08610.
+  - Scaled pointwise attention, σ(QKᵀ)/L.
+  - A range-minimisation loss so low-degree polynomials suffice.
+- **PowerSoftmax.** Zimerman et al. AISTATS 2026, arXiv:2410.09457.
+  - x^p normalised by the sum or mean, scaled to polynomial LLMs with over 1B
+    parameters.
+- **HETAL.** Lee et al. ICML 2023. Diagonal methods for ABᵀ and AᵀB.
+- **THOR.** Moon et al. CCS 2025, ePrint 2024/1881.
+  - Diagonal-major packing, with BSGS for ct×ct matrix multiplication.
+- **MOAI.** Zhang et al. ICLR 2026, ePrint 2025/991.
+  - Layouts that make the ct×pt multiplications and softmax/LayerNorm
+    rotation-free.
+- **Tricycle.** Lim et al. ePrint 2025/1200.
+  - Tricyclic encodings for batched matrix multiplication.
+  - CCS 2026 per the ePrint metadata *(unverified)*.
+- **2PC systems.** Iron, BOLT, BumbleBee, Nimbus *(cited from memory)*.
+  - They run nonlinear layers in MPC.
+  - What carries over to pure FHE is their matmul packing and the low-degree
+    approximations over narrow ranges.
+- **Common recipe.**
+  - Polynomial or power attention with a public normaliser.
+  - No LayerNorm, or a Newton/Chebyshev 1/√x on a calibrated range.
+  - Quadratic or low-degree GELU replacements.
+  - Training with a range penalty.

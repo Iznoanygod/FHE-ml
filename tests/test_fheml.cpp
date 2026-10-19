@@ -185,6 +185,66 @@ void measure_poly_depth() {
   }
 }
 
+// A one-block transformer: token embedding, attention and MLP residuals,
+// mean pooling and a classifier head.
+Network tiny_transformer(int n, int in, int d) {
+  auto attn = std::make_shared<Attention>(n, d, rand_vec(d * d, -0.3, 0.3), rand_vec(d * d, -0.3, 0.3),
+                                          rand_vec(d * d, -0.3, 0.3), rand_vec(d * d, -0.3, 0.3), rand_vec(d, -0.1, 0.1),
+                                          rand_vec(d, -0.1, 0.1), rand_vec(d, -0.1, 0.1), rand_vec(d, -0.1, 0.1),
+                                          std::vector<double>{0.5 / n, 0.5 / n, 0.125 / n});
+  std::vector<std::shared_ptr<Layer>> mlp = {
+      std::make_shared<TokenDense>(n, d, 2 * d, rand_vec(2 * d * d, -0.3, 0.3), rand_vec(2 * d, -0.1, 0.1)),
+      std::make_shared<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25}),
+      std::make_shared<TokenDense>(n, 2 * d, d, rand_vec(2 * d * d, -0.3, 0.3), rand_vec(d, -0.1, 0.1))};
+  Network net(Shape{n, 1, in});
+  net.emplace<TokenDense>(n, in, d, rand_vec(in * d, -0.4, 0.4), rand_vec(n * d, -0.1, 0.1))
+      .add(std::make_shared<Residual>(std::vector<std::shared_ptr<Layer>>{attn}))
+      .add(std::make_shared<Residual>(mlp))
+      .emplace<TokenMean>(n, d)
+      .emplace<Dense>(d, 3, rand_vec(3 * d, -0.5, 0.5), rand_vec(3, -0.1, 0.1));
+  return net;
+}
+
+void transformer_tests() {
+  {
+    Network n(Shape{5, 1, 6});
+    n.emplace<TokenDense>(5, 6, 8, rand_vec(48), rand_vec(40));
+    check_plan("tokendense", n);
+    Network m(Shape{5, 1, 8});
+    m.emplace<TokenMean>(5, 8);
+    check_plan("tokenmean", m);
+  }
+  {
+    Network net = tiny_transformer(4, 5, 8);
+    const char* path = "test_transformer.fheml";
+    net.save(path);
+    Network back = Network::load(path);
+    std::remove(path);
+    auto x = rand_vec(20);
+    check_err("transformer save/load round trip", max_err(net.forward_plain(x), back.forward_plain(x), 3), 1e-12);
+  }
+  {
+    // Attention alone; n = 5 is not a power of two on purpose.
+    const int n = 5, d = 8;
+    Network net(Shape{n, 1, d});
+    net.emplace<Attention>(n, d, rand_vec(d * d, -0.4, 0.4), rand_vec(d * d, -0.4, 0.4), rand_vec(d * d, -0.4, 0.4),
+                           rand_vec(d * d, -0.4, 0.4), rand_vec(d), rand_vec(d), rand_vec(d), rand_vec(d),
+                           std::vector<double>{0.2, 0.1, 0.05});
+    check_encrypted("attention n=5 d=8", net, 1e-4);
+  }
+  {
+    Network net = tiny_transformer(4, 5, 8);
+    check_encrypted("tiny transformer", net, 1e-3);
+    Network net2 = tiny_transformer(4, 5, 8);
+    check_encrypted("enc-weights tiny transformer", net2, 1e-3, 1.0, true);
+    // Input tokens padded to the MLP width: every layer keeps token stride 16.
+    Network net3 = tiny_transformer(4, 16, 8);
+    net3.compile();
+    check(net3.layers()[1]->in_layout().cs == 16, "transformer keeps the padded token stride");
+    check_encrypted("tiny transformer, strided tokens", net3, 1e-3);
+  }
+}
+
 void encrypted_tests(bool quick) {
   {
     Network n(Shape{2, 8, 8});
@@ -276,6 +336,7 @@ int main(int argc, char** argv) {
   bool quick = argc > 1 && std::strcmp(argv[1], "--quick") == 0;
   cleartext_tests();
   encrypted_tests(quick);
+  transformer_tests();
   std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");
   return g_failures ? 1 : 0;
 }

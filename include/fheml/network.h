@@ -13,11 +13,16 @@
 //   poly N                                        followed by N coefficients c0..c{N-1}
 //   chebyshev FN A B DEGREE                       FN in relu|silu|gelu|sigmoid|tanh
 //   bootstrap
+//   tokendense N IN OUT NB                        followed by weights [OUT][IN], NB bias values (0, OUT or N*OUT)
+//   tokenmean N D
+//   attention N D HAS_BIAS                        followed by Wq Wk Wv Wo [, bq bk bv bo], 3 score coefficients
+//   residual K                                    followed by K layers (y = body(x) + x)
 //   end
 #ifndef FHEML_NETWORK_H_
 #define FHEML_NETWORK_H_
 
 #include <functional>
+#include <iosfwd>
 #include <memory>
 #include <string>
 #include <vector>
@@ -27,6 +32,9 @@
 
 namespace fheml {
 
+// Parses one layer whose keyword `tok` was just read.
+std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is);
+
 class Network {
  public:
   Network() = default;
@@ -35,10 +43,10 @@ class Network {
   static Network load(const std::string& path);
   void save(const std::string& path) const;
 
-  Network& add(std::unique_ptr<Layer> layer);
+  Network& add(std::shared_ptr<Layer> layer);
   template <typename L, typename... Args>
   Network& emplace(Args&&... args) {
-    return add(std::unique_ptr<Layer>(new L(std::forward<Args>(args)...)));
+    return add(std::make_shared<L>(std::forward<Args>(args)...));
   }
 
   // Propagates shapes and slot layouts. Called automatically by add().
@@ -93,13 +101,13 @@ class Network {
 
   const Shape& input_shape() const { return input_; }
   Shape output_shape() const { return layers_.empty() ? input_ : layers_.back()->out_shape(); }
-  const std::vector<std::unique_ptr<Layer>>& layers() const { return layers_; }
+  const std::vector<std::shared_ptr<Layer>>& layers() const { return layers_; }
   uint32_t slots() const { return slots_; }
   std::string summary() const;
 
  private:
   Shape input_;
-  std::vector<std::unique_ptr<Layer>> layers_;
+  std::vector<std::shared_ptr<Layer>> layers_;
   uint32_t slots_ = 0;
   bool gapped_ = true;
 };

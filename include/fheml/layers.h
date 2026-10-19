@@ -8,6 +8,7 @@
 #ifndef FHEML_LAYERS_H_
 #define FHEML_LAYERS_H_
 
+#include <algorithm>
 #include <functional>
 #include <iosfwd>
 #include <memory>
@@ -61,6 +62,14 @@ class Layer {
 
   virtual uint32_t depth() const = 0;
   virtual std::vector<int32_t> rotation_indices() const { return {}; }
+  // Slots this layer needs (after configure_layout).
+  virtual size_t min_slots() const { return std::max(in_layout_.span(in_), out_layout_.span(out_)); }
+  // Encrypted-weights mode (see Network::encrypt_weights). No-op for layers
+  // without trained weights.
+  virtual void encrypt_weights(const FHEContext& ctx, bool drop_plaintext) {
+    (void)ctx;
+    (void)drop_plaintext;
+  }
   virtual bool is_linear() const { return false; }
   virtual bool is_bootstrap() const { return false; }
 
@@ -100,8 +109,14 @@ class LinearLayer : public Layer {
   // Encrypts this layer's weight diagonals and bias. Must follow one forward()
   // with clear weights so the input/output levels are known (see
   // Network::encrypt_weights).
-  void encrypt_weights(const FHEContext& ctx, bool drop_plaintext);
+  void encrypt_weights(const FHEContext& ctx, bool drop_plaintext) override;
   bool weights_encrypted() const { return lt_.weights_encrypted(); }
+  // Forbid the folded (hybrid) lowering, which leaves partial sums in the
+  // slots past the output. Needed when the output must be clean (attention).
+  void set_allow_fold(bool on) { allow_fold_ = on; }
+  // Overrides the output layout chosen by configure_layout (any linear map can
+  // write its outputs anywhere). Used by Residual to line up y with x.
+  void set_out_layout(const Layout& l) { out_layout_ = l; }
   void set_cache_plaintexts(bool on) {
     cache_ = on;
     lt_.set_cache_plaintexts(on);
@@ -115,6 +130,7 @@ class LinearLayer : public Layer {
   Ctxt enc_bias_;
   mutable uint32_t last_out_level_ = 0;
   bool cache_ = false;
+  bool allow_fold_ = true;
 };
 
 class Conv2d : public LinearLayer {

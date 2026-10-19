@@ -70,6 +70,53 @@ The plaintext reference evaluates the *same* approximation
 (`EvalChebyshevFunctionPtxt`). Encrypted-vs-plaintext error therefore measures
 only the CKKS noise. The approximation error is a training-time concern.
 
+## Transformers
+
+### Layout
+
+A sequence of n tokens with d features is the Shape `{n, 1, d}`. Feature j of
+token t sits in slot `t*B + j`.
+
+- The token stride B ≥ d is set by the input: pad every input token to the
+  widest layer, which is 64 in the MNIST model.
+- `TokenDense` keeps that stride whenever its output fits. `kron(I_n, W)`
+  then has only `in + out - 1` diagonals. Without the padding, the MNIST
+  model's 32→64 layer had 575 diagonals instead of 95, and inference took
+  26 s instead of 15 s.
+- `Residual` forces its last linear layer to write in the residual's layout.
+
+### Attention
+
+There is one ciphertext in and one out, using the diagonal-over-offsets method
+(NEXUS / Powerformer style). For each token offset s in 0..n-1:
+
+1. Rotate K and V by `s*B`. Both were first extended with a cyclic copy at
+   `[n*B, 2n*B)`, so the rotation maps token i to token (i+s) mod n, and the
+   rotations are hoisted.
+2. Multiply Q ⊙ K_s, then sum each token's d-window with log₂ d rotations.
+3. Apply the masked score polynomial `mask · (c0 + c1 p + c2 p²)`, with the
+   mask folded into the coefficients. This costs 2 levels.
+4. Broadcast back over the token with log₂ d rotations.
+5. Multiply by V_s.
+
+- **Cost:** about n·(2 log₂ d + 2) rotations and 3n ct×ct products.
+- **Depth:** 6 for the block, including the four projections.
+
+### Softmax and normalisation
+
+- Softmax is replaced by the fixed quadratic `A = (S+2)²/(8n)`. It is
+  non-negative, with a public normaliser 1/n, as in PowerSoftmax and
+  Powerformer's plaintext normaliser. 1/√d is learned into W_q.
+- LayerNorm is omitted. The toy model trains fine without it.
+
+### Next steps
+
+- Multiple heads, which fit as sub-blocks of each token.
+- Normalised power attention, using a Chebyshev 1/x on the rotation-free sum
+  of the per-offset score ciphertexts.
+- LayerNorm via a Chebyshev 1/√x on a training-calibrated range.
+- Bootstrapping between blocks for deeper models.
+
 ## Encrypted weights
 
 `Network::encrypt_weights(ctx)` switches every linear layer to ciphertext
@@ -126,6 +173,8 @@ All of the following are tested under encryption:
 - The trained MNIST CNN at 128-bit security: about 3 s per image, with
   predictions identical to plaintext.
 - The same CNN with encrypted weights: about 3.6 s per image.
+- A one-block MNIST vision transformer (95.6%): about 15 s per image.
+- Python bindings for all of the above.
 
 ## Roadmap (suggested order)
 
@@ -154,7 +203,9 @@ All of the following are tested under encryption:
 6. **Batch-norm and residual connections.**
    - Fold BN into the convolutions at load time.
    - Add a residual `Add` layer that aligns levels and layouts.
-7. **Training/export from PyTorch.** An exporter for `torch.nn.Sequential`
+7. **Training/export from PyTorch.** torch could not be installed in the
+   development environment, so the trainers use numpy with hand-written
+   backprop. An exporter for `torch.nn.Sequential`
    models with polynomial activations, next to the numpy trainer.
 8. **Performance.**
    - Reduce `scale_mod_bits` / depth so the MNIST net fits ring 2^14.
