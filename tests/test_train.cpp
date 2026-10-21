@@ -1,0 +1,262 @@
+// Encrypted training tests (no framework, INSECURE toy parameters).
+//
+// 1. train_plain's gradients against finite differences, for every layer type
+//    that can be trained or backpropagated through.
+// 2. Encrypted SGD updates against train_plain on the same batch: the
+//    decrypted weights must match the plaintext-trained ones.
+// 3. The same with bootstrapped weights over several updates.
+#include <cmath>
+#include <cstdio>
+#include <algorithm>
+#include <cstring>
+#include <functional>
+#include <random>
+#include <string>
+#include <vector>
+
+#include "fheml/fheml.h"
+
+using namespace fheml;
+
+namespace {
+
+int g_failures = 0;
+
+void check(bool ok, const std::string& name, const std::string& detail = "") {
+  std::printf("[%s] %s %s\n", ok ? " OK " : "FAIL", name.c_str(), detail.c_str());
+  if (!ok) ++g_failures;
+}
+
+void check_err(const std::string& name, double err, double tol) {
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "(max err %.2e, tol %.0e)", err, tol);
+  check(err <= tol, name, buf);
+}
+
+struct Rng {
+  std::mt19937 g;
+  explicit Rng(unsigned seed) : g(seed) {}
+  std::vector<double> vec(size_t n, double s) {
+    std::uniform_real_distribution<double> d(-s, s);
+    std::vector<double> v(n);
+    for (double& x : v) x = d(g);
+    return v;
+  }
+};
+
+using Layers = std::vector<std::shared_ptr<Layer>>;
+using Builder = std::function<Network()>;
+
+// Every trainable layer, depth first.
+void linear_layers(const Layers& ls, std::vector<LinearLayer*>& out) {
+  for (const auto& l : ls) {
+    if (auto* r = dynamic_cast<Residual*>(l.get())) linear_layers(r->body(), out);
+    if (auto* lin = dynamic_cast<LinearLayer*>(l.get()))
+      if (lin->trainable()) out.push_back(lin);
+  }
+}
+
+std::vector<double> all_params(const Network& net) {
+  std::vector<LinearLayer*> ls;
+  linear_layers(net.layers(), ls);
+  std::vector<double> p;
+  for (auto* l : ls) {
+    auto q = l->params();
+    p.insert(p.end(), q.begin(), q.end());
+  }
+  return p;
+}
+
+double max_diff(const std::vector<double>& a, const std::vector<double>& b) {
+  double e = 0;
+  for (size_t i = 0; i < a.size(); ++i) e = std::max(e, std::fabs(a[i] - b[i]));
+  return e;
+}
+
+// ------------------------------------------------------------------ networks
+
+Network mlp(unsigned seed) {
+  Rng r(seed);
+  Network n(Shape{12, 1, 1});
+  n.emplace<Dense>(12, 6, r.vec(72, 0.4), r.vec(6, 0.1))
+      .emplace<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25})
+      .emplace<Dense>(6, 3, r.vec(18, 0.4), r.vec(3, 0.1));
+  return n;
+}
+
+// Shared weights everywhere: conv taps and biases, per-channel affine; a
+// frozen average pool and a square in between.
+Network cnn(unsigned seed) {
+  Rng r(seed);
+  Network n(Shape{2, 6, 6});
+  n.emplace<Conv2d>(2, 3, 3, 3, 1, 1, r.vec(54, 0.3), r.vec(3, 0.1))
+      .emplace<ChannelAffine>(std::vector<double>{1.0, 0.8, 1.2}, std::vector<double>{0.0, 0.1, -0.1})
+      .emplace<Square>()
+      .emplace<AvgPool2d>(2, 2)
+      .emplace<Dense>(27, 2, r.vec(54, 0.3), r.vec(2, 0.1));
+  return n;
+}
+
+Network strided_cnn(unsigned seed) {
+  Rng r(seed);
+  Network n(Shape{1, 8, 8});
+  n.emplace<Conv2d>(1, 2, 3, 3, 2, 1, r.vec(18, 0.4), r.vec(2, 0.1))
+      .emplace<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25})
+      .emplace<Dense>(32, 2, r.vec(64, 0.3), std::vector<double>{});
+  return n;
+}
+
+// Token layers with shared and per-token biases, a Chebyshev activation and a
+// residual connection.
+Network tokens(unsigned seed) {
+  Rng r(seed);
+  const int t = 3, d = 4;
+  Layers mlp = {std::make_shared<TokenDense>(t, d, 8, r.vec(32, 0.4), r.vec(8, 0.1)),
+                std::make_shared<ChebyshevActivation>("silu", -3.0, 3.0, 7),
+                std::make_shared<TokenDense>(t, 8, d, r.vec(32, 0.3), r.vec(d, 0.1))};
+  Network n(Shape{t, 1, 5});
+  n.emplace<TokenDense>(t, 5, d, r.vec(20, 0.4), r.vec(t * d, 0.1))
+      .add(std::make_shared<Residual>(mlp))
+      .emplace<TokenMean>(t, d)
+      .emplace<Dense>(d, 2, r.vec(8, 0.4), r.vec(2, 0.1));
+  return n;
+}
+
+struct Batch {
+  std::vector<std::vector<double>> xs, ts;
+};
+
+Batch batch(const Network& n, size_t count, unsigned seed) {
+  Rng r(seed);
+  Batch b;
+  for (size_t i = 0; i < count; ++i) {
+    b.xs.push_back(r.vec(n.input_shape().size(), 1.0));
+    b.ts.push_back(r.vec(n.output_shape().size(), 1.0));
+  }
+  return b;
+}
+
+// --------------------------------------------------------- gradient checks
+
+double loss(const Network& net, const Batch& b) {
+  double l = 0;
+  for (size_t s = 0; s < b.xs.size(); ++s) {
+    auto y = net.forward_plain(b.xs[s]);
+    for (size_t i = 0; i < y.size(); ++i) l += 0.5 * (y[i] - b.ts[s][i]) * (y[i] - b.ts[s][i]);
+  }
+  return l / static_cast<double>(b.xs.size());
+}
+
+void gradient_check(const std::string& name, const Builder& make, const std::vector<size_t>& frozen = {}) {
+  Network net = make();
+  net.compile();
+  Batch b = batch(net, 3, 7);
+  // One SGD step with lr = 1 moves the parameters by -grad.
+  std::vector<double> p0 = all_params(net);
+  train_plain(net, b.xs, b.ts, 1.0, frozen);
+  std::vector<double> p1 = all_params(net);
+
+  Network ref = make();
+  ref.compile();
+  double err = 0, scale = 0;
+  size_t k = 0;
+  for (size_t top = 0; top < ref.layers().size(); ++top) {
+    std::vector<LinearLayer*> ls;
+    linear_layers({ref.layers()[top]}, ls);
+    const bool is_frozen = std::find(frozen.begin(), frozen.end(), top) != frozen.end();
+    for (auto* l : ls) {
+      std::vector<double> p = l->params();
+      for (size_t i = 0; i < p.size(); ++i, ++k) {
+        const double eps = 1e-5, v = p[i];
+        p[i] = v + eps;
+        l->set_params(p);
+        double up = loss(ref, b);
+        p[i] = v - eps;
+        l->set_params(p);
+        double down = loss(ref, b);
+        p[i] = v;
+        l->set_params(p);
+        double num = is_frozen ? 0.0 : (up - down) / (2 * eps);
+        double got = p0[k] - p1[k];
+        err = std::max(err, std::fabs(num - got));
+        scale = std::max(scale, std::fabs(num));
+      }
+    }
+  }
+  check_err("gradient " + name, err / std::max(scale, 1e-3), 1e-6);
+}
+
+// ------------------------------------------------------- encrypted training
+
+FHEContext training_context(const Trainer& tr, bool boot, uint32_t updates) {
+  ContextOptions o = tr.context_options(false, boot, updates);
+  o.ring_dim = boot ? 4096 : std::max(2048u, 2 * o.slots);
+  FHEContext ctx(o);
+  ctx.keygen(tr.rotation_indices());
+  return ctx;
+}
+
+void encrypted_check(const std::string& name, const Builder& make, size_t updates, bool boot, double tol,
+                     const std::vector<size_t>& frozen = {}, double lr = 0.5) {
+  Network plain = make();
+  plain.compile();
+  Network enc = make();
+  // Bootstrapping: use all 2048 slots of the ring so weights are packed.
+  enc.compile(boot ? 2048 : 0);
+  Trainer tr(enc, frozen);
+  FHEContext ctx = training_context(tr, boot, static_cast<uint32_t>(updates));
+  std::printf("  %s\n  %s\n", tr.summary().c_str(), ctx.describe().c_str());
+  tr.encrypt_weights(ctx);
+
+  std::vector<double> before = all_params(plain);
+  for (size_t u = 0; u < updates; ++u) {
+    Batch b = batch(plain, 2, 100 + static_cast<unsigned>(u));
+    train_plain(plain, b.xs, b.ts, lr, frozen);
+    for (size_t s = 0; s < b.xs.size(); ++s) tr.accumulate(ctx, tr.encrypt_input(ctx, b.xs[s]), tr.encrypt_target(ctx, b.ts[s]));
+    tr.update(ctx, lr);
+    if (!boot)
+      check(tr.weight_level() <= ctx.total_depth(), name + " weights within the planned depth",
+            "(level " + std::to_string(tr.weight_level()) + " of " + std::to_string(ctx.total_depth()) + ")");
+  }
+  // The trained encrypted weights also run inference.
+  Batch probe = batch(plain, 1, 999);
+  auto y = tr.decrypt_output(ctx, tr.forward(ctx, tr.encrypt_input(ctx, probe.xs[0])));
+
+  tr.decrypt_weights(ctx);
+  std::vector<double> want = all_params(plain), got = all_params(enc);
+  check(max_diff(before, want) > 10 * tol, name + " training changed the weights");
+  check_err("encrypted training " + name, max_diff(want, got), tol);
+  check_err("inference with trained encrypted weights " + name, max_diff(y, plain.forward_plain(probe.xs[0])), 10 * tol);
+  if (!frozen.empty()) {
+    // Frozen layers keep their weights.
+    Network orig = make();
+    auto* a = dynamic_cast<LinearLayer*>(orig.layers()[frozen[0]].get());
+    auto* c = dynamic_cast<LinearLayer*>(enc.layers()[frozen[0]].get());
+    check(a && c && max_diff(a->params(), c->params()) == 0.0, name + " frozen layer unchanged");
+  }
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+  const bool quick = argc > 1 && std::strcmp(argv[1], "--quick") == 0;
+
+  gradient_check("mlp", [] { return mlp(1); });
+  gradient_check("cnn (shared weights, affine, square, avgpool)", [] { return cnn(2); });
+  gradient_check("strided cnn", [] { return strided_cnn(3); });
+  gradient_check("tokens (residual, chebyshev, per-token bias)", [] { return tokens(4); });
+  gradient_check("mlp, first layer frozen", [] { return mlp(5); }, {0});
+
+  encrypted_check("mlp", [] { return mlp(1); }, 1, false, 1e-4);
+  encrypted_check("mlp, two updates", [] { return mlp(1); }, 2, false, 1e-4);
+  encrypted_check("cnn", [] { return cnn(2); }, 1, false, 1e-4);
+  encrypted_check("strided cnn", [] { return strided_cnn(3); }, 1, false, 1e-4);
+  encrypted_check("tokens", [] { return tokens(4); }, 1, false, 1e-4);
+  encrypted_check("mlp, fine-tune last layer", [] { return mlp(5); }, 1, false, 1e-4, {0});
+  if (!quick) encrypted_check("mlp, bootstrapped weights", [] { return mlp(6); }, 3, true, 1e-3, {}, 0.3);
+  if (!quick) encrypted_check("cnn, bootstrapped weights", [] { return cnn(7); }, 2, true, 1e-3, {}, 0.3);
+
+  std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");
+  return g_failures ? 1 : 0;
+}
