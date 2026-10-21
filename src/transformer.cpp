@@ -70,6 +70,37 @@ std::vector<double> TokenDense::bias() const {
   return b;
 }
 
+std::vector<LinearLayer::ParamRef> TokenDense::weight_refs() const {
+  std::vector<ParamRef> refs;
+  for (int t = 0; t < n_; ++t)
+    for (int o = 0; o < out_dim_; ++o)
+      for (int i = 0; i < in_dim_; ++i)
+        refs.push_back({static_cast<size_t>(t) * out_dim_ + o, static_cast<size_t>(t) * in_dim_ + i, o * in_dim_ + i});
+  return refs;
+}
+
+std::vector<int> TokenDense::bias_refs() const {
+  std::vector<int> r;
+  if (b_.empty()) return r;
+  const bool per_token = b_.size() == static_cast<size_t>(n_) * out_dim_;
+  for (size_t i = 0; i < static_cast<size_t>(n_) * out_dim_; ++i)
+    r.push_back(static_cast<int>(w_.size() + (per_token ? i : i % out_dim_)));
+  return r;
+}
+
+std::vector<double> TokenDense::params() const {
+  std::vector<double> p(w_);
+  p.insert(p.end(), b_.begin(), b_.end());
+  return p;
+}
+
+void TokenDense::set_params(const std::vector<double>& p) {
+  if (p.size() != w_.size() + b_.size()) throw std::invalid_argument("tokendense: wrong parameter count");
+  std::copy(p.begin(), p.begin() + static_cast<std::ptrdiff_t>(w_.size()), w_.begin());
+  std::copy(p.begin() + static_cast<std::ptrdiff_t>(w_.size()), p.end(), b_.begin());
+  invalidate();
+}
+
 void TokenDense::save(std::ostream& os) const {
   os << "tokendense " << n_ << " " << in_dim_ << " " << out_dim_ << " " << b_.size() << "\n";
   write_vec(os, w_);

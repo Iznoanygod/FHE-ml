@@ -35,6 +35,8 @@ FHEContext::FHEContext(const ContextOptions& opts) : opts_(opts) {
   // OpenFHE picks the ring dimension from the security level and modulus
   // size; it has to be at least 2 * slots, so grow it until both hold.
   uint32_t ring = opts_.ring_dim ? opts_.ring_dim : 2 * opts_.slots;
+  // Bootstrapping fails on tiny rings even when security is off.
+  if (!opts_.ring_dim && opts_.bootstrapping) ring = std::max(ring, 4096u);
   std::string last_error;
   for (; ring <= (1u << 17); ring *= 2) {
     params.SetRingDim(ring);
@@ -84,6 +86,16 @@ std::vector<double> FHEContext::decrypt(const Ctxt& c, size_t n) const {
   cc_->Decrypt(keys_.secretKey, c, &p);
   p->SetLength(std::min<size_t>(n, opts_.slots));
   return p->GetRealPackedValue();
+}
+
+uint32_t FHEContext::ring_dim_for(const ContextOptions& opts) {
+  ContextOptions o = opts;
+  if (o.bootstrapping) {
+    o.mult_depth += FHECKKSRNS::GetBootstrapDepth(o.level_budget, UNIFORM_TERNARY);
+    o.bootstrapping = false;
+    if (!o.ring_dim) o.slots = std::max(o.slots, 2048u);  // the constructor's 4096 floor
+  }
+  return FHEContext(o).ring_dim();
 }
 
 Ctxt FHEContext::bootstrap(const Ctxt& c) const {

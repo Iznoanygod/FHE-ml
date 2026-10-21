@@ -43,6 +43,10 @@ class TokenDense : public LinearLayer {
   Layout configure_layout(const Layout& in, bool gapped) override;
   SparseMatrix matrix() const override;
   std::vector<double> bias() const override;
+  std::vector<ParamRef> weight_refs() const override;
+  std::vector<int> bias_refs() const override;
+  std::vector<double> params() const override;
+  void set_params(const std::vector<double>& p) override;
   void save(std::ostream& os) const override;
 
  private:

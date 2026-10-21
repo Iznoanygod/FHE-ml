@@ -38,6 +38,11 @@ That code is kept in [`legacy/`](legacy/) for reference.
 * **A PyTorch exporter.** Train with `torch.nn` layers plus the HE-friendly
   modules in `fheml.nn` (polynomial activations, polynomial attention), then
   `fheml.from_torch(model, input_shape)` gives the encrypted network.
+* **Encrypted training.** `Trainer` runs SGD with backpropagation entirely on
+  ciphertexts: encrypted inputs, labels, weights, activations and gradients.
+  The encrypted weights are bootstrapped after every update. Freezing the
+  first layers turns the same API into encrypted fine-tuning. See
+  [Encrypted training](#encrypted-training).
 * **Bootstrapping layers** let you build deep networks.
 * **Optional encrypted weights.** `Network::encrypt_weights(ctx)` encrypts
   every conv/dense weight diagonal and bias, so the linear layers multiply
@@ -195,6 +200,62 @@ PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch cnn 
 PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch vit --out models/vit_torch.fheml
 ```
 
+## Encrypted training
+
+`Trainer` trains a network on encrypted data. The client encrypts inputs and
+one-hot targets; the server runs forward, backward and SGD updates on
+ciphertexts and never sees the data, the labels, the gradients or the weights.
+Only the secret-key holder can decrypt the trained model.
+
+```python
+net.compile()
+trainer, ctx = fheml.make_trainer(net, frozen=[], secure=True)  # bootstraps the weights after each update
+trainer.encrypt_weights(ctx)
+for xs, ts in batches:
+    fheml.train_step(trainer, ctx, xs, ts, lr=1.0)       # encrypt, accumulate gradients, update
+trainer.decrypt_weights(ctx)                             # key holder: trained weights back into net
+```
+
+* **What trains:** conv2d, dense, tokendense and affine weights and biases,
+  with shared weights handled exactly. Gradients flow through square, poly,
+  chebyshev, average pooling, token mean, residual and bootstrap layers.
+* **What does not:** attention layers can't be trained or backpropagated
+  through yet. They can sit in a frozen prefix, which only runs forward.
+* **Fine-tuning:** `frozen=[...]` keeps layers fixed. Everything before the
+  first trainable layer runs as ordinary encrypted inference.
+* **Loss:** squared error against the encrypted target. Softmax
+  cross-entropy would need an encrypted softmax.
+* **Check:** `fheml.train_plain` runs the same SGD in the clear.
+  `tests/test_train.cpp` shows the decrypted weights match it to about 1e-8
+  without bootstrapping and 3e-4 with it, and checks the plaintext gradients
+  against finite differences.
+
+It is slow. Every weight diagonal is a ciphertext, every sample costs about
+three ciphertext products and three rotations per diagonal, and each update
+bootstraps all the weights. Bootstrapping packs many weight ciphertexts into
+one, so with toy parameters the MNIST demo below takes about 15 s per update
+of 16 images. `examples/python/train_encrypted_mnist.py` trains a
+49→16→10 network on downsampled MNIST with encrypted images, labels and
+weights, next to the same training in the clear:
+
+```sh
+PYTHONPATH=build/python python3 examples/python/train_encrypted_mnist.py --insecure            # from scratch
+PYTHONPATH=build/python python3 examples/python/train_encrypted_mnist.py --insecure --fine-tune
+```
+
+With toy parameters, on 1000 test images:
+
+| Run | Encrypted updates | Test accuracy before → after | Encrypted vs. clear weights |
+| --- | --- | --- | --- |
+| From scratch, all layers | 40 × 16 images, about 15 s each | 16.1% → 52.8% | match to 1.4e-3, same accuracy |
+| Fine-tune last layer (after 300 clear pre-training steps) | 10 × 16 images, about 5 s each | 82.7% after | match to 7.8e-4, same accuracy |
+
+The accuracy numbers only reflect how few updates were run, not the
+encryption: the plaintext run with the same updates gets the same result.
+At 128-bit security the same training needs ring 2^16 and one rotation key
+per weight diagonal (about 100 MB each), which does not fit in 16 GB yet (see
+[DESIGN.md](docs/DESIGN.md#encrypted-training)).
+
 ## Using the library
 
 ```cpp
@@ -225,11 +286,11 @@ std::vector<double> logits = net.decrypt_output(ctx, y);
 
 | Path | Contents |
 | --- | --- |
-| `include/fheml/`, `src/` | the library: context, linear transforms, layers, network |
+| `include/fheml/`, `src/` | the library: context, linear transforms, layers, network, encrypted training (`train.h`) |
 | `examples/` | `mnist_cnn` (encrypted MNIST) and `conv_demo` (network built in code) |
-| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting; `test_python.py`, `test_torch.py` |
+| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py` |
 | `python/` | pybind11 bindings and the `fheml` Python package (`fheml.nn` + `fheml.from_torch`: PyTorch export) |
-| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted |
+| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `train_encrypted_mnist.py` trains on encrypted data |
 | `tools/train_mnist.py`, `tools/train_transformer.py` | HE-friendly CNN / transformer training and export (numpy) |
 | `models/` | trained example models and 200 test images |
 | `legacy/` | the original PALISADE capstone code |

@@ -58,7 +58,8 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("slots", &FHEContext::slots)
       .def_property_readonly("ring_dim", &FHEContext::ring_dim)
       .def_property_readonly("total_depth", &FHEContext::total_depth)
-      .def("describe", &FHEContext::describe);
+      .def("describe", &FHEContext::describe)
+      .def_static("ring_dim_for", &FHEContext::ring_dim_for, py::arg("options"));
 
   py::class_<Layer, LayerPtr>(m, "Layer")
       .def_property_readonly("type", &Layer::type)
@@ -68,7 +69,10 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("out_shape", &Layer::out_shape)
       .def("forward_plain", &Layer::forward_plain);
 
-  py::class_<LinearLayer, Layer, std::shared_ptr<LinearLayer>>(m, "LinearLayer");
+  py::class_<LinearLayer, Layer, std::shared_ptr<LinearLayer>>(m, "LinearLayer")
+      .def("params", &LinearLayer::params, "Trainable values: weights, then biases.")
+      .def("set_params", &LinearLayer::set_params, py::arg("params"))
+      .def_property_readonly("trainable", &LinearLayer::trainable);
   py::class_<Conv2d, LinearLayer, std::shared_ptr<Conv2d>>(m, "Conv2d")
       .def(py::init<int, int, int, int, int, int, Vec, Vec>(), py::arg("in_channels"), py::arg("out_channels"),
            py::arg("kh"), py::arg("kw"), py::arg("stride"), py::arg("pad"), py::arg("weights"),
@@ -133,4 +137,48 @@ PYBIND11_MODULE(_fheml, m) {
           py::arg("ctx"), py::arg("y"))
       .def("encrypt_weights", &Network::encrypt_weights, py::arg("ctx"), py::arg("drop_plaintext") = true,
            py::call_guard<py::gil_scoped_release>());
+
+  py::class_<Trainer>(m, "Trainer", "Encrypted SGD training (see include/fheml/train.h).")
+      .def(py::init<Network&, std::vector<size_t>>(), py::arg("net"), py::arg("frozen") = std::vector<size_t>{},
+           py::keep_alive<1, 2>())
+      .def_property_readonly("step_depth", &Trainer::step_depth)
+      .def_property_readonly("weight_ciphertexts", &Trainer::weight_ciphertexts)
+      .def_property_readonly("first_trained_layer", &Trainer::first_trained_layer)
+      .def_property_readonly("weight_level", &Trainer::weight_level)
+      .def("rotation_indices", &Trainer::rotation_indices)
+      .def("context_options", &Trainer::context_options, py::arg("secure") = true, py::arg("bootstrapping") = true,
+           py::arg("updates") = 1)
+      .def("encrypt_weights", &Trainer::encrypt_weights, py::arg("ctx"), py::call_guard<py::gil_scoped_release>())
+      .def(
+          "encrypt_input",
+          [](const Trainer& t, const FHEContext& c, const Vec& x) { return Ciphertext{t.encrypt_input(c, x)}; },
+          py::arg("ctx"), py::arg("x"))
+      .def(
+          "encrypt_target",
+          [](const Trainer& t, const FHEContext& c, const Vec& y) { return Ciphertext{t.encrypt_target(c, y)}; },
+          py::arg("ctx"), py::arg("target"))
+      .def(
+          "accumulate",
+          [](Trainer& t, const FHEContext& c, const Ciphertext& x, const Ciphertext& y) {
+            py::gil_scoped_release release;
+            return Ciphertext{t.accumulate(c, x.ct, y.ct)};
+          },
+          py::arg("ctx"), py::arg("x"), py::arg("target"))
+      .def("update", &Trainer::update, py::arg("ctx"), py::arg("lr"), py::call_guard<py::gil_scoped_release>())
+      .def(
+          "forward",
+          [](Trainer& t, const FHEContext& c, const Ciphertext& x) {
+            py::gil_scoped_release release;
+            return Ciphertext{t.forward(c, x.ct)};
+          },
+          py::arg("ctx"), py::arg("x"))
+      .def(
+          "decrypt_output", [](const Trainer& t, const FHEContext& c, const Ciphertext& y) { return t.decrypt_output(c, y.ct); },
+          py::arg("ctx"), py::arg("y"))
+      .def("decrypt_weights", &Trainer::decrypt_weights, py::arg("ctx"), py::call_guard<py::gil_scoped_release>())
+      .def("summary", &Trainer::summary);
+
+  m.def("train_plain", &train_plain, py::arg("net"), py::arg("xs"), py::arg("targets"), py::arg("lr"),
+        py::arg("frozen") = std::vector<size_t>{}, "Plaintext reference of Trainer: one SGD update on a batch.",
+        py::call_guard<py::gil_scoped_release>());
 }

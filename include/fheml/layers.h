@@ -122,6 +122,28 @@ class LinearLayer : public Layer {
     lt_.set_cache_plaintexts(on);
   }
 
+  // Training (see train.h). A trainable layer lists every matrix entry as
+  // (row, col, index into params()) and every bias element's index into
+  // params() (empty = no bias). Shared weights (conv taps, per-channel or
+  // per-token biases) appear several times. params() is the weights followed
+  // by the biases; after set_params() compile() again before encrypted use.
+  struct ParamRef {
+    size_t row, col;
+    int param;
+  };
+  virtual std::vector<ParamRef> weight_refs() const { return {}; }
+  virtual std::vector<int> bias_refs() const { return {}; }
+  virtual std::vector<double> params() const { return {}; }
+  virtual void set_params(const std::vector<double>& p);
+  bool trainable() const { return !weight_refs().empty(); }
+
+ protected:
+  // Forgets the compiled matrix and bias after the weights changed.
+  void invalidate() {
+    m_ = SparseMatrix();
+    b_.clear();
+  }
+
  private:
   LinearTransform lt_;
   SparseMatrix m_;
@@ -144,6 +166,10 @@ class Conv2d : public LinearLayer {
   SparseMatrix matrix() const override;
   std::vector<double> bias() const override;
   int gap_stride() const override { return stride_; }
+  std::vector<ParamRef> weight_refs() const override;
+  std::vector<int> bias_refs() const override;
+  std::vector<double> params() const override;
+  void set_params(const std::vector<double>& p) override;
   void save(std::ostream& os) const override;
 
  private:
@@ -160,6 +186,10 @@ class Dense : public LinearLayer {
   Shape configure(const Shape& in) override;
   SparseMatrix matrix() const override;
   std::vector<double> bias() const override;
+  std::vector<ParamRef> weight_refs() const override;
+  std::vector<int> bias_refs() const override;
+  std::vector<double> params() const override;
+  void set_params(const std::vector<double>& p) override;
   void save(std::ostream& os) const override;
 
  private:
@@ -191,6 +221,10 @@ class ChannelAffine : public LinearLayer {
   SparseMatrix matrix() const override;
   std::vector<double> bias() const override;
   int gap_stride() const override { return 1; }
+  std::vector<ParamRef> weight_refs() const override;
+  std::vector<int> bias_refs() const override;
+  std::vector<double> params() const override;
+  void set_params(const std::vector<double>& p) override;
   void save(std::ostream& os) const override;
 
  private:
@@ -236,6 +270,7 @@ class PolyActivation : public Layer {
   Ctxt forward(const FHEContext& ctx, const Ctxt& x) const override;
   uint32_t depth() const override;
   void save(std::ostream& os) const override;
+  const std::vector<double>& coeffs() const { return c_; }
 
  private:
   std::vector<double> c_;
@@ -257,6 +292,10 @@ class ChebyshevActivation : public Layer {
   void save(std::ostream& os) const override;
 
   static std::function<double(double)> function(const std::string& name);
+  // Series c0/2 + sum_k c_k T_k(t), t = (2x - a - b) / (b - a) (OpenFHE convention).
+  const std::vector<double>& coeffs() const { return coeffs_; }
+  double a() const { return a_; }
+  double b() const { return b_; }
 
  private:
   std::string fn_name_;

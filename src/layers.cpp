@@ -39,9 +39,26 @@ void write_vec(std::ostream& os, const std::vector<double>& v) {
   for (size_t i = 0; i < v.size(); ++i) os << v[i] << ((i + 1) % 16 == 0 || i + 1 == v.size() ? "\n" : " ");
 }
 
+// params() = weights then biases.
+std::vector<double> concat(const std::vector<double>& w, const std::vector<double>& b) {
+  std::vector<double> p(w);
+  p.insert(p.end(), b.begin(), b.end());
+  return p;
+}
+
+void split(const std::vector<double>& p, std::vector<double>& w, std::vector<double>& b, const std::string& what) {
+  if (p.size() != w.size() + b.size()) throw std::invalid_argument(what + ": wrong parameter count");
+  std::copy(p.begin(), p.begin() + static_cast<std::ptrdiff_t>(w.size()), w.begin());
+  std::copy(p.begin() + static_cast<std::ptrdiff_t>(w.size()), p.end(), b.begin());
+}
+
 }  // namespace
 
 // ----------------------------------------------------------------- LinearLayer
+
+void LinearLayer::set_params(const std::vector<double>& p) {
+  if (!p.empty()) throw std::logic_error(type() + ": has no trainable parameters");
+}
 
 Layout LinearLayer::configure_layout(const Layout& in, bool gapped) {
   in_layout_ = in;
@@ -197,6 +214,39 @@ std::vector<double> Conv2d::bias() const {
   return b;
 }
 
+std::vector<LinearLayer::ParamRef> Conv2d::weight_refs() const {
+  std::vector<ParamRef> refs;
+  for (int o = 0; o < out_c_; ++o)
+    for (int y = 0; y < out_.h; ++y)
+      for (int x = 0; x < out_.w; ++x) {
+        size_t row = (static_cast<size_t>(o) * out_.h + y) * out_.w + x;
+        for (int i = 0; i < in_c_; ++i)
+          for (int dy = 0; dy < kh_; ++dy)
+            for (int dx = 0; dx < kw_; ++dx) {
+              int iy = y * stride_ - pad_ + dy, ix = x * stride_ - pad_ + dx;
+              if (iy < 0 || iy >= in_.h || ix < 0 || ix >= in_.w) continue;
+              refs.push_back({row, (static_cast<size_t>(i) * in_.h + iy) * in_.w + ix,
+                              ((o * in_c_ + i) * kh_ + dy) * kw_ + dx});
+            }
+      }
+  return refs;
+}
+
+std::vector<int> Conv2d::bias_refs() const {
+  if (b_.empty()) return {};
+  std::vector<int> r(out_.size());
+  for (size_t i = 0; i < r.size(); ++i)
+    r[i] = static_cast<int>(w_.size() + i / (static_cast<size_t>(out_.h) * out_.w));
+  return r;
+}
+
+std::vector<double> Conv2d::params() const { return concat(w_, b_); }
+
+void Conv2d::set_params(const std::vector<double>& p) {
+  split(p, w_, b_, "conv2d");
+  invalidate();
+}
+
 void Conv2d::save(std::ostream& os) const {
   os << "conv2d " << in_c_ << " " << out_c_ << " " << kh_ << " " << kw_ << " " << stride_ << " " << pad_ << " "
      << (b_.empty() ? 0 : 1) << "\n";
@@ -233,6 +283,26 @@ SparseMatrix Dense::matrix() const {
 }
 
 std::vector<double> Dense::bias() const { return b_; }
+
+std::vector<LinearLayer::ParamRef> Dense::weight_refs() const {
+  std::vector<ParamRef> refs;
+  for (int r = 0; r < n_out_; ++r)
+    for (int c = 0; c < n_in_; ++c) refs.push_back({static_cast<size_t>(r), static_cast<size_t>(c), r * n_in_ + c});
+  return refs;
+}
+
+std::vector<int> Dense::bias_refs() const {
+  std::vector<int> r;
+  for (size_t i = 0; i < b_.size(); ++i) r.push_back(static_cast<int>(w_.size() + i));
+  return r;
+}
+
+std::vector<double> Dense::params() const { return concat(w_, b_); }
+
+void Dense::set_params(const std::vector<double>& p) {
+  split(p, w_, b_, "dense");
+  invalidate();
+}
 
 void Dense::save(std::ostream& os) const {
   os << "dense " << n_in_ << " " << n_out_ << " " << (b_.empty() ? 0 : 1) << "\n";
@@ -291,6 +361,27 @@ std::vector<double> ChannelAffine::bias() const {
   const size_t hw = static_cast<size_t>(in_.h) * in_.w;
   for (size_t i = 0; i < b.size(); ++i) b[i] = shift_[i / hw];
   return b;
+}
+
+std::vector<LinearLayer::ParamRef> ChannelAffine::weight_refs() const {
+  std::vector<ParamRef> refs;
+  const size_t hw = static_cast<size_t>(in_.h) * in_.w;
+  for (size_t i = 0; i < in_.size(); ++i) refs.push_back({i, i, static_cast<int>(i / hw)});
+  return refs;
+}
+
+std::vector<int> ChannelAffine::bias_refs() const {
+  std::vector<int> r(in_.size());
+  const size_t hw = static_cast<size_t>(in_.h) * in_.w;
+  for (size_t i = 0; i < r.size(); ++i) r[i] = static_cast<int>(scale_.size() + i / hw);
+  return r;
+}
+
+std::vector<double> ChannelAffine::params() const { return concat(scale_, shift_); }
+
+void ChannelAffine::set_params(const std::vector<double>& p) {
+  split(p, scale_, shift_, "affine");
+  invalidate();
 }
 
 void ChannelAffine::save(std::ostream& os) const {

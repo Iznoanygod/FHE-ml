@@ -34,6 +34,10 @@ struct ContextOptions {
 class FHEContext {
  public:
   explicit FHEContext(const ContextOptions& opts);
+  // Ring dimension FHEContext(opts) would pick, without building keys or
+  // bootstrapping precomputations. A ciphertext has ring_dim / 2 slots at no
+  // extra cost per operation.
+  static uint32_t ring_dim_for(const ContextOptions& opts);
 
   // Generates the key pair, relinearization keys, the given rotation keys and
   // (when enabled) bootstrapping keys.

@@ -144,6 +144,66 @@ weights.
   requires threshold or multi-party CKKS. OpenFHE supports it, and it is on
   the roadmap.
 
+## Encrypted training
+
+`Trainer` (`include/fheml/train.h`) runs SGD with backpropagation on
+ciphertexts only.
+
+**Weights as diagonals.** Each linear layer is kept as its generalized
+diagonals `D_d`, one ciphertext each, without the BSGS pre-rotation, so they
+can be updated in place:
+
+| Pass | Computation |
+| --- | --- |
+| forward | `y = Σ_d D_d ⊙ rot_d(x) + B` (rotations of x hoisted) |
+| backward | `∂L/∂x = Σ_d rot_{-d}(D_d ⊙ g)` |
+| gradient | `∂L/∂D_d = g ⊙ rot_d(x)`, `∂L/∂B = g` |
+
+**Shared weights.** Layers say which parameter owns each matrix entry
+(`LinearLayer::weight_refs`).
+- A weight owning one slot (dense) gets that slot's gradient: the update is
+  `D_d -= lr/n · mask ⊙ G_d`.
+- A weight owning many slots (a conv tap, a per-channel bias, a weight shared
+  by every token) needs the sum over its slots. A masked rotate-and-sum over
+  all slots computes it and leaves it in every slot, and a second mask puts it
+  back in place. That costs `log2(slots)` rotations per shared weight.
+- Gradients are summed over the batch first, so this happens once per update.
+
+**Activations** backpropagate through their derivative, evaluated under
+encryption:
+- `square`: `2z`.
+- `poly`: the derivative polynomial.
+- `chebyshev`: the derivative Chebyshev series (Numerical Recipes `chder`,
+  same `c0/2` convention as OpenFHE).
+
+The loss is `0.5 |y - t|²`, so `g = y - t` with an encrypted target `t`. No
+masking is needed: unused slots of `y` only meet zero rows of the matrices,
+and the update masks keep gradients out of unused weight slots.
+
+**Levels.** `Trainer::step_depth()` simulates the levels of a whole step
+(forward, backward, update) and `context_options()` sizes the context from
+that.
+- Without bootstrapping, each update leaves the weights deeper, so only a
+  planned number of updates fit.
+- With bootstrapping, the weights are refreshed after every update.
+- Weights are zero outside a window of `w` slots (their output rows), so
+  `slots / w` of them are packed side by side with a rotate-and-add tree,
+  bootstrapped once, and unpacked with the inverse tree and a mask.
+- `fheml.make_trainer` uses every slot of the ring for this (free per
+  operation): the MNIST demo went from 67 s to 8 s of bootstrapping per
+  update.
+- Bootstrapping uses 55-bit scaling: at 50 bits, full-slot bootstrapping
+  error is about 1e-2.
+
+**Cost and limits.**
+- **Rotation keys:** one per diagonal offset, plus its negative. That is
+  fine for toy parameters but heavy at 128-bit security, where each key at
+  ring 2^16 is about 100 MB. Composing rotations from baby/giant keys would
+  fix it.
+- **Attention:** no backward pass yet.
+- **Loss:** cross-entropy needs an encrypted softmax (exp and inverse
+  approximations).
+
 ## Parameters and bootstrapping
 
 - `Network::context_options()` sets:
@@ -175,6 +235,8 @@ All of the following are tested under encryption:
 - The same CNN with encrypted weights: about 3.6 s per image.
 - A one-block MNIST vision transformer (95.6%): about 15 s per image.
 - Python bindings for all of the above.
+- Encrypted training (`Trainer`): SGD updates on encrypted data and weights
+  match plaintext SGD, with and without bootstrapping.
 - PyTorch export (`fheml.from_torch`): torch-trained CNN and ViT run
   encrypted with logits matching torch to about 1e-6.
 
@@ -209,7 +271,10 @@ All of the following are tested under encryption:
    (see the README). Next: tracing arbitrary `forward` code with `torch.fx`,
    multi-head attention, and a range penalty during training so Chebyshev
    activations stay inside their interval.
-8. **Performance.**
+8. **Encrypted training.** Baby/giant rotation keys, so 128-bit training fits
+   in memory. Backpropagation through attention. An encrypted softmax for
+   cross-entropy.
+9. **Performance.**
    - Reduce `scale_mod_bits` / depth so the MNIST net fits ring 2^14.
    - Use `EvalFastRotationExt` to keep giant-step sums in the extended basis.
    - Benchmark threading.

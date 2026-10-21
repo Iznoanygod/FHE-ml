@@ -27,6 +27,7 @@ from ._fheml import (  # noqa: F401
     Residual,
     Shape,
     Square,
+    Trainer,
 )
 
 
@@ -105,6 +106,65 @@ def decrypt(net, ctx, y):
 def infer(net, ctx, x):
     """Encrypt ``x``, run ``net`` homomorphically and decrypt the result."""
     return decrypt(net, ctx, net.forward(ctx, encrypt(net, ctx, x)))
+
+
+def make_training_context(trainer, secure=True, bootstrapping=True, updates=1, **overrides):
+    """CKKS context with every key encrypted training needs.
+
+    Without bootstrapping, ``updates`` SGD updates fit before the weights run
+    out of levels. ``overrides`` set ContextOptions fields.
+    """
+    opts = trainer.context_options(secure, bootstrapping, updates)
+    for k, v in overrides.items():
+        setattr(opts, k, v)
+    ctx = Context(opts)
+    ctx.keygen(trainer.rotation_indices())
+    return ctx
+
+
+def make_trainer(net, frozen=(), secure=True, bootstrapping=True, updates=1, full_slots=True, **overrides):
+    """Encrypted-training setup: returns ``(trainer, ctx)``.
+
+    full_slots recompiles ``net`` to use every slot of the ring (free per
+    operation), so one bootstrap refreshes many weight ciphertexts at once.
+    """
+    def options(tr):
+        opts = tr.context_options(secure, bootstrapping, updates)
+        for k, v in overrides.items():
+            setattr(opts, k, v)
+        return opts
+
+    trainer = Trainer(net, list(frozen))
+    opts = options(trainer)
+    if full_slots:
+        full = Context.ring_dim_for(opts) // 2
+        if full > net.slots:
+            net.compile(full)
+            trainer = Trainer(net, list(frozen))
+            opts = options(trainer)
+    ctx = Context(opts)
+    ctx.keygen(trainer.rotation_indices())
+    return trainer, ctx
+
+
+def train_step(trainer, ctx, xs, targets, lr):
+    """One encrypted SGD update on a batch of (numpy) samples.
+
+    The client encrypts each input and target; the server accumulates
+    gradients and updates the encrypted weights. Returns the decrypted
+    outputs (for monitoring; only the key holder can do this).
+    """
+    outs = []
+    for x, t in zip(xs, targets):
+        y = trainer.accumulate(ctx, trainer.encrypt_input(ctx, _flat(x)), trainer.encrypt_target(ctx, _flat(t)))
+        outs.append(trainer.decrypt_output(ctx, y))
+    trainer.update(ctx, lr)
+    return np.asarray(outs)
+
+
+def train_plain(net, xs, targets, lr, frozen=()):
+    """Plaintext reference of ``Trainer``: one SGD update on a batch."""
+    _fheml.train_plain(net, [_flat(x) for x in xs], [_flat(t) for t in targets], lr, list(frozen))
 
 
 def plain(net, x):

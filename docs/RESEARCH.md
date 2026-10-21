@@ -171,3 +171,33 @@ October 2026, except where marked *(unverified)*.
   - No LayerNorm, or a Newton/Chebyshev 1/√x on a calibrated range.
   - Quadratic or low-degree GELU replacements.
   - Training with a range penalty.
+
+## 5. Training on encrypted data
+
+These were cited from memory in October 2026 and have not been re-checked
+*(unverified)*.
+
+- **Logistic regression on HE.**
+  - Kim, Song, Kim, Lee, Cheon (2018), from the iDASH 2017 competition.
+  - Crawford et al., *Doing Real Work with FHE* (WAHC 2018).
+  - Both run gradient descent on encrypted data with polynomial sigmoid
+    approximations, one of the first practical uses of training under HE.
+- **Nandakumar, Ratha, Pankanti, Halevi.** *Towards Deep Neural Network
+  Training on Encrypted Data*, CVPR Workshops 2019.
+  - Trains a small MLP on encrypted MNIST with HElib, using table lookups for
+    the sigmoid.
+  - It takes hours per mini-batch. That shows why full encrypted training
+    stays impractical.
+- **Glyph.** Lou et al., NeurIPS 2020.
+  - Switches between TFHE (activations) and BGV (linear layers), and uses
+    transfer learning to cut the trained part.
+- **HETAL.** Lee et al., ICML 2023.
+  - Fine-tunes only the classifier head on encrypted features, with an
+    encrypted softmax approximation and diagonal-method matrix products.
+  - The practical end of the spectrum, and fheml's `frozen=` mode.
+- **What fheml does.**
+  - Plain SGD on squared error. Every weight is a CKKS slot of a diagonal
+    ciphertext, and shared weights are summed with masked rotate-and-sums.
+  - Weights are refreshed with packed bootstrapping after every update.
+  - It covers the whole network (conv, dense, token layers, polynomial
+    activations, residuals), at the cost of speed.

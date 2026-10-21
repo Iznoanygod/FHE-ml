@@ -34,7 +34,9 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_PREFIX_PATH=$HOME/openfhe
           cmake --build build
       - name: Test
-        run: ./build/test_fheml
+        run: |
+          ./build/test_fheml
+          ./build/test_train
       - name: Encrypted MNIST (insecure toy parameters for speed)
         run: ./build/mnist_cnn --encrypted 2 --insecure
       - name: Python examples (insecure toy parameters for speed)
@@ -50,3 +52,9 @@ jobs:
         run: |
           python3 tests/test_torch.py
           python3 examples/python/train_torch_mnist.py --arch cnn --epochs 1 --n 1 --insecure
+      - name: Encrypted training (insecure toy parameters for speed)
+        env:
+          PYTHONPATH: build/python
+        run: |
+          python3 tests/test_train.py
+          python3 examples/python/train_encrypted_mnist.py --insecure --updates 2 --batch 4 --test 200

@@ -25,6 +25,7 @@ add_library(fheml
   src/linear.cpp
   src/layers.cpp
   src/network.cpp
+  src/train.cpp
   src/transformer.cpp)
 target_include_directories(fheml PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(fheml SYSTEM PUBLIC
@@ -50,6 +51,9 @@ enable_testing()
 add_executable(test_fheml tests/test_fheml.cpp)
 target_link_libraries(test_fheml fheml)
 add_test(NAME test_fheml COMMAND test_fheml)
+add_executable(test_train tests/test_train.cpp)
+target_link_libraries(test_train fheml)
+add_test(NAME test_train COMMAND test_train)
 
 # Python bindings: build/python/fheml (add build/python to PYTHONPATH).
 option(FHEML_PYTHON "Build the Python module (needs pybind11)" ON)
