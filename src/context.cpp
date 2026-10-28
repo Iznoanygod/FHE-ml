@@ -25,7 +25,7 @@ FHEContext::FHEContext(const ContextOptions& opts) : opts_(opts) {
   // at large rings), so the first modulus is capped when bootstrapping. The
   // gap is also the headroom of the final level: output values must stay
   // below 2^(first_mod - scale_mod) in magnitude.
-  if (opts_.bootstrapping && opts_.first_mod_bits > opts_.scale_mod_bits + 7) opts_.first_mod_bits = opts_.scale_mod_bits + 7;
+  if (opts_.bootstrapping) opts_.first_mod_bits = std::min<uint32_t>({opts_.first_mod_bits, opts_.scale_mod_bits + 7, 60});
   params.SetMultiplicativeDepth(total_depth_);
   params.SetScalingModSize(opts_.scale_mod_bits);
   params.SetFirstModSize(opts_.first_mod_bits);
@@ -192,11 +192,12 @@ std::vector<Ctxt> FHEContext::rotate_many(const Ctxt& x, const std::vector<int32
   return out;
 }
 
-// The rotation-key map is OpenFHE's static registry; FIDESlib keeps its keys on
-// the device, so these report 0 in a GPU build.
+// The rotation-key map is OpenFHE's static registry. FIDESlib keeps its keys
+// on the device, so a GPU build counts the keys keygen() asked for (without
+// the bootstrapping keys) and reports their size as 0.
 size_t FHEContext::rotation_key_count() const {
 #ifdef FHEML_WITH_FIDESLIB
-  return 0;
+  return static_cast<size_t>(std::count(has_key_.begin(), has_key_.end(), 1));
 #else
   if (!keys_.secretKey) return 0;
   return lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::GetEvalAutomorphismKeyMap(keys_.secretKey->GetKeyTag()).size();

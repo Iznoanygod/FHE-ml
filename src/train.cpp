@@ -677,7 +677,7 @@ ContextOptions Trainer::context_options(bool secure, bool bootstrapping, uint32_
     // Bootstrapping precision: about 1e-2 at 50 bits on full-slot toy rings,
     // 1e-10 at 50 bits on ring 2^16, where 55 bits would not fit 24 levels.
     o.scale_mod_bits = secure ? 50 : 55;
-    o.first_mod_bits = o.scale_mod_bits + 7;
+    o.first_mod_bits = std::min<uint32_t>(o.scale_mod_bits + 7, 60);  // 60 is OpenFHE's native prime limit
   } else {
     // Each update leaves the weights deeper; the next step starts there.
     uint32_t prefix = 0;
