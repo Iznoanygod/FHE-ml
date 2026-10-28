@@ -201,7 +201,7 @@ void LinearTransform::encrypt_weights(const FHEContext& ctx, uint32_t level, boo
   if (!enc_.empty()) throw std::logic_error("LinearTransform: weights already encrypted");
   std::vector<std::vector<Ctxt>> enc(giants_.size());
   for (size_t gi = 0; gi < giants_.size(); ++gi) enc[gi].resize(giants_[gi].terms.size());
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
   for (size_t gi = 0; gi < giants_.size(); ++gi)
     for (size_t ti = 0; ti < giants_[gi].terms.size(); ++ti) enc[gi][ti] = ctx.encrypt(giants_[gi].terms[ti].diag, level);
   enc_ = std::move(enc);
@@ -220,12 +220,7 @@ Ctxt LinearTransform::eval(const FHEContext& ctx, const Ctxt& x) const {
   }
 
   // Baby steps: one digit decomposition shared by all rotations (hoisting).
-  std::vector<Ctxt> baby(babies_.size());
-  auto digits = cc->EvalFastRotationPrecompute(x);
-  const uint32_t m = cc->GetCyclotomicOrder();
-#pragma omp parallel for schedule(dynamic)
-  for (size_t i = 0; i < babies_.size(); ++i)
-    baby[i] = babies_[i] == 0 ? x : cc->EvalFastRotation(x, static_cast<uint32_t>(babies_[i]), m, digits);
+  std::vector<Ctxt> baby = backend::rotate_hoisted(cc, x, babies_, ctx.parallel());
 
   // Plaintext diagonals are encoded at the level the products will live at.
   const uint32_t level = x->GetLevel() + (x->GetNoiseScaleDeg() > 1 ? 1 : 0);
@@ -245,7 +240,7 @@ Ctxt LinearTransform::eval(const FHEContext& ctx, const Ctxt& x) const {
   }
 
   std::vector<Ctxt> partial(giants_.size());
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
   for (size_t gi = 0; gi < giants_.size(); ++gi) {
     const Giant& g = giants_[gi];
     Ctxt inner;
@@ -254,7 +249,7 @@ Ctxt LinearTransform::eval(const FHEContext& ctx, const Ctxt& x) const {
       Ctxt prod;
       if (encrypted) {
         // Relinearize once per giant step instead of once per product.
-        prod = cc->EvalMultNoRelin(baby[t.baby], enc_[gi][ti]);
+        prod = backend::mult_lazy(cc, baby[t.baby], enc_[gi][ti]);
       } else {
         Ptxt p = cached ? (*cached)[gi][ti] : ctx.encode(t.diag, level);
         prod = cc->EvalMult(baby[t.baby], p);
@@ -264,7 +259,7 @@ Ctxt LinearTransform::eval(const FHEContext& ctx, const Ctxt& x) const {
       else
         cc->EvalAddInPlace(inner, prod);
     }
-    if (encrypted) cc->RelinearizeInPlace(inner);
+    if (encrypted) backend::relinearize(cc, inner);
     if (g.step) inner = cc->EvalRotate(inner, g.step);
     partial[gi] = inner;
   }

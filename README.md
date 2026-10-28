@@ -97,7 +97,8 @@ one MLP block:
 ## Building
 
 You need CMake ≥ 3.16, a C++17 compiler and an OpenFHE install (tested with
-v1.4.2).
+v1.4.2 and v1.6.1). For the optional GPU build, see
+[GPU acceleration](#gpu-acceleration-fideslib-optional).
 
 ```sh
 # OpenFHE (once)
@@ -113,6 +114,53 @@ cmake --build build -j
 ./build/mnist_cnn --encrypted 5
 ./build/conv_demo
 ```
+
+### GPU acceleration (FIDESlib, optional)
+
+`-DFHEML_GPU=ON` builds fheml on [FIDESlib](https://github.com/CAPS-UMU/FIDESlib)
+2.2, an open-source CUDA CKKS library that wraps OpenFHE. Its API mirrors
+OpenFHE's, so the library code is the same. GPU results are bit-identical to
+OpenFHE on the CPU. A GPU build still runs on machines without a GPU: the
+context then falls back to the OpenFHE CPU code inside FIDESlib.
+
+* **Requirements:** CUDA 12 or 13, an NVIDIA GPU from `sm_70` up, CMake ≥ 3.25
+  and GCC ≥ 11.
+* **OpenFHE version:** FIDESlib needs a *patched* OpenFHE **1.6.1** with
+  static libraries, built without `-march=native`. The CPU-only build keeps
+  working with OpenFHE 1.4.2 or 1.6.1.
+* **What runs on the GPU:** add/mult/rotate, hoisted rotations (the BSGS baby
+  steps and attention), `EvalChebyshevSeries` and bootstrapping. Key
+  generation, encryption and decryption stay on the CPU.
+* **Differences on the GPU:**
+  * FIDESlib's GPU context isn't thread-safe, so fheml's OpenMP loops run
+    serially there. The GPU parallelises inside each operation instead.
+  * FIDESlib has no `EvalMultNoRelin` or `EvalPoly`. Encrypted weights
+    relinearize every product, and `PolyActivation` is rewritten as a
+    Chebyshev series on [-1, 1], with the same depth.
+
+```sh
+# Patched OpenFHE 1.6.1 + FIDESlib (once)
+git clone https://github.com/CAPS-UMU/FIDESlib.git && cd FIDESlib
+git clone --branch v1.6.1 https://github.com/openfheorg/openfhe-development.git openfhe-1.6.1
+git -C openfhe-1.6.1 apply ../deps/fideslib-1.6.1-compile.patch
+cmake -S openfhe-1.6.1 -B openfhe-1.6.1/build -DCMAKE_INSTALL_PREFIX=$HOME/openfhe-fides \
+      -DBUILD_STATIC=ON -DWITH_NATIVEOPT=OFF -DBUILD_UNITTESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARKS=OFF
+cmake --build openfhe-1.6.1/build -j && cmake --install openfhe-1.6.1/build
+# FIDESLIB_ARCH=auto builds for the visible GPUs; CUDA_PATH defaults to /usr/local/cuda
+cmake -S . -B build -DOPENFHE_INSTALL_PREFIX=$HOME/openfhe-fides -DFIDESLIB_INSTALL_PREFIX=$HOME/fideslib \
+      -DFIDESLIB_ARCH=auto -DFIDESLIB_COMPILE_TESTS=OFF -DFIDESLIB_COMPILE_BENCHMARKS=OFF
+cmake --build build -j && cmake --install build && cd ..
+
+# fheml on the GPU
+cmake -S . -B build-gpu -DFHEML_GPU=ON -DCMAKE_PREFIX_PATH="$HOME/openfhe-fides;$HOME/fideslib"
+cmake --build build-gpu -j
+./build-gpu/test_fheml        # the context lines print device=gpu
+```
+
+`ContextOptions::use_gpu` (default `true`) and `gpu_devices` (default `{0}`)
+choose the device. `FHEContext::on_gpu()` reports what was picked. From
+Python, use `fheml.make_context(net, use_gpu=False)`, `ctx.on_gpu` and
+`fheml.gpu_device_count()`.
 
 To retrain the models (numpy only; MNIST is downloaded into `data/`):
 
@@ -286,7 +334,7 @@ std::vector<double> logits = net.decrypt_output(ctx, y);
 
 | Path | Contents |
 | --- | --- |
-| `include/fheml/`, `src/` | the library: context, linear transforms, layers, network, encrypted training (`train.h`) |
+| `include/fheml/`, `src/` | the library: backend selection (`backend.h`: OpenFHE or FIDESlib), context, linear transforms, layers, network, encrypted training (`train.h`) |
 | `examples/` | `mnist_cnn` (encrypted MNIST) and `conv_demo` (network built in code) |
 | `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py` |
 | `python/` | pybind11 bindings and the `fheml` Python package (`fheml.nn` + `fheml.from_torch`: PyTorch export) |

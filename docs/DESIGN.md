@@ -222,6 +222,32 @@ that.
   - Slot values must be roughly within [-1, 1]. Scale the preceding linear
     layer's weights for that.
 
+## GPU backend (FIDESlib)
+
+`include/fheml/backend.h` picks the CKKS API at compile time: `lbcrypto`
+(OpenFHE, default) or `fideslib` (`-DFHEML_GPU=ON`). FIDESlib 2.2 mirrors
+OpenFHE's `CryptoContext` API and keeps an OpenFHE 1.6.1 context inside, so
+`CC`, `Ctxt` and `Ptxt` are the only types that change. GPU ciphertexts are
+bit-identical to the CPU ones.
+
+- **Device choice.** `FHEContext` passes `gpu_devices` to FIDESlib only when
+  `use_gpu` is set and CUDA reports a device. With no devices, every FIDESlib
+  call runs on its OpenFHE context: that is the CPU fallback.
+  `keygen()` uploads the keys and bootstrapping precomputations with
+  `LoadContext`. Fresh ciphertexts are then uploaded at encryption.
+- **Hoisting.** FIDESlib's single-index `EvalFastRotation` doesn't hoist on
+  the GPU. `backend::rotate_hoisted` therefore uses the multi-index form for
+  BSGS baby steps, attention token shifts and training rotations.
+- **Threads.** The GPU context isn't thread-safe: its handle registry has no
+  lock. Every OpenMP loop over ciphertexts has an `if (ctx.parallel())` clause,
+  which is false on the GPU.
+- **Missing operations.** FIDESlib has no `EvalMultNoRelin`/`Relinearize`. The
+  encrypted-weights BSGS relinearizes each product instead of each giant step.
+  It also has no `EvalPoly`. `backend::eval_poly` rewrites the power basis into
+  Chebyshev coefficients and calls `EvalChebyshevSeries` on [-1, 1]. On that
+  interval no affine map is applied, so the result holds for every x and the
+  depth matches `poly_depth()`. `test_fheml` checks this on every build.
+
 ## Status
 
 All of the following are tested under encryption:
@@ -275,6 +301,8 @@ All of the following are tested under encryption:
    in memory. Backpropagation through attention. An encrypted softmax for
    cross-entropy.
 9. **Performance.**
+   - Benchmark the FIDESlib GPU backend on a real GPU (see below), and batch
+     the remaining single-ciphertext calls (giant steps, rotate-and-sum) for it.
    - Reduce `scale_mod_bits` / depth so the MNIST net fits ring 2^14.
    - Use `EvalFastRotationExt` to keep giant-step sums in the extended basis.
    - Benchmark threading.

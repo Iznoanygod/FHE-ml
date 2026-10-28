@@ -28,6 +28,8 @@ from ._fheml import (  # noqa: F401
     Shape,
     Square,
     Trainer,
+    gpu_backend_built,
+    gpu_device_count,
 )
 
 
@@ -83,7 +85,8 @@ def __getattr__(name):
 def make_context(net, secure=True, **overrides):
     """Create a CKKS context with keys for a compiled network.
 
-    ``overrides`` set ContextOptions fields, e.g. scale_mod_bits=45.
+    ``overrides`` set ContextOptions fields, e.g. scale_mod_bits=45, or
+    use_gpu=False to stay on the CPU in a GPU (FIDESlib) build.
     """
     opts = net.context_options(secure)
     for k, v in overrides.items():
