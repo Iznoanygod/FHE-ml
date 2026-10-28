@@ -188,24 +188,29 @@ void gradient_check(const std::string& name, const Builder& make, const std::vec
 
 // ------------------------------------------------------- encrypted training
 
-FHEContext training_context(const Trainer& tr, bool boot, uint32_t updates) {
-  ContextOptions o = tr.context_options(false, boot, updates);
+FHEContext training_context(const Trainer& tr, bool boot, uint32_t updates, uint32_t window) {
+  ContextOptions o = tr.context_options(false, boot, updates, window);
   o.ring_dim = boot ? 4096 : std::max(2048u, 2 * o.slots);
   FHEContext ctx(o);
-  ctx.keygen(tr.rotation_indices());
+  ctx.keygen(tr.rotation_indices(window > 0));
   return ctx;
 }
 
 void encrypted_check(const std::string& name, const Builder& make, size_t updates, bool boot, double tol,
-                     const std::vector<size_t>& frozen = {}, double lr = 0.5) {
+                     const std::vector<size_t>& frozen = {}, double lr = 0.5, uint32_t window = 0) {
   Network plain = make();
   plain.compile();
   Network enc = make();
   // Bootstrapping: use all 2048 slots of the ring so weights are packed.
   enc.compile(boot ? 2048 : 0);
   Trainer tr(enc, frozen);
-  FHEContext ctx = training_context(tr, boot, static_cast<uint32_t>(updates));
+  FHEContext ctx = training_context(tr, boot, static_cast<uint32_t>(updates), window);
   std::printf("  %s\n  %s\n", tr.summary().c_str(), ctx.describe().c_str());
+  if (window) {
+    const size_t direct = tr.rotation_indices(false).size() + (boot ? 0 : 0);
+    check(ctx.rotation_key_count() < direct || boot, name + " ladder uses fewer keys",
+          "(" + std::to_string(ctx.rotation_key_count()) + " vs " + std::to_string(direct) + " direct)");
+  }
   tr.encrypt_weights(ctx);
 
   std::vector<double> before = all_params(plain);
@@ -254,6 +259,23 @@ int main(int argc, char** argv) {
   encrypted_check("strided cnn", [] { return strided_cnn(3); }, 1, false, 1e-4);
   encrypted_check("tokens", [] { return tokens(4); }, 1, false, 1e-4);
   encrypted_check("mlp, fine-tune last layer", [] { return mlp(5); }, 1, false, 1e-4, {0});
+  // Rotation-key ladder: the same training with composed rotations.
+  encrypted_check("cnn, ladder window 1", [] { return cnn(2); }, 1, false, 1e-4, {}, 0.5, 1);
+  encrypted_check("mlp, fine-tune last layer, ladder window 3", [] { return mlp(5); }, 1, false, 1e-4, {0}, 0.5, 3);
+  // Training through an automatically placed bootstrap (budget 2 splits the
+  // mlp after its activation).
+  if (!quick)
+    encrypted_check(
+        "mlp with auto-placed bootstrap, ladder",
+        [] {
+          Network n = mlp(8);
+          std::vector<std::vector<double>> cal;
+          Rng r(99);
+          for (int i = 0; i < 4; ++i) cal.push_back(r.vec(12, 1.0));
+          n.place_bootstraps(2, cal);
+          return n;
+        },
+        2, true, 1e-3, {}, 0.3, 1);
   if (!quick) encrypted_check("mlp, bootstrapped weights", [] { return mlp(6); }, 3, true, 1e-3, {}, 0.3);
   if (!quick) encrypted_check("cnn, bootstrapped weights", [] { return cnn(7); }, 2, true, 1e-3, {}, 0.3);
 

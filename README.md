@@ -43,7 +43,18 @@ That code is kept in [`legacy/`](legacy/) for reference.
   The encrypted weights are bootstrapped after every update. Freezing the
   first layers turns the same API into encrypted fine-tuning. See
   [Encrypted training](#encrypted-training).
-* **Bootstrapping layers** let you build deep networks.
+* **Deep networks.** `Bootstrap` layers refresh ciphertexts, and
+  `Network::place_bootstraps()` inserts them automatically: it keeps every
+  stretch within a level budget and scales the values entering each
+  bootstrap into [-1, 1] from calibration data, folding the scales into the
+  neighbouring layers. `fold_activation_intervals()` moves each Chebyshev
+  activation's interval map into the preceding linear layer, one level less
+  per activation. See [Deep networks](#deep-networks).
+* **Small rotation-key sets.** With `ContextOptions::rotation_window`, any
+  rotation is composed from a ladder of `2 log2(slots)` keys instead of one
+  key per rotation index. At ring 2^16 a key is 100 MB, which is what makes
+  encrypted training and bootstrapped inference fit in memory at 128-bit
+  security.
 * **Optional encrypted weights.** `Network::encrypt_weights(ctx)` encrypts
   every conv/dense weight diagonal and bias, so the linear layers multiply
   ciphertext × ciphertext.
@@ -300,9 +311,89 @@ With toy parameters, on 1000 test images:
 
 The accuracy numbers only reflect how few updates were run, not the
 encryption: the plaintext run with the same updates gets the same result.
-At 128-bit security the same training needs ring 2^16 and one rotation key
-per weight diagonal (about 100 MB each), which does not fit in 16 GB yet (see
-[DESIGN.md](docs/DESIGN.md#encrypted-training)).
+
+### Training at 128-bit security
+
+At 128-bit security the training context needs ring 2^16, where every
+rotation key is about 100 MB. One key per weight diagonal and its negative
+(105 keys, 10 GB for this small network) plus the bootstrapping keys did not
+fit in 16 GB. `fheml.make_trainer(net, secure=True)` therefore uses a
+**rotation-key ladder** (`rotation_window=1`): keys for ±2^i only, with every
+other rotation composed from them (balanced binary digits, one key switch
+per non-zero digit; see [DESIGN.md](docs/DESIGN.md#rotation-key-ladder)).
+The bootstrapping keys depend on the slot count, so `slots=256` keeps them
+small too (16 weight ciphertexts are packed per bootstrap instead of 2048).
+
+Bootstrapping the weights needs 30 levels (10 for the step, 20 for the
+bootstrap), which is ring 2^17 at 128-bit; without it, three updates fit
+ring 2^16. Measured on 4 cores, 16 GB:
+
+```sh
+PYTHONPATH=build/python python3 examples/python/train_encrypted_mnist.py --no-bootstrap --updates 3 --batch 4 --test 200
+```
+
+| | Keys | Memory |
+| --- | --- | --- |
+| One key per rotation (63 rotations in the step) | 63 × 111 MB | about 7 GB of keys (computed from the measured key size) |
+| Ladder, `rotation_window=1` | 11 keys | 1.2 GB of keys, 10 GB process peak with the ciphertexts |
+
+The three updates of 4 images took 338 s, 244 s and 178 s (the weights sit
+at deeper levels after each update, so the ciphertexts shrink); the
+decrypted weights matched the plaintext SGD run to 3e-8. Composed rotations
+cost 1-3 key switches each instead of one hoisted one, so this is slower
+per sample than the toy run, but it is the first run of the trainer at
+128-bit security.
+
+## Deep networks
+
+A CKKS ring holds a fixed number of levels (24 at ring 2^16 with 50-bit
+scaling and 128-bit security), and every linear layer and activation consumes
+some. Deeper networks need bootstrapping, which itself costs 18-20 levels and
+needs its input within [-1, 1]. `fheml.auto_bootstrap(net, calibration)`
+handles both:
+
+1. `fold_activation_intervals()`: the affine map from a Chebyshev
+   activation's interval `[a, b]` to `[-1, 1]` moves into the preceding
+   linear layer's weights and bias, saving one level per activation.
+2. `place_bootstraps(budget, calibration)`: bootstraps go in as late as
+   possible so that no stretch exceeds `budget` levels (the most that keeps
+   the ring at 2^16: 3 with level budget {3,3} and 5 with {2,2} at 50-bit
+   scaling, two more with `key_switch_digits=4`). The calibration inputs
+   are run in the clear, the
+   values entering each bootstrap are divided by `1.5 × max|x|`, and that
+   scale is folded into the neighbouring layers for free (weights,
+   polynomial coefficients, Chebyshev intervals, through squares and
+   pooling); only a residual block or attention needs a fixed `scale` layer,
+   which costs a level the planner budgets.
+
+`examples/python/train_torch_mnist.py --arch deepcnn --bootstrap` trains a
+CNN with three conv blocks, a 32-unit dense block and Chebyshev ReLUs (30
+levels, 25 after folding; 97.6% on MNIST at 14x14) in PyTorch and runs it
+encrypted with the ladder keys:
+
+```sh
+PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch deepcnn --bootstrap --window 1 --level-budget 3 --digits 4 --n 3
+```
+
+Measured at 128-bit security on 4 cores (ring 2^16, 256 slots, level budget
+{3,3}, `key_switch_digits=4` for 26 levels, 50-bit scaling):
+
+| | |
+| --- | --- |
+| Bootstraps placed | 8, at most 5 levels between them (budget 5) |
+| Rotation keys | 47 (6.2 GB): 32 bootstrapping keys plus the 15-key ladder, no per-layer keys |
+| Process peak | 9.9 GB (context, keys and setup 28 s) |
+| Time per image | 147 s, of which 8 bootstraps take 134 s (16-17 s each) |
+| Accuracy | both test images classified like the plaintext model; logits within 0.28 of plaintext (logit range 8) |
+
+Each bootstrap adds about 1e-2 of error to values in [-1, 1] at these
+parameters (50-bit scaling is the largest that fits; a 55-bit first modulus
+instead of 57 changes nothing), so eight of them leave the logits 3% off.
+That is the precision budget for deeper networks at ring 2^16; a larger
+ring buys 55-bit scaling and far better bootstraps at twice the memory.
+
+The same bootstraps work inside encrypted training: the trainer bootstraps
+the activation on the way forward and the gradient on the way back.
 
 ## Using the library
 
@@ -329,6 +420,10 @@ std::vector<double> logits = net.decrypt_output(ctx, y);
 `Network::load` / `save` use a small text format that is documented in
 [`include/fheml/network.h`](include/fheml/network.h).
 `Network::fuse_linear()` merges adjacent linear layers, saving one level each.
+`ctx.rotate(c, k)` rotates by any `k`, composing it from the ladder keys when
+`ContextOptions::rotation_window` is set (then pass
+`net.rotation_indices(true)` to `keygen`, which lists only the rotations that
+still need their own key).
 
 ## Layout
 

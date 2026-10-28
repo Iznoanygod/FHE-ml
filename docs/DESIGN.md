@@ -196,10 +196,13 @@ that.
   error is about 1e-2.
 
 **Cost and limits.**
-- **Rotation keys:** one per diagonal offset, plus its negative. That is
-  fine for toy parameters but heavy at 128-bit security, where each key at
-  ring 2^16 is about 100 MB. Composing rotations from baby/giant keys would
-  fix it.
+- **Rotation keys:** by default one per diagonal offset, plus its negative.
+  That is fine for toy parameters but heavy at 128-bit security, where each
+  key at ring 2^16 is about 100 MB (the MNIST training network needs 105
+  of them, 10 GB). With a rotation-key ladder
+  (`ContextOptions::rotation_window`, see below) the trainer composes every
+  rotation from 2·log2(slots) keys instead; `Trainer::rotation_indices(true)`
+  then lists only the hoisted rotations of the frozen prefix.
 - **Attention:** no backward pass yet.
 - **Loss:** cross-entropy needs an encrypted softmax (exp and inverse
   approximations).
@@ -218,9 +221,88 @@ that.
   - Inputs are encrypted at `Network::input_level()`, so the first segment
     gets exactly the levels it needs and the first bootstrap really refreshes.
     OpenFHE skips a bootstrap whose input has more levels left than it would
-    produce.
-  - Slot values must be roughly within [-1, 1]. Scale the preceding linear
-    layer's weights for that.
+    produce. `context_options()` adds one level per stretch, which
+    `EvalBootstrap` needs when its input arrives.
+  - Slot values must be roughly within [-1, 1]. `Network::place_bootstraps`
+    scales them (below); for hand-placed bootstraps scale the preceding
+    linear layer's weights.
+  - With 50-bit scaling the first modulus is capped at 57 bits: OpenFHE's
+    bootstrapping correction factor allows at most 7 bits between them at
+    large rings. Those 7 bits are also the headroom of the last level, so
+    network outputs must stay below 128 in magnitude. 128-bit ring 2^16
+    holds 24 levels at 50 bits (26 with `key_switch_digits = 4`, whose keys
+    are 25% larger), 20 at 55.
+  - Bootstrapping keys are rotation keys too and depend on the slot count:
+    at ring 2^16 with level budget {3,3}, 45 keys for 256 slots, 75 for 1024,
+    96 for 4096 (4.7, 7.6 and 9.7 GB), measured here. A bootstrap takes
+    16-22 s on 4 cores at any of these slot counts. Inside a network it
+    adds about 1e-2 of error to values in [-1, 1] at 50-bit scaling (the
+    deep CNN example: 8 bootstraps, logits 3% off plaintext, classes
+    unchanged); 55 bits would be far more precise but leaves only 20
+    levels at ring 2^16.
+
+### Rotation-key ladder
+
+`ContextOptions::rotation_window = w` makes `keygen()` generate keys for
+`±j·2^(w·i)`, `1 <= j <= 2^(w-1)` (for `w = 1`: all `±2^i`, i.e.
+`2·log2(slots) - 1` keys) besides the indices it is given, and
+`FHEContext::rotate(c, k)` composes any other rotation from them: `k` is
+written in balanced base `2^w`, one key switch per non-zero digit (at most
+`ceil(log2(slots) / w)`; signed digits make `-1` as cheap as `+1`).
+`FHEContext::rotate_many(x, ks)` rotates one ciphertext by many offsets: with
+direct keys it hoists them; otherwise it orders the offsets by cost and
+derives each from the already rotated copy nearest to it, so the conv
+offsets `28, 29, 30` cost one key switch each after the first.
+
+- `Trainer` and `LinearTransform::eval` rotate through the context, so both
+  training and inference work with a ladder; `rotation_indices(true)` on a
+  `Trainer` or `Network` lists the rotations that still need their own key
+  (attention, the trainer's frozen prefix).
+- A composed rotation cannot be hoisted, so each costs 1-3 full key
+  switches instead of one hoisted one. The trade is memory for time; at ring
+  2^16 the memory is what decides whether a run fits at all.
+
+### Automatic bootstrap placement
+
+`Network::place_bootstraps(budget, calibration, headroom)` inserts
+`Bootstrap` layers so that no stretch of the network consumes more than
+`budget` levels, as late as possible (fewest bootstraps). The ring then
+depends on `budget + bootstrap depth` only, not on the network's depth.
+
+- **Range scaling.** A bootstrap needs its input in about [-1, 1]. The
+  calibration inputs are run in the clear and the values entering each
+  bootstrap are divided by `headroom · max|x|` (when that maximum exceeds 1)
+  and multiplied back afterwards. Both scales are folded into neighbouring
+  layers at no cost: weights and biases of a linear layer, `poly`
+  coefficients, the evaluation interval of a `chebyshev` layer, through
+  `square` (as a square root) and through bias-free linear layers (pooling,
+  token mean). Where no layer can take it (a residual block, attention, the
+  network output) a fixed `scale` layer is inserted, which costs one level
+  that the planner budgets; the planner moves a bootstrap earlier when that
+  level does not fit, and reports a budget that cannot hold a layer and its
+  scale layers instead of overflowing.
+- **Interval folding.** `Network::fold_activation_intervals()` moves the
+  affine map `[a, b] -> [-1, 1]` of a Chebyshev activation into the
+  preceding linear layer's weights and bias, so `EvalChebyshevSeries` runs
+  on [-1, 1] and the activation costs one level less. Run it before placing
+  bootstraps. `chebyshev` layers therefore carry an evaluation interval
+  (`map EA EB OUT` in the model file) separate from the approximation
+  interval.
+- **Budget.** `Network::max_bootstrap_budget(options, max_ring)` gives the
+  largest stretch that keeps the bootstrapping context at `max_ring`. With
+  uniform ternary secrets the bootstrap itself costs 20 levels (level budget
+  {3,3}) or 18 ({2,2}) plus the spare level `EvalBootstrap` wants at its
+  input; at ring 2^16, 128-bit and 50-bit scaling (24 levels) that leaves 3
+  or 5 levels per stretch, and 5 or 7 with `key_switch_digits = 4` (26
+  levels). A degree-15 Chebyshev ReLU with its interval folded costs 5, so
+  a conv + ReLU block fits a stretch of 6; the deep CNN example gets by with
+  5 because the conv's level is spent before the bootstrap that precedes
+  each ReLU. 45-bit scaling would give more levels, but at 256 slots its
+  bootstrap error was 7e-2 here (first modulus 52), unusable, so 50 bits is
+  the floor.
+  `fheml.auto_bootstrap(net, calibration)` does all three steps in Python.
+- Training through placed bootstraps works: the trainer bootstraps the
+  activation forward and the gradient backward (`tests/test_train.cpp`).
 
 ## GPU backend (FIDESlib)
 
@@ -255,7 +337,9 @@ All of the following are tested under encryption:
 - Dense layers, average pooling and channel affine layers.
 - Fused linear layers.
 - The square, polynomial and Chebyshev activations.
-- Bootstrapping in the middle of a network.
+- Bootstrapping in the middle of a network, placed by hand or by
+  `place_bootstraps` (with scale folding and interval folding).
+- Rotations composed from a key ladder, for inference and training.
 - The trained MNIST CNN at 128-bit security: about 3 s per image, with
   predictions identical to plaintext.
 - The same CNN with encrypted weights: about 3.6 s per image.
@@ -285,11 +369,10 @@ All of the following are tested under encryption:
 4. **Better activations.**
    - Composite minimax sign/ReLU, built by composing `EvalChebyshevSeries`
      calls.
-   - Fold the Chebyshev interval map into the preceding linear layer, which
-     saves one level per activation.
    - Training-time range calibration.
-5. **Automatic bootstrap placement** (Orion-style shortest path over levels),
-   and per-segment slot counts.
+5. **Bootstrap placement**: per-segment slot counts, and a cost model that
+   weighs an earlier bootstrap against the scale layers around residual
+   blocks (the planner is greedy-latest with back-off).
 6. **Batch-norm and residual connections.**
    - Fold BN into the convolutions at load time.
    - Add a residual `Add` layer that aligns levels and layouts.
@@ -297,9 +380,9 @@ All of the following are tested under encryption:
    (see the README). Next: tracing arbitrary `forward` code with `torch.fx`,
    multi-head attention, and a range penalty during training so Chebyshev
    activations stay inside their interval.
-8. **Encrypted training.** Baby/giant rotation keys, so 128-bit training fits
-   in memory. Backpropagation through attention. An encrypted softmax for
-   cross-entropy.
+8. **Encrypted training.** Backpropagation through attention. An encrypted
+   softmax for cross-entropy. Hoisting for composed rotations (one
+   decomposition per ladder digit).
 9. **Performance.**
    - Benchmark the FIDESlib GPU backend on a real GPU (see below), and batch
      the remaining single-ciphertext calls (giant steps, rotate-and-sum) for it.

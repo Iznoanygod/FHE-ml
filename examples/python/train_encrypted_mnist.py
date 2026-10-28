@@ -8,9 +8,12 @@ the key holder decrypts the trained weights.
 
     PYTHONPATH=build/python python3 examples/python/train_encrypted_mnist.py --insecure [--updates 20]
     ... --fine-tune    # pre-train in the clear, then train only the last layer encrypted
+    ... --slots 256    # 128-bit security: ring 2^16, rotation-key ladder, small bootstraps
 
 This is slow (every weight diagonal is a ciphertext and is bootstrapped after
-every update); it demonstrates that the whole pipeline works.
+every update); it demonstrates that the whole pipeline works. At 128-bit
+security the rotations are composed from a ladder of 2 log2(slots) keys
+instead of one key per weight diagonal (about 100 MB each at ring 2^16).
 """
 import argparse
 import os
@@ -47,6 +50,14 @@ def build(rng):
     return net
 
 
+def rss_mb():
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024
+    return float("nan")
+
+
 def accuracy(net, x, y):
     return np.mean([fheml.plain(net, xi).argmax() == yi for xi, yi in zip(x, y)])
 
@@ -64,6 +75,10 @@ def main():
     ap.add_argument("--fine-tune", action="store_true", help="pre-train in the clear, train only the last layer")
     ap.add_argument("--insecure", action="store_true", help="toy parameters (fast, NOT secure)")
     ap.add_argument("--test", type=int, default=1000, help="test images for the accuracy check")
+    ap.add_argument("--slots", type=int, help="CKKS slots (default: all of the ring; fewer = fewer bootstrapping keys)")
+    ap.add_argument("--window", type=int, help="rotation-key ladder window (default: 1 when secure, 0 = key per rotation)")
+    ap.add_argument("--no-bootstrap", action="store_true",
+                    help="size the context for --updates updates instead of bootstrapping the weights")
     args = ap.parse_args()
 
     data = load_mnist(args.data)
@@ -88,9 +103,12 @@ def main():
     print(f"initial test accuracy {accuracy(ref_net, xte, yte):.1%}")
 
     t = time.time()
-    trainer, ctx = fheml.make_trainer(enc_net, frozen, secure=not args.insecure)
+    trainer, ctx = fheml.make_trainer(enc_net, frozen, secure=not args.insecure, slots=args.slots,
+                                      rotation_window=args.window, bootstrapping=not args.no_bootstrap,
+                                      updates=args.updates, full_slots=not args.no_bootstrap)
     print(trainer.summary())
-    print(ctx.describe(), f"(keys {time.time() - t:.0f}s)")
+    print(ctx.describe(), f"(keys {time.time() - t:.0f}s, {len(trainer.rotation_indices())} rotations in the step, "
+          f"process RSS {rss_mb():.0f} MB)")
     t = time.time()
     trainer.encrypt_weights(ctx)
     print(f"{trainer.weight_ciphertexts} weight ciphertexts encrypted in {time.time() - t:.1f}s")
@@ -103,7 +121,8 @@ def main():
         dt = time.time() - t
         fheml.train_plain(ref_net, xtr[idx], onehot[ytr[idx]], args.lr, frozen)
         loss = 0.5 * np.mean(np.sum((out - onehot[ytr[idx]]) ** 2, axis=1))
-        print(f"update {u + 1}: batch loss {loss:.3f}, {dt:.0f}s", flush=True)
+        print(f"update {u + 1}: batch loss {loss:.3f}, {dt:.0f}s ({dt / args.batch:.1f}s per sample incl. the update; "
+              f"RSS {rss_mb():.0f} MB)", flush=True)
 
     trainer.decrypt_weights(ctx)  # the key holder recovers the trained model
     diff = np.abs(weights(enc_net) - weights(ref_net)).max()

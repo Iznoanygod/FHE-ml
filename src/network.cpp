@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -63,7 +64,21 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
     double a, b;
     uint32_t d;
     is >> fn >> a >> b >> d;
-    layer = std::make_shared<ChebyshevActivation>(fn, a, b, d);
+    double ea = a, eb = b, out = 1.0;
+    // Optional "map EA EB OUT"; otherwise the next token starts a new layer.
+    std::string next;
+    auto pos = is.tellg();
+    if (is >> next && next == "map") {
+      is >> ea >> eb >> out;
+    } else {
+      is.clear();
+      is.seekg(pos);
+    }
+    layer = std::make_shared<ChebyshevActivation>(fn, a, b, d, ea, eb, out);
+  } else if (tok == "scale") {
+    size_t c;
+    is >> c;
+    layer = std::make_shared<Scale>(read_vec(is, c, "scale factors"));
   } else if (tok == "bootstrap") {
     layer = std::make_shared<Bootstrap>();
   } else if (tok == "tokendense") {
@@ -188,6 +203,285 @@ void Network::encrypt_weights(const FHEContext& ctx, bool drop_plaintext) {
   for (auto& l : layers_) l->encrypt_weights(ctx, drop_plaintext);
 }
 
+// ---------------------------------------------------- bootstrap placement
+
+namespace {
+
+// How a scale on a layer's signal can move through it (see place_bootstraps).
+enum class Fold {
+  kAbsorb,  // the layer can take a scale into its parameters for free
+  kPass,    // linear without bias: the scale passes through unchanged
+  kSquare,  // the scale passes through squared
+  kBlock    // neither: a Scale layer is needed
+};
+
+Fold fold_kind(const Layer& l) {
+  if (dynamic_cast<const Square*>(&l)) return Fold::kSquare;
+  if (dynamic_cast<const PolyActivation*>(&l) || dynamic_cast<const ChebyshevActivation*>(&l) ||
+      dynamic_cast<const Scale*>(&l) || dynamic_cast<const FusedLinear*>(&l))
+    return Fold::kAbsorb;
+  if (l.is_bootstrap()) return Fold::kPass;
+  if (auto* lin = dynamic_cast<const LinearLayer*>(&l)) {
+    if (lin->trainable()) return Fold::kAbsorb;
+    return lin->bias().empty() ? Fold::kPass : Fold::kBlock;
+  }
+  return Fold::kBlock;
+}
+
+// Can the output of layers[i] be scaled for free (folding back through
+// passing layers until one absorbs)? boot_before marks planned bootstraps,
+// which stop the fold like existing ones.
+bool can_scale_output(const std::vector<std::shared_ptr<Layer>>& layers, size_t i, const std::vector<char>& boot_before) {
+  for (size_t k = i + 1; k-- > 0;) {
+    switch (fold_kind(*layers[k])) {
+      case Fold::kAbsorb: return true;
+      case Fold::kPass:
+      case Fold::kSquare:
+        if (layers[k]->is_bootstrap() || boot_before[k]) return false;
+        continue;
+      case Fold::kBlock: return false;
+    }
+  }
+  return false;
+}
+
+// Multiplies what the layer outputs by f (f > 0 when squares are involved).
+void scale_output(std::shared_ptr<Layer>& l, double f) {
+  if (auto* p = dynamic_cast<PolyActivation*>(l.get())) return p->rescale(1.0, f);
+  if (auto* c = dynamic_cast<ChebyshevActivation*>(l.get())) return c->rescale(1.0, f);
+  if (auto* sc = dynamic_cast<Scale*>(l.get())) return sc->multiply(f);
+  if (auto* fu = dynamic_cast<FusedLinear*>(l.get())) return fu->scale(f, f);
+  auto* lin = dynamic_cast<LinearLayer*>(l.get());
+  if (!lin || !lin->trainable()) throw std::logic_error("place_bootstraps: cannot scale " + l->type());
+  std::vector<double> p = lin->params();
+  for (double& x : p) x *= f;
+  lin->set_params(p);
+}
+
+void scale_output_chain(std::vector<std::shared_ptr<Layer>>& layers, double f) {
+  for (size_t k = layers.size(); k-- > 0;) {
+    switch (fold_kind(*layers[k])) {
+      case Fold::kAbsorb: return scale_output(layers[k], f);
+      case Fold::kSquare: f = std::sqrt(f); continue;
+      case Fold::kPass:
+        if (layers[k]->is_bootstrap()) throw std::logic_error("place_bootstraps: fold reached a bootstrap");
+        continue;
+      case Fold::kBlock: throw std::logic_error("place_bootstraps: fold blocked by " + layers[k]->type());
+    }
+  }
+  throw std::logic_error("place_bootstraps: nothing to fold into");
+}
+
+// The layer's input arrives multiplied by c; changes the layer so that its
+// output is unchanged. Only for absorbing layers.
+void absorb_input(std::shared_ptr<Layer>& l, double c) {
+  if (auto* p = dynamic_cast<PolyActivation*>(l.get())) return p->rescale(1.0 / c, 1.0);
+  if (auto* ch = dynamic_cast<ChebyshevActivation*>(l.get())) return ch->rescale(1.0 / c, 1.0);
+  if (auto* sc = dynamic_cast<Scale*>(l.get())) return sc->multiply(1.0 / c);
+  if (auto* fu = dynamic_cast<FusedLinear*>(l.get())) return fu->scale(1.0 / c, 1.0);
+  auto* lin = dynamic_cast<LinearLayer*>(l.get());
+  if (!lin || !lin->trainable()) throw std::logic_error("place_bootstraps: cannot rescale " + l->type());
+  std::vector<double> p = lin->params();
+  std::vector<char> is_bias(p.size(), 0);
+  for (int b : lin->bias_refs()) is_bias[static_cast<size_t>(b)] = 1;
+  for (size_t i = 0; i < p.size(); ++i)
+    if (!is_bias[i]) p[i] /= c;
+  lin->set_params(p);
+}
+
+std::shared_ptr<Layer> make_scale(const Shape& s, double f) {
+  return std::make_shared<Scale>(std::vector<double>(static_cast<size_t>(s.c), f));
+}
+
+}  // namespace
+
+size_t Network::place_bootstraps(uint32_t budget, const std::vector<std::vector<double>>& calibration,
+                                 double headroom) {
+  if (budget == 0) throw std::invalid_argument("place_bootstraps: budget must be at least one level");
+  if (!(headroom > 0)) throw std::invalid_argument("place_bootstraps: headroom must be positive");
+  configure();
+  const size_t n = layers_.size();
+  for (const auto& l : layers_)
+    if (l->depth() > budget)
+      throw std::invalid_argument("place_bootstraps: layer " + l->describe() + " alone needs " +
+                                  std::to_string(l->depth()) + " levels, more than the budget");
+
+  // Plaintext ranges: range[i] = max |output of layer i - 1| (range[0]: input).
+  std::vector<double> range(n + 1, 0.0);
+  for (const auto& x0 : calibration) {
+    std::vector<double> x = x0;
+    for (size_t i = 0; i <= n; ++i) {
+      for (double v : x) range[i] = std::max(range[i], std::fabs(v));
+      if (i < n) x = layers_[i]->forward_plain(x);
+    }
+  }
+
+  // Plan: walk the layers with the running depth d, tracking whether a
+  // bootstrap's scale is still being carried (not yet absorbed). A bootstrap
+  // goes before layer i when i would overflow the budget. If the scale
+  // entering it cannot be folded back, a Scale layer (one level) precedes
+  // it; when that does not fit either, the bootstrap moves one layer earlier.
+  std::vector<char> boot_before(n + 1, 0), pre_scale(n + 1, 0);
+  std::vector<uint32_t> d_at(n + 1, 0);
+  std::vector<char> carry_at(n + 1, 0);
+  std::vector<Fold> kind(n);
+  for (size_t i = 0; i < n; ++i) kind[i] = fold_kind(*layers_[i]);
+  uint32_t d = 0;
+  bool carrying = false;
+  size_t i = 0;
+  size_t forced = n + 1;  // a position the back-off decided on
+  while (i <= n) {
+    d_at[i] = d;
+    carry_at[i] = carrying;
+    const uint32_t dep = i < n ? layers_[i]->depth() : 0;
+    const Fold k = i < n ? kind[i] : Fold::kBlock;  // the output must come out unscaled
+    const bool is_boot = i < n && layers_[i]->is_bootstrap();
+    uint32_t extra = (carrying && k == Fold::kBlock) ? 1 : 0;  // Scale layer restoring the carry
+    const bool overflow = !is_boot && d + extra + dep > budget && (i < n || carrying);
+    if (overflow || forced == i) {
+      forced = n + 1;
+      const bool fold = i > 0 && can_scale_output(layers_, i - 1, boot_before);
+      const uint32_t pre = fold ? 0 : 1;
+      if (d + pre > budget) {
+        // Back off: the latest earlier position in this stretch where the
+        // bootstrap (and its Scale layer, if any) still fits.
+        size_t j = i;
+        for (size_t p = i; p-- > 0 && j == i;) {
+          if (layers_[p]->is_bootstrap() || boot_before[p]) break;  // start of the stretch
+          const uint32_t pre_p = (p > 0 && can_scale_output(layers_, p - 1, boot_before)) ? 0 : 1;
+          if (p > 0 && d_at[p] + pre_p <= budget) j = p;
+        }
+        if (j == i)
+          throw std::invalid_argument("place_bootstraps: the layers up to " + layers_[std::min(i, n - 1)]->describe() +
+                                      " do not fit in " + std::to_string(budget) + " levels with their scaling");
+        std::fill(boot_before.begin() + static_cast<long>(j), boot_before.end(), 0);
+        std::fill(pre_scale.begin() + static_cast<long>(j), pre_scale.end(), 0);
+        d = d_at[j];
+        carrying = carry_at[j];
+        i = j;
+        forced = j;
+        continue;
+      }
+      boot_before[i] = 1;
+      pre_scale[i] = !fold;
+      d = 0;
+      carrying = true;
+      extra = (k == Fold::kBlock) ? 1 : 0;
+    }
+    if (is_boot) {
+      d = 0;
+    } else {
+      d += extra + dep;
+      if (k == Fold::kAbsorb || k == Fold::kBlock) carrying = false;
+    }
+    ++i;
+  }
+
+  // Apply the plan.
+  std::vector<std::shared_ptr<Layer>> out;
+  double carry = 1.0;  // factor currently on the signal relative to the calibration run
+  size_t inserted = 0;
+  for (size_t j = 0; j <= n; ++j) {
+    const Shape shape = j == 0 ? input_ : layers_[j - 1]->out_shape();
+    if (boot_before[j]) {
+      // Values already within [-1, 1] need no scaling.
+      const double m = range[j] * std::fabs(carry);
+      const double s = m > 1.0 ? headroom * m : 1.0;
+      if (pre_scale[j])
+        out.push_back(make_scale(shape, 1.0 / s));
+      else
+        scale_output_chain(out, 1.0 / s);
+      out.push_back(std::make_shared<Bootstrap>());
+      carry /= s;
+      ++inserted;
+    }
+    if (j == n) {
+      if (carry != 1.0) out.push_back(make_scale(shape, 1.0 / carry));
+      break;
+    }
+    std::shared_ptr<Layer> l = layers_[j];
+    if (carry != 1.0) {
+      switch (kind[j]) {
+        case Fold::kAbsorb:
+          absorb_input(l, carry);
+          carry = 1.0;
+          break;
+        case Fold::kSquare: carry *= carry; break;
+        case Fold::kPass: break;
+        case Fold::kBlock:
+          out.push_back(make_scale(shape, 1.0 / carry));
+          carry = 1.0;
+          break;
+      }
+    }
+    out.push_back(l);
+  }
+  layers_ = std::move(out);
+  configure();
+  return inserted;
+}
+
+namespace {
+
+size_t fold_intervals(std::vector<std::shared_ptr<Layer>>& layers) {
+  size_t folded = 0;
+  for (size_t i = 0; i < layers.size(); ++i) {
+    if (auto* r = dynamic_cast<Residual*>(layers[i].get())) {
+      // The body is a separate chain; its first layer's input is the block input.
+      std::vector<std::shared_ptr<Layer>> body = r->body();
+      size_t f = fold_intervals(body);
+      if (f) {
+        layers[i] = std::make_shared<Residual>(std::move(body));
+        folded += f;
+      }
+      continue;
+    }
+    auto* c = dynamic_cast<ChebyshevActivation*>(layers[i].get());
+    if (!c || (c->a() == -1.0 && c->b() == 1.0) || i == 0) continue;
+    // t = alpha x + beta maps [a, b] onto [-1, 1].
+    const double alpha = 2.0 / (c->b() - c->a()), beta = -(c->a() + c->b()) / (c->b() - c->a());
+    auto* lin = dynamic_cast<LinearLayer*>(layers[i - 1].get());
+    if (lin && lin->trainable() && !lin->bias_refs().empty()) {
+      std::vector<double> p = lin->params();
+      std::vector<char> is_bias(p.size(), 0);
+      for (int b : lin->bias_refs()) is_bias[static_cast<size_t>(b)] = 1;
+      for (size_t k = 0; k < p.size(); ++k) p[k] = p[k] * alpha + (is_bias[k] ? beta : 0.0);
+      lin->set_params(p);
+    } else if (beta == 0.0) {
+      std::vector<std::shared_ptr<Layer>> prefix(layers.begin(), layers.begin() + static_cast<long>(i));
+      if (!can_scale_output(prefix, i - 1, std::vector<char>(i, 0))) continue;
+      scale_output_chain(prefix, alpha);
+      std::copy(prefix.begin(), prefix.end(), layers.begin());
+    } else {
+      continue;
+    }
+    c->set_evaluation_interval(-1.0, 1.0);
+    ++folded;
+  }
+  return folded;
+}
+
+}  // namespace
+
+size_t Network::fold_activation_intervals() {
+  size_t n = fold_intervals(layers_);
+  configure();
+  return n;
+}
+
+uint32_t Network::max_bootstrap_budget(ContextOptions base, uint32_t max_ring) {
+  base.bootstrapping = true;
+  base.ring_dim = 0;
+  base.slots = std::min(base.slots, max_ring / 2);
+  uint32_t best = 0;
+  for (uint32_t b = 1; b < 64; ++b) {
+    base.mult_depth = b + 1;  // as context_options() sizes it
+    if (FHEContext::ring_dim_for(base) > max_ring) break;
+    best = b;
+  }
+  return best;
+}
+
 uint32_t Network::required_slots() const {
   size_t n = input_.size();
   for (const auto& l : layers_) n = std::max(n, l->min_slots());
@@ -240,11 +534,25 @@ bool Network::uses_bootstrapping() const {
   return std::any_of(layers_.begin(), layers_.end(), [](const std::shared_ptr<Layer>& l) { return l->is_bootstrap(); });
 }
 
-std::vector<int32_t> Network::rotation_indices() const {
+namespace {
+
+void collect_rotations(const std::vector<std::shared_ptr<Layer>>& layers, bool ladder, std::set<int32_t>& s) {
+  for (const auto& l : layers) {
+    if (auto* r = dynamic_cast<const Residual*>(l.get())) {
+      collect_rotations(r->body(), ladder, s);
+      continue;
+    }
+    if (ladder && l->is_linear()) continue;
+    for (int32_t k : l->rotation_indices()) s.insert(k);
+  }
+}
+
+}  // namespace
+
+std::vector<int32_t> Network::rotation_indices(bool ladder) const {
   if (!slots_) throw std::logic_error("compile() the network first");
   std::set<int32_t> s;
-  for (const auto& l : layers_)
-    for (int32_t r : l->rotation_indices()) s.insert(r);
+  collect_rotations(layers_, ladder, s);
   return std::vector<int32_t>(s.begin(), s.end());
 }
 
@@ -254,7 +562,14 @@ ContextOptions Network::context_options(bool secure) const {
   o.slots = slots_;
   o.secure = secure;
   o.bootstrapping = uses_bootstrapping();
-  o.mult_depth = o.bootstrapping ? depth_between_bootstraps() : depth();
+  // +1: EvalBootstrap needs one level left when its input arrives.
+  o.mult_depth = o.bootstrapping ? depth_between_bootstraps() + 1 : depth();
+  if (o.bootstrapping) {
+    // Bootstrapping precision needs a larger scaling factor; the first
+    // modulus must stay within OpenFHE's correction factor of it.
+    o.scale_mod_bits = 50;
+    o.first_mod_bits = 57;  // outputs must stay below 2^7 in magnitude
+  }
   return o;
 }
 

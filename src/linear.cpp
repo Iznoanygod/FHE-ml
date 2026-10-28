@@ -219,8 +219,9 @@ Ctxt LinearTransform::eval(const FHEContext& ctx, const Ctxt& x) const {
     return cc->EvalMult(x, 0.0);
   }
 
-  // Baby steps: one digit decomposition shared by all rotations (hoisting).
-  std::vector<Ctxt> baby = backend::rotate_hoisted(cc, x, babies_, ctx.parallel());
+  // Baby steps: one digit decomposition shared by all rotations (hoisting),
+  // or composed from the context's rotation-key ladder.
+  const std::vector<Ctxt> baby = ctx.rotate_many(x, babies_);
 
   // Plaintext diagonals are encoded at the level the products will live at.
   const uint32_t level = x->GetLevel() + (x->GetNoiseScaleDeg() > 1 ? 1 : 0);
@@ -260,14 +261,14 @@ Ctxt LinearTransform::eval(const FHEContext& ctx, const Ctxt& x) const {
         cc->EvalAddInPlace(inner, prod);
     }
     if (encrypted) backend::relinearize(cc, inner);
-    if (g.step) inner = cc->EvalRotate(inner, g.step);
+    if (g.step) inner = ctx.rotate(inner, g.step);
     partial[gi] = inner;
   }
 
   Ctxt y = partial[0];
   for (size_t gi = 1; gi < partial.size(); ++gi) cc->EvalAddInPlace(y, partial[gi]);
   if (fold_)
-    for (uint32_t s = fold_; s < slots_; s *= 2) cc->EvalAddInPlace(y, cc->EvalRotate(y, static_cast<int32_t>(s)));
+    for (uint32_t s = fold_; s < slots_; s *= 2) cc->EvalAddInPlace(y, ctx.rotate(y, static_cast<int32_t>(s)));
   return y;
 }
 

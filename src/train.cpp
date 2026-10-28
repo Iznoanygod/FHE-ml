@@ -391,7 +391,7 @@ void for_each_linear(const std::vector<std::unique_ptr<Node>>& nodes, F f) {
 Ctxt linear_forward(const FHEContext& ctx, Node& n, const Ctxt& x) {
   const CC& cc = ctx.cc();
   n.in = x;
-  const std::vector<Ctxt> rot = backend::rotate_hoisted(cc, x, n.offs, ctx.parallel());
+  const std::vector<Ctxt> rot = ctx.rotate_many(x, n.offs);
   std::vector<Ctxt> terms(n.offs.size());
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
   for (size_t i = 0; i < n.offs.size(); ++i)
@@ -435,7 +435,7 @@ Ctxt backward_nodes(const FHEContext& ctx, std::vector<std::unique_ptr<Node>>& n
       case Node::kLinear: {
         if (n.trainable) {
           // dL/dD_i = g (*) rot_i(x), summed over the batch.
-          const std::vector<Ctxt> rot = backend::rotate_hoisted(cc, n.in, n.offs, ctx.parallel());
+          const std::vector<Ctxt> rot = ctx.rotate_many(n.in, n.offs);
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
           for (size_t i = 0; i < n.offs.size(); ++i) add_to(ctx, n.gD[i], cc->EvalMult(g, rot[i]));
           if (n.B) add_to(ctx, n.gB, g);
@@ -445,8 +445,7 @@ Ctxt backward_nodes(const FHEContext& ctx, std::vector<std::unique_ptr<Node>>& n
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
           for (size_t i = 0; i < n.offs.size(); ++i) {
             Ctxt t = n.trainable ? cc->EvalMult(n.D[i], g) : mul_plain(ctx, g, n.diag[i]);
-            terms[i] = n.offs[i] ? cc->EvalRotate(t, normalize_rotation(-static_cast<int64_t>(n.offs[i]), ctx.slots()))
-                                 : t;
+            terms[i] = ctx.rotate(t, -n.offs[i]);
           }
           g = sum(ctx, std::move(terms));
         }
@@ -492,7 +491,7 @@ std::vector<double> scaled(const std::vector<double>& mask, double s) {
 
 // Sum of all slots, in every slot.
 Ctxt allsum(const FHEContext& ctx, Ctxt c) {
-  for (uint32_t k = 1; k < ctx.slots(); k *= 2) ctx.cc()->EvalAddInPlace(c, ctx.cc()->EvalRotate(c, static_cast<int32_t>(k)));
+  for (uint32_t k = 1; k < ctx.slots(); k *= 2) ctx.cc()->EvalAddInPlace(c, ctx.rotate(c, static_cast<int32_t>(k)));
   return c;
 }
 
@@ -549,13 +548,13 @@ void bootstrap_packed(const FHEContext& ctx, std::vector<Ctxt*> cts, uint32_t wi
     for (size_t step = 1; step < width; step *= 2)
       for (size_t i = 0; i + step < width; i += 2 * step)
         if (t[i + step]) {
-          Ctxt r = cc->EvalRotate(t[i + step], normalize_rotation(-static_cast<int64_t>(step * window), ctx.slots()));
+          Ctxt r = ctx.rotate(t[i + step], -static_cast<int32_t>(step * window));
           t[i] = t[i] ? cc->EvalAdd(t[i], r) : r;
         }
     t[0] = ctx.bootstrap(t[0]);
     for (size_t step = width / 2; step >= 1; step /= 2)
       for (size_t i = 0; i + step < width; i += 2 * step)
-        if (i + step < m) t[i + step] = cc->EvalRotate(t[i], static_cast<int32_t>(step * window));
+        if (i + step < m) t[i + step] = ctx.rotate(t[i], static_cast<int32_t>(step * window));
 #pragma omp parallel for if (ctx.parallel())
     for (size_t j = 0; j < m; ++j) *cts[start + j] = mul_plain(ctx, t[j], mask);
   }
@@ -651,11 +650,12 @@ uint32_t Trainer::step_depth() const {
   return std::max(s.max, s.new_w);
 }
 
-std::vector<int32_t> Trainer::rotation_indices() const {
+std::vector<int32_t> Trainer::rotation_indices(bool ladder) const {
   std::set<int32_t> r;
   const auto& layers = net_.layers();
   for (size_t i = 0; i < first_; ++i)
     for (int32_t k : layers[i]->rotation_indices()) r.insert(k);
+  if (ladder) return std::vector<int32_t>(r.begin(), r.end());
   bool all = false;
   collect_rotations(nodes_, slots_, r, all);
   if (all)
@@ -663,16 +663,21 @@ std::vector<int32_t> Trainer::rotation_indices() const {
   return std::vector<int32_t>(r.begin(), r.end());
 }
 
-ContextOptions Trainer::context_options(bool secure, bool bootstrapping, uint32_t updates) const {
+ContextOptions Trainer::context_options(bool secure, bool bootstrapping, uint32_t updates,
+                                        uint32_t rotation_window) const {
   ContextOptions o;
   o.slots = slots_;
   o.secure = secure;
   o.bootstrapping = bootstrapping;
+  o.rotation_window = rotation_window;
   if (bootstrapping) {
     // +1: weights restart one level below a fresh bootstrap (unpacking mask);
     // +1: EvalBootstrap needs one level left.
     o.mult_depth = step_depth() + 2;
-    o.scale_mod_bits = 55;  // bootstrapping precision (about 1e-2 at 50 bits with full slots)
+    // Bootstrapping precision: about 1e-2 at 50 bits on full-slot toy rings,
+    // 1e-10 at 50 bits on ring 2^16, where 55 bits would not fit 24 levels.
+    o.scale_mod_bits = secure ? 50 : 55;
+    o.first_mod_bits = std::min<uint32_t>(o.scale_mod_bits + 7, 60);  // 60 is OpenFHE's native prime limit
   } else {
     // Each update leaves the weights deeper; the next step starts there.
     uint32_t prefix = 0;
