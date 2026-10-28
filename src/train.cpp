@@ -393,7 +393,7 @@ Ctxt linear_forward(const FHEContext& ctx, Node& n, const Ctxt& x) {
   n.in = x;
   const std::vector<Ctxt> rot = ctx.rotate_many(x, n.offs);
   std::vector<Ctxt> terms(n.offs.size());
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
   for (size_t i = 0; i < n.offs.size(); ++i)
     terms[i] = n.trainable ? cc->EvalMult(n.D[i], rot[i]) : mul_plain(ctx, rot[i], n.diag[i]);
   Ctxt y = sum(ctx, std::move(terms));
@@ -436,13 +436,13 @@ Ctxt backward_nodes(const FHEContext& ctx, std::vector<std::unique_ptr<Node>>& n
         if (n.trainable) {
           // dL/dD_i = g (*) rot_i(x), summed over the batch.
           const std::vector<Ctxt> rot = ctx.rotate_many(n.in, n.offs);
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
           for (size_t i = 0; i < n.offs.size(); ++i) add_to(ctx, n.gD[i], cc->EvalMult(g, rot[i]));
           if (n.B) add_to(ctx, n.gB, g);
         }
         if (need) {
           std::vector<Ctxt> terms(n.offs.size());
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
           for (size_t i = 0; i < n.offs.size(); ++i) {
             Ctxt t = n.trainable ? cc->EvalMult(n.D[i], g) : mul_plain(ctx, g, n.diag[i]);
             terms[i] = ctx.rotate(t, -n.offs[i]);
@@ -500,13 +500,13 @@ void update_linear(const FHEContext& ctx, Node& n, double step) {
   std::vector<Ctxt> delta(n.offs.size());
   Ctxt delta_b;
   // Unshared weights: their own slot's gradient.
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
   for (size_t i = 0; i < n.offs.size(); ++i)
     if (!n.unshared[i].empty()) delta[i] = mul_plain(ctx, n.gD[i], scaled(n.unshared[i], step));
   if (!n.bias_unshared.empty()) delta_b = mul_plain(ctx, n.gB, scaled(n.bias_unshared, step));
   // Shared weights: masked sum over their slots, broadcast, masked again.
   std::vector<std::vector<Ctxt>> contrib(n.groups.size());
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
   for (size_t gi = 0; gi < n.groups.size(); ++gi) {
     const auto& g = n.groups[gi];
     std::vector<Ctxt> parts;
@@ -555,7 +555,7 @@ void bootstrap_packed(const FHEContext& ctx, std::vector<Ctxt*> cts, uint32_t wi
     for (size_t step = width / 2; step >= 1; step /= 2)
       for (size_t i = 0; i + step < width; i += 2 * step)
         if (i + step < m) t[i + step] = ctx.rotate(t[i], static_cast<int32_t>(step * window));
-#pragma omp parallel for
+#pragma omp parallel for if (ctx.parallel())
     for (size_t j = 0; j < m; ++j) *cts[start + j] = mul_plain(ctx, t[j], mask);
   }
 }
@@ -708,7 +708,7 @@ void Trainer::encrypt_weights(const FHEContext& ctx) {
     if (!n.trainable) return;
     n.D.assign(n.offs.size(), nullptr);
     n.gD.assign(n.offs.size(), nullptr);
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
     for (size_t i = 0; i < n.offs.size(); ++i) n.D[i] = ctx.encrypt(n.diag[i], base_level_);
     if (!n.bias.empty()) n.B = ctx.encrypt(n.bias, base_level_);
   });

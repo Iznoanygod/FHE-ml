@@ -185,6 +185,48 @@ void measure_poly_depth() {
   }
 }
 
+// The GPU backend (FIDESlib) has no EvalPoly and evaluates power-basis
+// polynomials as Chebyshev series on [-1, 1]. Check that rewrite on any build:
+// same values (also off [-1, 1]) and no more levels than poly_depth().
+void backend_tests() {
+  std::vector<std::vector<double>> polys = {{0.1, 0.5, 0.25, -0.05},
+                                            {0.0, 1.0, 0.0, -0.1, 0.0, 0.01},
+                                            {0.3, -0.2, 0.1, 0.05, -0.02, 0.01, 0.004, -0.001, 0.0005, 0.0, 0.0, 0.0, 0.0, 1e-5}};
+  auto power = [](const std::vector<double>& c, double x) {
+    double acc = 0.0;
+    for (size_t k = c.size(); k-- > 0;) acc = acc * x + c[k];
+    return acc;
+  };
+  for (const auto& c : polys) {
+    std::vector<double> t = backend::power_to_chebyshev(c);
+    double err = 0.0;
+    for (double x : {-2.0, -1.0, -0.3, 0.0, 0.7, 1.5}) {
+      double t0 = 1.0, t1 = x, acc = t[0] / 2 + (t.size() > 1 ? t[1] * x : 0.0);
+      for (size_t k = 2; k < t.size(); ++k) {
+        double tk = 2 * x * t1 - t0;
+        acc += t[k] * tk;
+        t0 = t1;
+        t1 = tk;
+      }
+      err = std::max(err, std::fabs(acc - power(c, x)));
+    }
+    check_err("power->chebyshev degree " + std::to_string(c.size() - 1), err, 1e-12);
+
+    const uint32_t depth = poly_depth(static_cast<uint32_t>(c.size() - 1));
+    FHEContext ctx = make_ctx(depth, 16, {});
+    auto x = rand_vec(16, -1.5, 1.5);
+    Ctxt in = ctx.encrypt(x);
+    Ctxt y = ctx.cc()->EvalChebyshevSeries(in, t, -1.0, 1.0);
+    auto got = ctx.decrypt(y, 16);
+    std::vector<double> ref(16);
+    for (size_t i = 0; i < 16; ++i) ref[i] = power(c, x[i]);
+    const std::string name = "chebyshev-basis poly degree " + std::to_string(c.size() - 1);
+    check_err(name, max_err(ref, got, 16), 1e-4);
+    uint32_t used = y->GetLevel() - in->GetLevel() + (y->GetNoiseScaleDeg() > 1 ? 1 : 0);
+    check(used <= depth, "depth " + name, "(used " + std::to_string(used) + ", planned " + std::to_string(depth) + ")");
+  }
+}
+
 // A one-block transformer: token embedding, attention and MLP residuals,
 // mean pooling and a classifier head.
 Network tiny_transformer(int n, int in, int d) {
@@ -498,6 +540,7 @@ int main(int argc, char** argv) {
   cleartext_tests();
   ladder_tests();
   placement_tests(quick);
+  backend_tests();
   encrypted_tests(quick);
   transformer_tests();
   std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");

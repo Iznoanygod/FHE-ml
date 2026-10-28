@@ -509,7 +509,7 @@ Ctxt PolyActivation::forward(const FHEContext& ctx, const Ctxt& x) const {
     t = cc->EvalAdd(t, c_[1]);
     return cc->EvalAdd(cc->EvalMult(x, t), c_[0]);
   }
-  return cc->EvalPoly(x, c_);
+  return backend::eval_poly(cc, x, c_);
 }
 
 void PolyActivation::save(std::ostream& os) const {
@@ -581,7 +581,8 @@ std::vector<double> ChebyshevActivation::forward_plain(const std::vector<double>
 }
 
 Ctxt ChebyshevActivation::forward(const FHEContext& ctx, const Ctxt& x) const {
-  return ctx.cc()->EvalChebyshevSeries(x, coeffs_, ea_, eb_);
+  std::vector<double> c = coeffs_;  // FIDESlib takes the coefficients by mutable reference
+  return ctx.cc()->EvalChebyshevSeries(x, c, ea_, eb_);
 }
 
 void ChebyshevActivation::save(std::ostream& os) const {

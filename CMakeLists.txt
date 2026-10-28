@@ -9,7 +9,19 @@ endif()
 
 # Point CMake at an OpenFHE install with -DOpenFHE_DIR=<prefix>/lib/OpenFHE
 # or -DCMAKE_PREFIX_PATH=<prefix>.
-find_package(OpenFHE 1.2 REQUIRED CONFIG)
+#
+# FHEML_GPU=ON builds on FIDESlib (CUDA) instead. FIDESlib needs the patched
+# OpenFHE 1.6.1 it was built against (static libraries); add its prefix and the
+# FIDESlib prefix to CMAKE_PREFIX_PATH. The result still runs on machines
+# without a GPU, through FIDESlib's OpenFHE fallback.
+option(FHEML_GPU "Use FIDESlib for GPU-accelerated CKKS" OFF)
+if(FHEML_GPU)
+  find_package(OpenFHE 1.6.1 EXACT REQUIRED CONFIG)
+  find_package(fideslib 2.2 REQUIRED CONFIG)
+  find_package(CUDAToolkit REQUIRED)
+else()
+  find_package(OpenFHE 1.2 REQUIRED CONFIG)
+endif()
 find_package(OpenMP)
 set(CMAKE_BUILD_RPATH ${OpenFHE_LIBDIR})
 set(CMAKE_INSTALL_RPATH ${OpenFHE_LIBDIR})
@@ -21,6 +33,7 @@ string(REPLACE "-Werror" "" FHEML_OPENFHE_FLAGS "${OpenFHE_CXX_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FHEML_OPENFHE_FLAGS}")
 
 add_library(fheml
+  src/backend.cpp
   src/context.cpp
   src/linear.cpp
   src/layers.cpp
@@ -34,8 +47,17 @@ target_include_directories(fheml SYSTEM PUBLIC
   ${OpenFHE_INCLUDE}/core
   ${OpenFHE_INCLUDE}/pke
   ${OpenFHE_INCLUDE}/binfhe)
-target_link_directories(fheml PUBLIC ${OpenFHE_LIBDIR})
-target_link_libraries(fheml PUBLIC ${OpenFHE_SHARED_LIBRARIES})
+if(FHEML_GPU)
+  # fideslib.a carries OpenFHE's static libraries; linking the shared ones
+  # too would duplicate OpenFHE's global state (key maps).
+  target_compile_definitions(fheml PUBLIC FHEML_WITH_FIDESLIB)
+  target_compile_features(fheml PUBLIC cxx_std_20)
+  target_include_directories(fheml SYSTEM PUBLIC ${FIDESLIB_INCLUDE_PATH})
+  target_link_libraries(fheml PUBLIC fideslib::fideslib CUDA::cudart)
+else()
+  target_link_directories(fheml PUBLIC ${OpenFHE_LIBDIR})
+  target_link_libraries(fheml PUBLIC ${OpenFHE_SHARED_LIBRARIES})
+endif()
 if(OpenMP_CXX_FOUND)
   target_link_libraries(fheml PUBLIC OpenMP::OpenMP_CXX)
 endif()

@@ -7,8 +7,6 @@
 
 namespace fheml {
 
-using namespace lbcrypto;
-
 namespace {
 
 bool is_pow2(uint32_t x) { return x && !(x & (x - 1)); }
@@ -18,11 +16,11 @@ bool is_pow2(uint32_t x) { return x && !(x & (x - 1)); }
 FHEContext::FHEContext(const ContextOptions& opts) : opts_(opts) {
   if (!is_pow2(opts_.slots)) throw std::invalid_argument("slots must be a power of two");
 
-  SecretKeyDist dist = UNIFORM_TERNARY;
-  boot_depth_ = opts_.bootstrapping ? FHECKKSRNS::GetBootstrapDepth(opts_.level_budget, dist) : 0;
+  boot_depth_ =
+      opts_.bootstrapping ? lbcrypto::FHECKKSRNS::GetBootstrapDepth(opts_.level_budget, lbcrypto::UNIFORM_TERNARY) : 0;
   total_depth_ = opts_.mult_depth + boot_depth_;
 
-  CCParams<CryptoContextCKKSRNS> params;
+  fhe::CCParams<fhe::CryptoContextCKKSRNS> params;
   // EvalBootstrap requires first_mod - scale_mod <= its correction factor (7
   // at large rings), so the first modulus is capped when bootstrapping. The
   // gap is also the headroom of the final level: output values must stay
@@ -31,12 +29,17 @@ FHEContext::FHEContext(const ContextOptions& opts) : opts_(opts) {
   params.SetMultiplicativeDepth(total_depth_);
   params.SetScalingModSize(opts_.scale_mod_bits);
   params.SetFirstModSize(opts_.first_mod_bits);
-  params.SetScalingTechnique(FLEXIBLEAUTO);
-  params.SetKeySwitchTechnique(HYBRID);
-  params.SetSecretKeyDist(dist);
+  params.SetScalingTechnique(fhe::FLEXIBLEAUTO);
+  params.SetKeySwitchTechnique(fhe::HYBRID);
+  params.SetSecretKeyDist(fhe::UNIFORM_TERNARY);
   params.SetBatchSize(opts_.slots);
   if (opts_.key_switch_digits) params.SetNumLargeDigits(opts_.key_switch_digits);
-  params.SetSecurityLevel(opts_.secure ? HEStd_128_classic : HEStd_NotSet);
+  params.SetSecurityLevel(opts_.secure ? fhe::HEStd_128_classic : fhe::HEStd_NotSet);
+#ifdef FHEML_WITH_FIDESLIB
+  // No devices = FIDESlib runs every operation on its OpenFHE context.
+  on_gpu_ = opts_.use_gpu && !opts_.gpu_devices.empty() && gpu_device_count() > 0;
+  if (on_gpu_) params.SetDevices(std::vector<int>(opts_.gpu_devices));
+#endif
 
   // OpenFHE picks the ring dimension from the security level and modulus
   // size; it has to be at least 2 * slots, so grow it until both hold.
@@ -47,7 +50,7 @@ FHEContext::FHEContext(const ContextOptions& opts) : opts_(opts) {
   for (; ring <= (1u << 17); ring *= 2) {
     params.SetRingDim(ring);
     try {
-      cc_ = GenCryptoContext(params);
+      cc_ = fhe::GenCryptoContext(params);
       break;
     } catch (const std::exception& e) {
       last_error = e.what();
@@ -56,12 +59,12 @@ FHEContext::FHEContext(const ContextOptions& opts) : opts_(opts) {
   }
   if (!cc_) throw std::runtime_error("could not create CKKS context: " + last_error);
 
-  cc_->Enable(PKE);
-  cc_->Enable(KEYSWITCH);
-  cc_->Enable(LEVELEDSHE);
-  cc_->Enable(ADVANCEDSHE);
+  cc_->Enable(fhe::PKE);
+  cc_->Enable(fhe::KEYSWITCH);
+  cc_->Enable(fhe::LEVELEDSHE);
+  cc_->Enable(fhe::ADVANCEDSHE);
   if (opts_.bootstrapping) {
-    cc_->Enable(FHE);
+    cc_->Enable(fhe::FHE);
     cc_->EvalBootstrapSetup(opts_.level_budget, {0, 0}, opts_.slots);
   }
 }
@@ -93,6 +96,10 @@ void FHEContext::keygen(const std::vector<int32_t>& rotations) {
   for (int32_t r : uniq) has_key_[static_cast<size_t>(r)] = 1;
   if (!uniq.empty()) cc_->EvalRotateKeyGen(keys_.secretKey, std::vector<int32_t>(uniq.begin(), uniq.end()));
   if (opts_.bootstrapping) cc_->EvalBootstrapKeyGen(keys_.secretKey, opts_.slots);
+#ifdef FHEML_WITH_FIDESLIB
+  // Uploads the context, relinearization, rotation and bootstrapping keys.
+  if (on_gpu_) cc_->LoadContext(keys_.publicKey);
+#endif
 }
 
 bool FHEContext::has_rotation_key(int32_t k) const {
@@ -146,14 +153,9 @@ std::vector<Ctxt> FHEContext::rotate_many(const Ctxt& x, const std::vector<int32
   const size_t n = offs.size();
   std::vector<Ctxt> out(n);
   if (std::all_of(offs.begin(), offs.end(), [&](int32_t k) { return has_rotation_key(k); })) {
-    auto pre = cc_->EvalFastRotationPrecompute(x);
-    const uint32_t m = cc_->GetCyclotomicOrder();
-#pragma omp parallel for schedule(dynamic)
-    for (size_t i = 0; i < n; ++i) {
-      const int32_t k = normalize_rotation(offs[i], opts_.slots);
-      out[i] = k ? cc_->EvalFastRotation(x, static_cast<uint32_t>(k), m, pre) : x;
-    }
-    return out;
+    std::vector<int32_t> idx(n);
+    for (size_t i = 0; i < n; ++i) idx[i] = normalize_rotation(offs[i], opts_.slots);
+    return backend::rotate_hoisted(cc_, x, idx, parallel());
   }
   // Plan: cheapest offsets first, each from the planned offset nearest to it.
   std::vector<size_t> order(n);
@@ -179,7 +181,7 @@ std::vector<Ctxt> FHEContext::rotate_many(const Ctxt& x, const std::vector<int32
     std::vector<size_t> now;
     for (size_t i = 0; i < n; ++i)
       if (wave[i] == w) now.push_back(i);
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(dynamic) if (parallel())
     for (size_t t = 0; t < now.size(); ++t) {
       const size_t i = now[t];
       const Ctxt& from = source[i] < 0 ? x : out[static_cast<size_t>(source[i])];
@@ -190,21 +192,32 @@ std::vector<Ctxt> FHEContext::rotate_many(const Ctxt& x, const std::vector<int32
   return out;
 }
 
+// The rotation-key map is OpenFHE's static registry; FIDESlib keeps its keys on
+// the device, so these report 0 in a GPU build.
 size_t FHEContext::rotation_key_count() const {
+#ifdef FHEML_WITH_FIDESLIB
+  return 0;
+#else
   if (!keys_.secretKey) return 0;
-  return CryptoContextImpl<DCRTPoly>::GetEvalAutomorphismKeyMap(keys_.secretKey->GetKeyTag()).size();
+  return lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::GetEvalAutomorphismKeyMap(keys_.secretKey->GetKeyTag()).size();
+#endif
 }
 
 size_t FHEContext::rotation_key_bytes() const {
+#ifdef FHEML_WITH_FIDESLIB
+  return 0;
+#else
   if (!keys_.secretKey) return 0;
   size_t bytes = 0;
-  for (const auto& kv : CryptoContextImpl<DCRTPoly>::GetEvalAutomorphismKeyMap(keys_.secretKey->GetKeyTag())) {
-    auto rk = std::dynamic_pointer_cast<EvalKeyRelinImpl<DCRTPoly>>(kv.second);
+  for (const auto& kv :
+       lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::GetEvalAutomorphismKeyMap(keys_.secretKey->GetKeyTag())) {
+    auto rk = std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(kv.second);
     if (!rk) continue;
     for (const auto* vec : {&rk->GetAVector(), &rk->GetBVector()})
       for (const auto& poly : *vec) bytes += poly.GetNumOfElements() * poly.GetRingDimension() * sizeof(uint64_t);
   }
   return bytes;
+#endif
 }
 
 Ptxt FHEContext::encode(const std::vector<double>& v, uint32_t level, uint32_t scale_deg) const {
@@ -213,12 +226,14 @@ Ptxt FHEContext::encode(const std::vector<double>& v, uint32_t level, uint32_t s
 
 Ctxt FHEContext::encrypt(const std::vector<double>& v, uint32_t level) const {
   if (v.size() > opts_.slots) throw std::invalid_argument("vector larger than slot count");
-  return cc_->Encrypt(keys_.publicKey, encode(v, level));
+  Ptxt p = encode(v, level);
+  return cc_->Encrypt(keys_.publicKey, p);
 }
 
 std::vector<double> FHEContext::decrypt(const Ctxt& c, size_t n) const {
   Ptxt p;
-  cc_->Decrypt(keys_.secretKey, c, &p);
+  Ctxt ct = c;  // FIDESlib's Decrypt takes a mutable handle
+  cc_->Decrypt(keys_.secretKey, ct, &p);
   p->SetLength(std::min<size_t>(n, opts_.slots));
   return p->GetRealPackedValue();
 }
@@ -226,7 +241,7 @@ std::vector<double> FHEContext::decrypt(const Ctxt& c, size_t n) const {
 uint32_t FHEContext::ring_dim_for(const ContextOptions& opts) {
   ContextOptions o = opts;
   if (o.bootstrapping) {
-    o.mult_depth += FHECKKSRNS::GetBootstrapDepth(o.level_budget, UNIFORM_TERNARY);
+    o.mult_depth += lbcrypto::FHECKKSRNS::GetBootstrapDepth(o.level_budget, lbcrypto::UNIFORM_TERNARY);
     o.bootstrapping = false;
     if (!o.ring_dim) o.slots = std::max(o.slots, 2048u);  // the constructor's 4096 floor
   }
@@ -242,7 +257,8 @@ std::string FHEContext::describe() const {
   std::ostringstream os;
   os << "CKKS ring_dim=" << cc_->GetRingDimension() << " slots=" << opts_.slots
      << " depth=" << total_depth_ << " (network " << opts_.mult_depth << ", bootstrap " << boot_depth_ << ")"
-     << " scale_bits=" << opts_.scale_mod_bits << " security=" << (opts_.secure ? "128-bit" : "NOT SET (insecure)");
+     << " scale_bits=" << opts_.scale_mod_bits << " security=" << (opts_.secure ? "128-bit" : "NOT SET (insecure)")
+     << " device=" << (on_gpu_ ? "gpu" : "cpu");
   if (opts_.rotation_window) os << " rotation_window=" << opts_.rotation_window;
   if (keys_.secretKey)
     os << " rotation_keys=" << rotation_key_count() << " (" << rotation_key_bytes() / (1 << 20) << " MB)";

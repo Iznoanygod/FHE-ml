@@ -1,5 +1,6 @@
-// Thin wrapper over an OpenFHE CKKS crypto context: parameter selection,
-// key generation and encode/encrypt/decrypt helpers.
+// Thin wrapper over an OpenFHE (or FIDESlib, see backend.h) CKKS crypto
+// context: parameter selection, key generation and encode/encrypt/decrypt
+// helpers.
 #ifndef FHEML_CONTEXT_H_
 #define FHEML_CONTEXT_H_
 
@@ -7,13 +8,9 @@
 #include <string>
 #include <vector>
 
-#include "openfhe.h"
+#include "fheml/backend.h"
 
 namespace fheml {
-
-using CC = lbcrypto::CryptoContext<lbcrypto::DCRTPoly>;
-using Ctxt = lbcrypto::Ciphertext<lbcrypto::DCRTPoly>;
-using Ptxt = lbcrypto::Plaintext;
 
 struct ContextOptions {
   // Levels the network consumes between bootstraps (or in total when
@@ -39,6 +36,11 @@ struct ContextOptions {
   // default). More digits: smaller auxiliary modulus, so a deeper network
   // fits a given ring, but larger keys and slower key switching.
   uint32_t key_switch_digits = 0;
+  // Run on the GPU when this build has FIDESlib and a CUDA device is visible;
+  // otherwise (or when false) everything runs on the CPU.
+  bool use_gpu = true;
+  // CUDA devices to use (several = FIDESlib multi-GPU, needs NCCL).
+  std::vector<int> gpu_devices = {0};
 };
 
 class FHEContext {
@@ -84,13 +86,19 @@ class FHEContext {
   uint32_t total_depth() const { return total_depth_; }
   uint32_t bootstrap_depth() const { return boot_depth_; }
   const ContextOptions& options() const { return opts_; }
+  // True when ciphertext operations run on the GPU.
+  bool on_gpu() const { return on_gpu_; }
+  // Whether callers may evaluate independent ciphertext operations from
+  // several threads. FIDESlib's GPU context is not thread-safe.
+  bool parallel() const { return !on_gpu_; }
   std::string describe() const;
 
  private:
   ContextOptions opts_;
   CC cc_;
-  lbcrypto::KeyPair<lbcrypto::DCRTPoly> keys_;
+  fhe::KeyPair<fhe::DCRTPoly> keys_;
   std::vector<char> has_key_;  // per normalised rotation index
+  bool on_gpu_ = false;
   uint32_t total_depth_ = 0;
   uint32_t boot_depth_ = 0;
 };

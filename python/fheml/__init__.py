@@ -29,6 +29,8 @@ from ._fheml import (  # noqa: F401
     Shape,
     Square,
     Trainer,
+    gpu_backend_built,
+    gpu_device_count,
 )
 
 
@@ -87,7 +89,8 @@ def make_context(net, secure=True, rotation_window=0, **overrides):
     ``rotation_window`` > 0 generates a small ladder of rotation keys and
     composes the linear layers' rotations from it (slower, far less key
     memory at ring 2^16). ``overrides`` set ContextOptions fields, e.g.
-    scale_mod_bits=45.
+    scale_mod_bits=45, or use_gpu=False to stay on the CPU in a GPU
+    (FIDESlib) build.
     """
     opts = net.context_options(secure)
     opts.rotation_window = rotation_window

@@ -44,7 +44,9 @@ PYBIND11_MODULE(_fheml, m) {
       .def_readwrite("bootstrapping", &ContextOptions::bootstrapping)
       .def_readwrite("level_budget", &ContextOptions::level_budget)
       .def_readwrite("rotation_window", &ContextOptions::rotation_window)
-      .def_readwrite("key_switch_digits", &ContextOptions::key_switch_digits);
+      .def_readwrite("key_switch_digits", &ContextOptions::key_switch_digits)
+      .def_readwrite("use_gpu", &ContextOptions::use_gpu)
+      .def_readwrite("gpu_devices", &ContextOptions::gpu_devices);
 
   py::class_<Ciphertext>(m, "Ciphertext").def_property_readonly("level", &Ciphertext::level);
 
@@ -64,6 +66,7 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("rotation_key_bytes", &FHEContext::rotation_key_bytes)
       .def("has_rotation_key", &FHEContext::has_rotation_key, py::arg("k"))
       .def("rotation_cost", &FHEContext::rotation_cost, py::arg("k"))
+      .def_property_readonly("on_gpu", &FHEContext::on_gpu)
       .def("describe", &FHEContext::describe)
       .def_static("ring_dim_for", &FHEContext::ring_dim_for, py::arg("options"));
 
@@ -206,6 +209,8 @@ PYBIND11_MODULE(_fheml, m) {
       .def("decrypt_weights", &Trainer::decrypt_weights, py::arg("ctx"), py::call_guard<py::gil_scoped_release>())
       .def("summary", &Trainer::summary);
 
+  m.def("gpu_backend_built", &gpu_backend_built, "True when built with FIDESlib (-DFHEML_GPU=ON).");
+  m.def("gpu_device_count", &gpu_device_count, "Visible CUDA devices (0 without the GPU backend).");
   m.def("train_plain", &train_plain, py::arg("net"), py::arg("xs"), py::arg("targets"), py::arg("lr"),
         py::arg("frozen") = std::vector<size_t>{}, "Plaintext reference of Trainer: one SGD update on a batch.",
         py::call_guard<py::gil_scoped_release>());

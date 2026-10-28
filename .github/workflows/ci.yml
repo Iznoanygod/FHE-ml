@@ -58,3 +58,66 @@ jobs:
         run: |
           python3 tests/test_train.py
           python3 examples/python/train_encrypted_mnist.py --insecure --updates 2 --batch 4 --test 200
+
+  # The runners have no GPU: this compiles the FIDESlib (CUDA) backend and runs
+  # the tests through FIDESlib's OpenFHE CPU fallback.
+  gpu-backend-build:
+    runs-on: ubuntu-24.04
+    env:
+      FIDESLIB_COMMIT: 597a0b3ab072dbbe061d8cacea216411208359d2  # FIDESlib 2.2.0
+      OPENFHE_VERSION: v1.6.1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          # libnvidia-compute provides libcuda.so to link against (no driver is loaded).
+          sudo apt-get update && sudo apt-get install -y python3-dev python3-numpy libnvidia-compute-580
+          python3 -m pip install --user pybind11==2.13.6
+      - name: Install the CUDA 13 compiler from PyPI
+        run: |
+          mkdir -p wheels "$HOME/cuda-pip"
+          python3 -m pip download --no-deps -d wheels nvidia-cuda-nvcc==13.0.88 nvidia-cuda-runtime==13.0.96 \
+            nvidia-cuda-cccl==13.0.85 nvidia-nvvm==13.0.88 nvidia-cuda-crt==13.0.88 nvidia-nvtx==13.0.85
+          for w in wheels/*.whl; do python3 -m zipfile -e "$w" "$HOME/cuda-pip"; done
+          C="$HOME/cuda-pip/nvidia/cu13"
+          chmod +x "$C"/bin/* "$C"/nvvm/bin/*
+          ln -sf libcudart.so.13 "$C/lib/libcudart.so"
+          ln -sfn lib "$C/lib64"
+          mkdir -p "$C/nvvm/lib64" && ln -sf "$C/lib/libnvvm.so.4" "$C/nvvm/lib64/libnvvm.so"
+          echo "CUDA_ROOT=$C" >> "$GITHUB_ENV"
+      - name: Cache OpenFHE 1.6.1 (patched) and FIDESlib
+        id: cache-fides
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/openfhe-fides
+            ~/fideslib
+          key: fideslib-${{ env.FIDESLIB_COMMIT }}-openfhe-${{ env.OPENFHE_VERSION }}-cuda13.0-ubuntu-24.04
+      - name: Build patched OpenFHE and FIDESlib
+        if: steps.cache-fides.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/CAPS-UMU/FIDESlib.git fideslib-src
+          git -C fideslib-src checkout "$FIDESLIB_COMMIT"
+          git clone --depth 1 --branch "$OPENFHE_VERSION" https://github.com/openfheorg/openfhe-development.git openfhe-src
+          git -C openfhe-src apply ../fideslib-src/deps/fideslib-1.6.1-compile.patch
+          cmake -S openfhe-src -B openfhe-src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_STATIC=ON -DWITH_NATIVEOPT=OFF \
+            -DBUILD_UNITTESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARKS=OFF -DCMAKE_INSTALL_PREFIX=$HOME/openfhe-fides
+          cmake --build openfhe-src/build -j4
+          cmake --install openfhe-src/build
+          cmake -S fideslib-src -B fideslib-src/build -DCUDA_PATH=$CUDA_ROOT -DCUDAToolkit_ROOT=$CUDA_ROOT \
+            -DFIDESLIB_ARCH=80-real -DOPENFHE_INSTALL_PREFIX=$HOME/openfhe-fides -DFIDESLIB_INSTALL_PREFIX=$HOME/fideslib \
+            -DFIDESLIB_COMPILE_TESTS=OFF -DFIDESLIB_COMPILE_BENCHMARKS=OFF
+          cmake --build fideslib-src/build -j4
+          cmake --install fideslib-src/build
+      - name: Build
+        run: |
+          cmake -S . -B build -DFHEML_GPU=ON -DCUDAToolkit_ROOT=$CUDA_ROOT \
+            -DCMAKE_PREFIX_PATH="$HOME/openfhe-fides;$HOME/fideslib"
+          cmake --build build -j4
+      - name: Test (CPU fallback)
+        env:
+          PYTHONPATH: build/python
+        run: |
+          ./build/test_fheml --quick
+          python3 tests/test_python.py
+          python3 -c "import fheml; assert fheml.gpu_backend_built() and fheml.gpu_device_count() == 0"
