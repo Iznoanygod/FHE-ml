@@ -295,22 +295,24 @@ Ctxt Attention::forward(const FHEContext& ctx, const Ctxt& x) const {
   // token i to token (i + s) mod n for every i < n.
   cc->EvalAddInPlace(k, rot(k, -nd));
   cc->EvalAddInPlace(v, rot(v, -nd));
-  auto kd = cc->EvalFastRotationPrecompute(k);
-  auto vd = cc->EvalFastRotationPrecompute(v);
-  const uint32_t m = cc->GetCyclotomicOrder();
+  std::vector<int32_t> offs(n_);
+  for (int s = 0; s < n_; ++s) offs[s] = s * stride_;
+  const std::vector<Ctxt> kr = backend::rotate_hoisted(cc, k, offs, ctx.parallel());
+  const std::vector<Ctxt> vr = backend::rotate_hoisted(cc, v, offs, ctx.parallel());
 
   std::vector<Ctxt> partial(n_);
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
   for (int s = 0; s < n_; ++s) {
-    Ctxt ks = s ? cc->EvalFastRotation(k, static_cast<uint32_t>(s * stride_), m, kd) : k;
-    Ctxt vs = s ? cc->EvalFastRotation(v, static_cast<uint32_t>(s * stride_), m, vd) : v;
+    const Ctxt& ks = kr[s];
+    const Ctxt& vs = vr[s];
     // score[i] = q_i . k_{i+s}, accumulated into slot i*B (slots i*B+d ..
     // i*B+B-1 are zero, so summing a d-wide window is enough).
     Ctxt p = cc->EvalMult(q, ks);
     for (int t = 1; t < d_; t *= 2) cc->EvalAddInPlace(p, rot(p, t));
     // a = mask * (c2 p^2 + c1 p + c0): 2 levels, zero outside slots i*d.
     const uint32_t lvl = p->GetLevel() + (p->GetNoiseScaleDeg() > 1 ? 1 : 0);
-    Ctxt a = cc->EvalMult(p, ctx.encode(mask_c2_, lvl));
+    Ptxt c2 = ctx.encode(mask_c2_, lvl);
+    Ctxt a = cc->EvalMult(p, c2);
     Ptxt c1 = ctx.encode(mask_c1_, a->GetLevel(), a->GetNoiseScaleDeg());
     cc->EvalAddInPlace(a, c1);
     a = cc->EvalMult(p, a);
