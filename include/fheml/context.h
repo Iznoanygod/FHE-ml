@@ -29,6 +29,16 @@ struct ContextOptions {
   bool secure = true;
   bool bootstrapping = false;
   std::vector<uint32_t> level_budget = {3, 3};
+  // Rotation keys. 0: keygen() makes one key per rotation index it is given.
+  // w > 0: keygen() also makes a ladder of keys for +-j * 2^(w*i), 1 <= j <=
+  // 2^(w-1), and rotate() composes every other rotation from them, so the key
+  // set no longer grows with the network (2 log2(slots) keys for w = 1). A
+  // rotation then costs up to ceil(log2(slots) / w) key switches.
+  uint32_t rotation_window = 0;
+  // HYBRID key switching digits (OpenFHE numLargeDigits; 0 = OpenFHE's
+  // default). More digits: smaller auxiliary modulus, so a deeper network
+  // fits a given ring, but larger keys and slower key switching.
+  uint32_t key_switch_digits = 0;
 };
 
 class FHEContext {
@@ -51,6 +61,23 @@ class FHEContext {
 
   Ctxt bootstrap(const Ctxt& c) const;
 
+  // Rotates by k slots (any k): with the key for k directly, otherwise
+  // composed from the ladder keys (see ContextOptions::rotation_window).
+  Ctxt rotate(const Ctxt& c, int32_t k) const;
+  // rotate(c, k) for every k in ks. With a key per index the rotations share
+  // one hoisted decomposition; composed rotations reuse each other (each
+  // starts from the already rotated copy nearest to it).
+  std::vector<Ctxt> rotate_many(const Ctxt& c, const std::vector<int32_t>& ks) const;
+  bool has_rotation_key(int32_t k) const;
+  // Key switches rotate(c, k) performs (0 for k = 0).
+  uint32_t rotation_cost(int32_t k) const;
+  // The ladder's rotation indices for the given slot count and window.
+  static std::vector<int32_t> ladder_rotations(uint32_t slots, uint32_t window);
+  // Rotation (automorphism) keys held, including bootstrapping keys, and
+  // their size in memory.
+  size_t rotation_key_count() const;
+  size_t rotation_key_bytes() const;
+
   const CC& cc() const { return cc_; }
   uint32_t slots() const { return opts_.slots; }
   uint32_t ring_dim() const { return cc_->GetRingDimension(); }
@@ -63,6 +90,7 @@ class FHEContext {
   ContextOptions opts_;
   CC cc_;
   lbcrypto::KeyPair<lbcrypto::DCRTPoly> keys_;
+  std::vector<char> has_key_;  // per normalised rotation index
   uint32_t total_depth_ = 0;
   uint32_t boot_depth_ = 0;
 };

@@ -11,7 +11,8 @@
 //   affine C                                      followed by C scales, C shifts
 //   square
 //   poly N                                        followed by N coefficients c0..c{N-1}
-//   chebyshev FN A B DEGREE                       FN in relu|silu|gelu|sigmoid|tanh
+//   chebyshev FN A B DEGREE [scale IN OUT]        FN in relu|silu|gelu|sigmoid|tanh; computes OUT*FN(IN*x)
+//   scale C                                       followed by C per-channel factors (fixed, not trained)
 //   bootstrap
 //   tokendense N IN OUT NB                        followed by weights [OUT][IN], NB bias values (0, OUT or N*OUT)
 //   tokenmean N D
@@ -71,13 +72,40 @@ class Network {
   // Lowers every linear layer to a BSGS plan for `slots` (0 = required_slots()).
   void compile(uint32_t slots = 0);
 
+  // Automatic bootstrap placement: inserts Bootstrap layers so that no
+  // stretch of the network consumes more than `budget` levels, as late as
+  // possible (fewest bootstraps). Each bootstrap must see values in about
+  // [-1, 1], so the values entering it are divided by headroom * max|x| over
+  // the calibration inputs (plaintext runs), and multiplied back afterwards.
+  // The two scales are folded into neighbouring layers for free (weights and
+  // biases of linear layers, polynomial coefficients, Chebyshev intervals,
+  // through squares and bias-free linear layers); where that is impossible
+  // (residual, attention) a fixed Scale layer is inserted, which costs one
+  // level. Without calibration inputs the values are assumed to be in range
+  // already. Existing Bootstrap layers are kept. Returns the number of
+  // bootstraps inserted; the network must be compiled again.
+  size_t place_bootstraps(uint32_t budget, const std::vector<std::vector<double>>& calibration = {},
+                          double headroom = 1.5);
+  // Folds the interval map of every Chebyshev activation (one level) into the
+  // preceding linear layer's weights and bias: the activation then evaluates
+  // on [-1, 1] directly. Activations preceded by a layer that cannot take an
+  // affine map (no bias, pooling, residual) are left alone unless their
+  // interval is symmetric. Returns the number of activations folded.
+  size_t fold_activation_intervals();
+  // Largest per-stretch budget whose bootstrapping context (scale bits and
+  // level budget of `base`) still has a ring dimension of at most `max_ring`.
+  static uint32_t max_bootstrap_budget(ContextOptions base, uint32_t max_ring = 1u << 16);
+
   // Smallest power-of-two slot count that holds every activation.
   uint32_t required_slots() const;
   // Levels consumed by the whole network / by the longest stretch between bootstraps.
   uint32_t depth() const;
   uint32_t depth_between_bootstraps() const;
   bool uses_bootstrapping() const;
-  std::vector<int32_t> rotation_indices() const;
+  // Rotation keys to generate. ladder = true (the context has a rotation-key
+  // ladder, ContextOptions::rotation_window): only the rotations of layers
+  // that cannot compose them (attention); linear layers compose theirs.
+  std::vector<int32_t> rotation_indices(bool ladder = false) const;
 
   // Level to encrypt inputs at: with bootstrapping the first segment only
   // needs depth_before_first_bootstrap() levels, and OpenFHE only refreshes

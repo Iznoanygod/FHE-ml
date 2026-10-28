@@ -231,6 +231,28 @@ class ChannelAffine : public LinearLayer {
   std::vector<double> scale_, shift_;
 };
 
+// Fixed per-channel scale y = factor[c] * x, not trainable. Inserted by
+// Network::place_bootstraps() when a bootstrap's input scale cannot be folded
+// into a neighbouring layer.
+class Scale : public LinearLayer {
+ public:
+  explicit Scale(std::vector<double> factors);
+  std::string type() const override { return "scale"; }
+  std::string describe() const override;
+  Shape configure(const Shape& in) override;
+  SparseMatrix matrix() const override;
+  int gap_stride() const override { return 1; }
+  void save(std::ostream& os) const override;
+  void multiply(double f) {
+    for (double& x : factors_) x *= f;
+    invalidate();
+  }
+  const std::vector<double>& factors() const { return factors_; }
+
+ private:
+  std::vector<double> factors_;
+};
+
 // Product of consecutive linear layers, produced by Network::fuse_linear().
 class FusedLinear : public LinearLayer {
  public:
@@ -240,6 +262,8 @@ class FusedLinear : public LinearLayer {
   Shape configure(const Shape& in) override;
   SparseMatrix matrix() const override { return m_; }
   std::vector<double> bias() const override { return b_; }
+  // Multiplies the matrix by fm and the bias by fb.
+  void scale(double fm, double fb);
   void save(std::ostream& os) const override;
 
  private:
@@ -263,6 +287,8 @@ class Square : public Layer {
 class PolyActivation : public Layer {
  public:
   explicit PolyActivation(std::vector<double> coeffs);
+  // Rewrites the coefficients so the layer computes out * p(in * x).
+  void rescale(double in, double out);
   std::string type() const override { return "poly"; }
   std::string describe() const override;
   Shape configure(const Shape& in) override { return in_ = out_ = in; }
@@ -279,29 +305,51 @@ class PolyActivation : public Layer {
 // Chebyshev approximation of a named function (relu, silu, gelu, sigmoid,
 // tanh) on [a, b] with the given degree. Inputs outside [a, b] diverge, so the
 // range must cover the (calibrated) pre-activation values.
+//
+// The series approximates fn on [a, b] in t = (2x - a - b) / (b - a). The
+// layer can instead take t from a different evaluation interval [ea, eb]
+// (and multiply the result by out_scale): it then computes
+// out_scale * fn(a + (x - ea) (b - a) / (eb - ea)) for x in [ea, eb]. This
+// lets Network::place_bootstraps() fold a bootstrap's range scaling into the
+// activation for free, and Network::fold_activation_intervals() move the
+// interval map into the preceding linear layer, making [ea, eb] = [-1, 1]
+// and saving a level.
 class ChebyshevActivation : public Layer {
  public:
   ChebyshevActivation(std::string fn, double a, double b, uint32_t degree);
+  ChebyshevActivation(std::string fn, double a, double b, uint32_t degree, double eval_a, double eval_b,
+                      double out_scale);
   std::string type() const override { return "chebyshev"; }
   std::string describe() const override;
   Shape configure(const Shape& in) override { return in_ = out_ = in; }
   std::vector<double> forward_plain(const std::vector<double>& x) const override;
   Ctxt forward(const FHEContext& ctx, const Ctxt& x) const override;
   // OpenFHE maps [a, b] onto [-1, 1] first, which costs one extra level.
-  uint32_t depth() const override { return poly_depth(degree_) + (a_ == -1.0 && b_ == 1.0 ? 0 : 1); }
+  uint32_t depth() const override { return poly_depth(degree_) + (ea_ == -1.0 && eb_ == 1.0 ? 0 : 1); }
   void save(std::ostream& os) const override;
+  // Afterwards the layer computes out * f(in * x), f being what it computed before.
+  void rescale(double in, double out);
+  void set_evaluation_interval(double ea, double eb);
 
   static std::function<double(double)> function(const std::string& name);
-  // Series c0/2 + sum_k c_k T_k(t), t = (2x - a - b) / (b - a) (OpenFHE convention).
+  // Series c0/2 + sum_k c_k T_k(t), t = (2x - a - b) / (b - a) (OpenFHE
+  // convention) for the evaluation interval [a(), b()], out_scale included.
   const std::vector<double>& coeffs() const { return coeffs_; }
-  double a() const { return a_; }
-  double b() const { return b_; }
+  double a() const { return ea_; }
+  double b() const { return eb_; }
+  double approx_a() const { return a_; }
+  double approx_b() const { return b_; }
+  const std::string& function_name() const { return fn_name_; }
+  uint32_t degree() const { return degree_; }
+  double out_scale() const { return out_scale_; }
 
  private:
   std::string fn_name_;
   std::function<double(double)> fn_;
-  double a_, b_;
+  double a_, b_;    // approximation interval of fn
   uint32_t degree_;
+  double ea_, eb_;  // evaluation interval
+  double out_scale_;
   std::vector<double> coeffs_;
 };
 

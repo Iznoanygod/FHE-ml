@@ -390,6 +390,36 @@ void ChannelAffine::save(std::ostream& os) const {
   write_vec(os, shift_);
 }
 
+// ----------------------------------------------------------------------- Scale
+
+Scale::Scale(std::vector<double> factors) : factors_(std::move(factors)) {
+  if (factors_.empty()) throw std::invalid_argument("scale: no factors");
+}
+
+std::string Scale::describe() const {
+  std::ostringstream os;
+  os << "scale " << std::setprecision(4) << factors_[0];
+  if (factors_.size() > 1) os << "..";
+  return os.str() + LinearLayer::describe();
+}
+
+Shape Scale::configure(const Shape& in) {
+  if (static_cast<size_t>(in.c) != factors_.size()) throw std::invalid_argument("scale: channel mismatch");
+  return in_ = out_ = in;
+}
+
+SparseMatrix Scale::matrix() const {
+  SparseMatrix m(in_.size(), in_.size());
+  const size_t hw = static_cast<size_t>(in_.h) * in_.w;
+  for (size_t i = 0; i < in_.size(); ++i) m.add(i, i, factors_[i / hw]);
+  return m;
+}
+
+void Scale::save(std::ostream& os) const {
+  os << "scale " << factors_.size() << "\n";
+  write_vec(os, factors_);
+}
+
 // ----------------------------------------------------------------- FusedLinear
 
 FusedLinear::FusedLinear(Shape in, Shape out, SparseMatrix m, std::vector<double> b, std::string what)
@@ -404,6 +434,15 @@ Shape FusedLinear::configure(const Shape& in) {
   if (in.size() != in_.size()) throw std::invalid_argument("fused: input size mismatch");
   in_ = in;
   return out_;
+}
+
+void FusedLinear::scale(double fm, double fb) {
+  SparseMatrix m(m_.rows(), m_.cols());
+  for (size_t r = 0; r < m_.rows(); ++r)
+    for (const auto& e : m_.row(r)) m.add(r, e.first, e.second * fm);
+  m_ = std::move(m);
+  for (double& x : b_) x *= fb;
+  invalidate();
 }
 
 void FusedLinear::save(std::ostream&) const {
@@ -445,6 +484,14 @@ std::vector<double> PolyActivation::forward_plain(const std::vector<double>& x) 
   return y;
 }
 
+void PolyActivation::rescale(double in, double out) {
+  double pw = 1.0;
+  for (double& c : c_) {
+    c *= out * pw;
+    pw *= in;
+  }
+}
+
 uint32_t PolyActivation::depth() const {
   const size_t deg = c_.size() - 1;
   if (deg == 2 && c_[2] == 1.0) return 1;
@@ -480,30 +527,68 @@ std::function<double(double)> ChebyshevActivation::function(const std::string& n
 }
 
 ChebyshevActivation::ChebyshevActivation(std::string fn, double a, double b, uint32_t degree)
-    : fn_name_(std::move(fn)), fn_(function(fn_name_)), a_(a), b_(b), degree_(degree) {
-  if (!(a < b)) throw std::invalid_argument("chebyshev: need a < b");
+    : ChebyshevActivation(std::move(fn), a, b, degree, a, b, 1.0) {}
+
+ChebyshevActivation::ChebyshevActivation(std::string fn, double a, double b, uint32_t degree, double eval_a,
+                                         double eval_b, double out_scale)
+    : fn_name_(std::move(fn)), fn_(function(fn_name_)), a_(a), b_(b), degree_(degree), ea_(eval_a), eb_(eval_b),
+      out_scale_(out_scale) {
+  if (!(a < b) || !(eval_a < eval_b)) throw std::invalid_argument("chebyshev: need a < b");
   coeffs_ = lbcrypto::EvalChebyshevCoefficients(fn_, a_, b_, degree_);
+  for (double& c : coeffs_) c *= out_scale_;
+}
+
+void ChebyshevActivation::rescale(double in, double out) {
+  if (in == 0.0) throw std::invalid_argument("chebyshev: zero input scale");
+  // T_k(-t) = (-1)^k T_k(t): a negative scale flips the interval and the odd terms.
+  if (in < 0) {
+    std::swap(a_, b_);
+    a_ = -a_;
+    b_ = -b_;
+    fn_ = [f = fn_](double x) { return f(-x); };
+    in = -in;
+  }
+  ea_ /= in;
+  eb_ /= in;
+  out_scale_ *= out;
+  coeffs_ = lbcrypto::EvalChebyshevCoefficients(fn_, a_, b_, degree_);
+  for (double& c : coeffs_) c *= out_scale_;
+}
+
+void ChebyshevActivation::set_evaluation_interval(double ea, double eb) {
+  if (!(ea < eb)) throw std::invalid_argument("chebyshev: need a < b");
+  ea_ = ea;
+  eb_ = eb;
 }
 
 std::string ChebyshevActivation::describe() const {
   std::ostringstream os;
   os << "chebyshev " << fn_name_ << " on [" << a_ << ", " << b_ << "] degree " << degree_;
+  if (ea_ != a_ || eb_ != b_) os << " evaluated on [" << ea_ << ", " << eb_ << "]";
+  if (out_scale_ != 1.0) os << " x " << out_scale_;
   return os.str();
 }
 
 std::vector<double> ChebyshevActivation::forward_plain(const std::vector<double>& x) const {
   // The reference uses the same approximation the encrypted path evaluates,
   // so plain-vs-encrypted comparisons isolate the CKKS error.
-  return lbcrypto::EvalChebyshevFunctionPtxt(fn_, x, a_, b_, degree_);
+  std::vector<double> y(x);
+  if (ea_ != a_ || eb_ != b_)
+    for (double& v : y) v = a_ + (v - ea_) * (b_ - a_) / (eb_ - ea_);
+  y = lbcrypto::EvalChebyshevFunctionPtxt(fn_, y, a_, b_, degree_);
+  for (double& v : y) v *= out_scale_;
+  return y;
 }
 
 Ctxt ChebyshevActivation::forward(const FHEContext& ctx, const Ctxt& x) const {
-  return ctx.cc()->EvalChebyshevSeries(x, coeffs_, a_, b_);
+  return ctx.cc()->EvalChebyshevSeries(x, coeffs_, ea_, eb_);
 }
 
 void ChebyshevActivation::save(std::ostream& os) const {
   os << std::setprecision(std::numeric_limits<double>::max_digits10) << "chebyshev " << fn_name_ << " " << a_ << " "
-     << b_ << " " << degree_ << "\n";
+     << b_ << " " << degree_;
+  if (ea_ != a_ || eb_ != b_ || out_scale_ != 1.0) os << " map " << ea_ << " " << eb_ << " " << out_scale_;
+  os << "\n";
 }
 
 void Bootstrap::save(std::ostream& os) const { os << "bootstrap\n"; }

@@ -42,7 +42,9 @@ PYBIND11_MODULE(_fheml, m) {
       .def_readwrite("ring_dim", &ContextOptions::ring_dim)
       .def_readwrite("secure", &ContextOptions::secure)
       .def_readwrite("bootstrapping", &ContextOptions::bootstrapping)
-      .def_readwrite("level_budget", &ContextOptions::level_budget);
+      .def_readwrite("level_budget", &ContextOptions::level_budget)
+      .def_readwrite("rotation_window", &ContextOptions::rotation_window)
+      .def_readwrite("key_switch_digits", &ContextOptions::key_switch_digits);
 
   py::class_<Ciphertext>(m, "Ciphertext").def_property_readonly("level", &Ciphertext::level);
 
@@ -58,6 +60,10 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("slots", &FHEContext::slots)
       .def_property_readonly("ring_dim", &FHEContext::ring_dim)
       .def_property_readonly("total_depth", &FHEContext::total_depth)
+      .def_property_readonly("rotation_key_count", &FHEContext::rotation_key_count)
+      .def_property_readonly("rotation_key_bytes", &FHEContext::rotation_key_bytes)
+      .def("has_rotation_key", &FHEContext::has_rotation_key, py::arg("k"))
+      .def("rotation_cost", &FHEContext::rotation_cost, py::arg("k"))
       .def("describe", &FHEContext::describe)
       .def_static("ring_dim_for", &FHEContext::ring_dim_for, py::arg("options"));
 
@@ -84,6 +90,7 @@ PYBIND11_MODULE(_fheml, m) {
       .def(py::init<int, int>(), py::arg("k"), py::arg("stride"));
   py::class_<ChannelAffine, LinearLayer, std::shared_ptr<ChannelAffine>>(m, "ChannelAffine")
       .def(py::init<Vec, Vec>(), py::arg("scale"), py::arg("shift"));
+  py::class_<Scale, LinearLayer, std::shared_ptr<Scale>>(m, "Scale").def(py::init<Vec>(), py::arg("factors"));
   py::class_<TokenDense, LinearLayer, std::shared_ptr<TokenDense>>(m, "TokenDense")
       .def(py::init<int, int, int, Vec, Vec>(), py::arg("tokens"), py::arg("inputs"), py::arg("outputs"),
            py::arg("weights"), py::arg("bias") = Vec{});
@@ -94,7 +101,9 @@ PYBIND11_MODULE(_fheml, m) {
       .def(py::init<Vec>(), py::arg("coeffs"));
   py::class_<ChebyshevActivation, Layer, std::shared_ptr<ChebyshevActivation>>(m, "Chebyshev")
       .def(py::init<std::string, double, double, uint32_t>(), py::arg("fn"), py::arg("a"), py::arg("b"),
-           py::arg("degree"));
+           py::arg("degree"))
+      .def(py::init<std::string, double, double, uint32_t, double, double, double>(), py::arg("fn"), py::arg("a"),
+           py::arg("b"), py::arg("degree"), py::arg("eval_a"), py::arg("eval_b"), py::arg("out_scale") = 1.0);
   py::class_<Bootstrap, Layer, std::shared_ptr<Bootstrap>>(m, "Bootstrap").def(py::init<>());
   py::class_<Residual, Layer, std::shared_ptr<Residual>>(m, "Residual")
       .def(py::init<std::vector<LayerPtr>>(), py::arg("body"));
@@ -111,6 +120,14 @@ PYBIND11_MODULE(_fheml, m) {
           "add", [](Network& n, LayerPtr l) -> Network& { return n.add(std::move(l)); }, py::arg("layer"),
           py::return_value_policy::reference_internal)
       .def("fuse_linear", &Network::fuse_linear)
+      .def("place_bootstraps", &Network::place_bootstraps, py::arg("budget"),
+           py::arg("calibration") = std::vector<std::vector<double>>{}, py::arg("headroom") = 1.5,
+           "Insert bootstraps so no stretch exceeds `budget` levels; compile() again afterwards.")
+      .def("fold_activation_intervals", &Network::fold_activation_intervals)
+      .def_static("max_bootstrap_budget", &Network::max_bootstrap_budget, py::arg("base"),
+                  py::arg("max_ring") = 1u << 16)
+      .def_property_readonly("depth_between_bootstraps", &Network::depth_between_bootstraps)
+      .def_property_readonly("uses_bootstrapping", &Network::uses_bootstrapping)
       .def("compile", &Network::compile, py::arg("slots") = 0, py::call_guard<py::gil_scoped_release>())
       .def("set_gapped_layouts", &Network::set_gapped_layouts)
       .def("set_cache_plaintexts", &Network::set_cache_plaintexts)
@@ -120,21 +137,32 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("output_shape", &Network::output_shape)
       .def_property_readonly("layers", &Network::layers)
       .def("required_slots", &Network::required_slots)
-      .def("rotation_indices", &Network::rotation_indices)
+      .def("rotation_indices", &Network::rotation_indices, py::arg("ladder") = false)
       .def("context_options", &Network::context_options, py::arg("secure") = true)
       .def("input_level", &Network::input_level, py::arg("ctx"))
       .def("summary", &Network::summary)
       .def("forward_plain", &Network::forward_plain, py::arg("x"), py::call_guard<py::gil_scoped_release>())
       .def(
           "forward",
-          [](const Network& n, const FHEContext& ctx, const Ciphertext& x) {
+          [](const Network& n, const FHEContext& ctx, const Ciphertext& x, const py::object& hook) {
+            Network::LayerHook h;
+            if (!hook.is_none())
+              h = [&](size_t i, const Layer& l, const Ctxt& c, double secs) {
+                py::gil_scoped_acquire acquire;
+                hook(i, l.describe(), Ciphertext{c}, secs);
+              };
             py::gil_scoped_release release;
-            return Ciphertext{n.forward(ctx, x.ct)};
+            return Ciphertext{n.forward(ctx, x.ct, h)};
           },
-          py::arg("ctx"), py::arg("x"))
+          py::arg("ctx"), py::arg("x"), py::arg("hook") = py::none(),
+          "hook(index, description, ciphertext, seconds) is called after every layer.")
       .def(
           "decrypt_output", [](const Network& n, const FHEContext& ctx, const Ciphertext& y) { return n.decrypt_output(ctx, y.ct); },
           py::arg("ctx"), py::arg("y"))
+      .def(
+          "decrypt_layer",
+          [](const Network& n, const FHEContext& ctx, const Ciphertext& y, size_t i) { return n.decrypt_layer(ctx, y.ct, i); },
+          py::arg("ctx"), py::arg("y"), py::arg("layer"), "Decrypts the output of layer i (e.g. from a forward hook).")
       .def("encrypt_weights", &Network::encrypt_weights, py::arg("ctx"), py::arg("drop_plaintext") = true,
            py::call_guard<py::gil_scoped_release>());
 
@@ -145,9 +173,9 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("weight_ciphertexts", &Trainer::weight_ciphertexts)
       .def_property_readonly("first_trained_layer", &Trainer::first_trained_layer)
       .def_property_readonly("weight_level", &Trainer::weight_level)
-      .def("rotation_indices", &Trainer::rotation_indices)
+      .def("rotation_indices", &Trainer::rotation_indices, py::arg("ladder") = false)
       .def("context_options", &Trainer::context_options, py::arg("secure") = true, py::arg("bootstrapping") = true,
-           py::arg("updates") = 1)
+           py::arg("updates") = 1, py::arg("rotation_window") = 0)
       .def("encrypt_weights", &Trainer::encrypt_weights, py::arg("ctx"), py::call_guard<py::gil_scoped_release>())
       .def(
           "encrypt_input",

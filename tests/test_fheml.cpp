@@ -329,12 +329,175 @@ void encrypted_tests(bool quick) {
   }
 }
 
+// Rotations composed from a ladder of keys (ContextOptions::rotation_window).
+void ladder_tests() {
+  for (uint32_t window : {1u, 3u}) {
+    ContextOptions o;
+    o.mult_depth = 1;
+    o.slots = 512;
+    o.secure = false;
+    o.ring_dim = 2048;
+    o.rotation_window = window;
+    FHEContext ctx(o);
+    ctx.keygen({});  // no direct keys: everything is composed
+    const size_t expect = FHEContext::ladder_rotations(o.slots, window).size();
+    check(ctx.rotation_key_count() == expect,
+          "ladder window " + std::to_string(window) + " has " + std::to_string(expect) + " keys",
+          "(" + std::to_string(ctx.rotation_key_bytes() / 1024) + " KB)");
+    auto x = rand_vec(o.slots);
+    Ctxt c = ctx.encrypt(x);
+    double err = 0;
+    uint32_t cost = 0;
+    for (int32_t k : {1, -1, 3, 7, 29, -28, 100, 255, -255, 256, 257, 511, 300}) {
+      auto got = ctx.decrypt(ctx.rotate(c, k), o.slots);
+      for (uint32_t i = 0; i < o.slots; ++i) err = std::max(err, std::fabs(got[i] - x[(i + k + 4 * o.slots) % o.slots]));
+      cost = std::max(cost, ctx.rotation_cost(k));
+    }
+    check_err("ladder rotations window " + std::to_string(window), err, 1e-6);
+    check(cost <= (9 + window - 1) / window, "ladder window " + std::to_string(window) + " cost bound",
+          "(max " + std::to_string(cost) + " key switches)");
+  }
+}
+
+// Automatic bootstrap placement and interval folding.
+void placement_tests(bool quick) {
+  // A CNN whose activations grow well beyond [-1, 1]: conv, square, pool,
+  // dense, chebyshev, dense, poly, dense (depth 1+1+1+1+(3+1)+1+2+1 = 12).
+  const std::vector<double> w1 = rand_vec(18, -0.5, 0.5), b1 = rand_vec(2, -0.2, 0.2), w2 = rand_vec(384, -0.5, 0.5),
+                            b2 = rand_vec(12, -0.5, 0.5), w3 = rand_vec(96, -0.6, 0.6), b3 = rand_vec(8, -0.3, 0.3),
+                            w4 = rand_vec(24, -0.5, 0.5), b4 = rand_vec(3);
+  auto make = [&] {
+    Network n(Shape{1, 8, 8});
+    n.emplace<Conv2d>(1, 2, 3, 3, 1, 1, w1, b1)
+        .emplace<Square>()
+        .emplace<AvgPool2d>(2, 2)
+        .emplace<Dense>(32, 12, w2, b2)
+        .emplace<ChebyshevActivation>("relu", -6.0, 6.0, 7)
+        .emplace<Dense>(12, 8, w3, b3)
+        .emplace<PolyActivation>(std::vector<double>{0.1, 0.5, 0.25})
+        .emplace<Dense>(8, 3, w4, b4);
+    return n;
+  };
+  std::vector<std::vector<double>> calib;
+  for (int i = 0; i < 8; ++i) calib.push_back(rand_vec(64, -2.0, 2.0));
+  Network ref = make();
+  ref.compile();
+  const uint32_t depth0 = ref.depth();
+  double big = 0;
+  for (const auto& x : calib)
+    for (double v : ref.forward_plain(x)) big = std::max(big, std::fabs(v));
+  check(big > 1.0, "placement test network has large activations", "(max output " + std::to_string(big) + ")");
+
+  for (uint32_t budget : {5u, 6u, 8u}) {
+    Network n = make();
+    size_t k = n.place_bootstraps(budget, calib);
+    n.compile();
+    std::string tag = "budget " + std::to_string(budget);
+    check(k > 0 && n.uses_bootstrapping(), "place_bootstraps " + tag + " inserted " + std::to_string(k));
+    check(n.depth_between_bootstraps() <= budget, "place_bootstraps " + tag + " respects the budget",
+          "(" + std::to_string(n.depth_between_bootstraps()) + ")");
+    // Scaling is folded exactly: the plaintext function is unchanged.
+    double err = 0, range = 0;
+    for (const auto& x : calib) {
+      err = std::max(err, max_err(ref.forward_plain(x), n.forward_plain(x), 3));
+      // Every bootstrap sees values within [-1, 1] (calibration inputs).
+      std::vector<double> v = x;
+      for (const auto& l : n.layers()) {
+        if (l->is_bootstrap())
+          for (double y : v) range = std::max(range, std::fabs(y));
+        v = l->forward_plain(v);
+      }
+    }
+    check_err("place_bootstraps " + tag + " keeps the function", err, 1e-9);
+    check(range <= 1.0, "place_bootstraps " + tag + " bootstrap inputs within [-1, 1]", "(max " + std::to_string(range) + ")");
+    // Round-trips through the model file (scaled chebyshev, scale layers).
+    n.save("/tmp/fheml_placement_test.fheml");
+    Network back = Network::load("/tmp/fheml_placement_test.fheml");
+    back.compile();
+    check_err("place_bootstraps " + tag + " save/load", max_err(ref.forward_plain(calib[0]), back.forward_plain(calib[0]), 3), 1e-9);
+    std::printf("  %s\n", n.summary().c_str());
+  }
+  {
+    // One fewer level: the chebyshev interval map goes into the dense layer.
+    Network n = make();
+    size_t f = n.fold_activation_intervals();
+    n.compile();
+    check(f == 1 && n.depth() == depth0 - 1, "fold_activation_intervals saves a level",
+          "(folded " + std::to_string(f) + ", depth " + std::to_string(n.depth()) + " vs " + std::to_string(depth0) + ")");
+    check_err("fold_activation_intervals keeps the function", max_err(ref.forward_plain(calib[1]), n.forward_plain(calib[1]), 3),
+              1e-9);
+    if (!quick) {
+      // Then bootstraps every 6 levels; encrypted on an insecure toy ring,
+      // with a composed-rotation ladder, inputs in the calibrated range.
+      size_t k = n.place_bootstraps(6, calib);
+      n.compile();
+      check(k == 2, "place_bootstraps after folding", "(" + std::to_string(k) + " bootstraps)");
+      auto opts = n.context_options(false);
+      opts.ring_dim = 4096;
+      opts.rotation_window = 1;
+      FHEContext ctx(opts);
+      ctx.keygen(n.rotation_indices(true));
+      auto x = rand_vec(64, -2.0, 2.0);
+      Ctxt c = ctx.encrypt(x, n.input_level(ctx));
+      auto got = n.decrypt_output(ctx, n.forward(ctx, c));
+      check_err("encrypted auto-bootstrapped cnn (ladder keys)", max_err(ref.forward_plain(x), got, 3), 2e-2);
+      std::printf("  %s\n", ctx.describe().c_str());
+    }
+  }
+  {
+    // Residual blocks cannot absorb a scale: Scale layers are inserted, and
+    // they must be budgeted.
+    const int t = 3, d = 4;
+    std::vector<std::vector<double>> w;
+    for (int i = 0; i < 4; ++i) {
+      w.push_back(rand_vec(32, -0.8, 0.8));
+      w.push_back(rand_vec(i % 2 ? d : 8, -0.5, 0.5));
+    }
+    const std::vector<double> w0 = rand_vec(20, -0.9, 0.9), b0 = rand_vec(t * d, -0.5, 0.5), wd = rand_vec(8, -0.5, 0.5),
+                              bd = rand_vec(2);
+    auto make_res = [&] {
+      Network n(Shape{t, 1, 5});
+      n.emplace<TokenDense>(t, 5, d, w0, b0);
+      for (int blk = 0; blk < 2; ++blk)
+        n.add(std::make_shared<Residual>(std::vector<std::shared_ptr<Layer>>{
+            std::make_shared<TokenDense>(t, d, 8, w[4 * blk], w[4 * blk + 1]), std::make_shared<Square>(),
+            std::make_shared<TokenDense>(t, 8, d, w[4 * blk + 2], w[4 * blk + 3])}));
+      n.emplace<TokenMean>(t, d).emplace<Dense>(d, 2, wd, bd);
+      return n;
+    };
+    std::vector<std::vector<double>> cal;
+    for (int i = 0; i < 6; ++i) cal.push_back(rand_vec(15, -2.0, 2.0));
+    Network n = make_res(), r2 = make_res();
+    // Budget 4 cannot hold a residual block (3) plus the Scale layers around
+    // it; the planner must say so instead of looping or overflowing.
+    bool threw = false;
+    try {
+      Network n4 = make_res();
+      n4.place_bootstraps(4, cal);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    check(threw, "place_bootstraps rejects a budget the scale layers cannot fit");
+    size_t k = n.place_bootstraps(5, cal);
+    n.compile();
+    size_t scales = 0;
+    for (const auto& l : n.layers()) scales += l->type() == "scale";
+    check(k >= 1 && scales >= 1, "place_bootstraps residual inserts scale layers",
+          "(" + std::to_string(k) + " bootstraps, " + std::to_string(scales) + " scale layers)");
+    check(n.depth_between_bootstraps() <= 5, "place_bootstraps residual respects the budget");
+    check_err("place_bootstraps residual keeps the function", max_err(r2.forward_plain(cal[0]), n.forward_plain(cal[0]), 2), 1e-9);
+    std::printf("  %s\n", n.summary().c_str());
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   bool quick = argc > 1 && std::strcmp(argv[1], "--quick") == 0;
   cleartext_tests();
+  ladder_tests();
+  placement_tests(quick);
   encrypted_tests(quick);
   transformer_tests();
   std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");

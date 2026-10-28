@@ -50,10 +50,18 @@ class Trainer {
   // Levels one training step (frozen prefix, forward, backward and update)
   // consumes, counted from the weights' level.
   uint32_t step_depth() const;
-  std::vector<int32_t> rotation_indices() const;
+  // Rotation keys to generate. ladder = false: one key per rotation the step
+  // uses (every diagonal offset and its negative, the rotate-and-sum steps),
+  // which is heavy at 128-bit security. ladder = true: only the hoisted
+  // rotations of the frozen prefix; everything else is composed from the
+  // context's rotation-key ladder (set ContextOptions::rotation_window).
+  std::vector<int32_t> rotation_indices(bool ladder = false) const;
   // CKKS parameters for training. Without bootstrapping, `updates` SGD
   // updates fit before the weights run out of levels.
-  ContextOptions context_options(bool secure = true, bool bootstrapping = true, uint32_t updates = 1) const;
+  // With rotation_window > 0 the context uses a rotation-key ladder (see
+  // rotation_indices(true)).
+  ContextOptions context_options(bool secure = true, bool bootstrapping = true, uint32_t updates = 1,
+                                 uint32_t rotation_window = 0) const;
 
   // Encrypts the network's current weights under ctx's public key.
   void encrypt_weights(const FHEContext& ctx);
