@@ -97,6 +97,8 @@ def main():
     ap.add_argument("--ring", type=int, help="ring dimension override (insecure runs; bootstrapping precision grows with it)")
     ap.add_argument("--digits", type=int, default=0, help="HYBRID key-switching digits (0 = OpenFHE default; 4 fits "
                     "two more levels in ring 2^16 for 25%% larger keys)")
+    ap.add_argument("--level-budget", type=int, default=2, help="bootstrap level budget {b,b}: 2 costs 18 levels and 69 "
+                    "bootstrapping keys at 256 slots, 3 costs 20 levels and 45 keys (use 3 with --digits 4)")
     ap.add_argument("--data", default="data")
     ap.add_argument("--epochs", type=int, help="default: 3 (cnn), 15 (vit)")
     ap.add_argument("--out", help="also save the exported model here (.fheml)")
@@ -139,7 +141,8 @@ def main():
     if args.arch == "deepcnn":
         net.set_gapped_layouts(False)  # compact activations: fewer slots, so fewer bootstrapping keys
     if args.bootstrap:
-        level_budget = [2, 2]  # bootstrap depth 18 instead of 20: 5 levels per stretch at ring 2^16 (6 with --digits 4)
+        # Levels per stretch at ring 2^16 and 50 bits: 5 with {2,2}, 3 with {3,3}, two more with --digits 4.
+        level_budget = [args.level_budget, args.level_budget]
         calib = xtr[:args.calibration].double().numpy()
         net.compile()
         check_ranges(net, calib)

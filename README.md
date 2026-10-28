@@ -357,8 +357,9 @@ handles both:
    linear layer's weights and bias, saving one level per activation.
 2. `place_bootstraps(budget, calibration)`: bootstraps go in as late as
    possible so that no stretch exceeds `budget` levels (the most that keeps
-   the ring at 2^16: 5 with level budget {2,2}, 6 with
-   `key_switch_digits=4`). The calibration inputs are run in the clear, the
+   the ring at 2^16: 3 with level budget {3,3} and 5 with {2,2} at 50-bit
+   scaling, two more with `key_switch_digits=4`). The calibration inputs
+   are run in the clear, the
    values entering each bootstrap are divided by `1.5 × max|x|`, and that
    scale is folded into the neighbouring layers for free (weights,
    polynomial coefficients, Chebyshev intervals, through squares and
@@ -366,14 +367,30 @@ handles both:
    which costs a level the planner budgets.
 
 `examples/python/train_torch_mnist.py --arch deepcnn --bootstrap` trains a
-four-block CNN with Chebyshev ReLUs (29 levels, 25 after folding) in PyTorch
-and runs it encrypted at ring 2^16 with the ladder keys:
+CNN with three conv blocks, a 32-unit dense block and Chebyshev ReLUs (30
+levels, 25 after folding; 97.6% on MNIST at 14x14) in PyTorch and runs it
+encrypted with the ladder keys:
 
 ```sh
-PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch deepcnn --bootstrap --window 1 --n 3
+PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch deepcnn --bootstrap --window 1 --level-budget 3 --digits 4 --n 3
 ```
 
-DEEP_NUMBERS_PLACEHOLDER
+Measured at 128-bit security on 4 cores (ring 2^16, 256 slots, level budget
+{3,3}, `key_switch_digits=4` for 26 levels, 50-bit scaling):
+
+| | |
+| --- | --- |
+| Bootstraps placed | 8, at most 5 levels between them (budget 5) |
+| Rotation keys | 47 (6.2 GB): 32 bootstrapping keys plus the 15-key ladder, no per-layer keys |
+| Process peak | 9.9 GB (context, keys and setup 28 s) |
+| Time per image | 147 s, of which 8 bootstraps take 134 s (16-17 s each) |
+| Accuracy | both test images classified like the plaintext model; logits within 0.28 of plaintext (logit range 8) |
+
+Each bootstrap adds about 1e-2 of error to values in [-1, 1] at these
+parameters (50-bit scaling is the largest that fits; a 55-bit first modulus
+instead of 57 changes nothing), so eight of them leave the logits 3% off.
+That is the precision budget for deeper networks at ring 2^16; a larger
+ring buys 55-bit scaling and far better bootstraps at twice the memory.
 
 The same bootstraps work inside encrypted training: the trainer bootstraps
 the activation on the way forward and the gradient on the way back.

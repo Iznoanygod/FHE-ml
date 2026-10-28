@@ -235,8 +235,11 @@ that.
   - Bootstrapping keys are rotation keys too and depend on the slot count:
     at ring 2^16 with level budget {3,3}, 45 keys for 256 slots, 75 for 1024,
     96 for 4096 (4.7, 7.6 and 9.7 GB), measured here. A bootstrap takes
-    18-22 s on 4 cores at any of these slot counts; its error is about
-    1e-10 at 50 bits.
+    16-22 s on 4 cores at any of these slot counts. Inside a network it
+    adds about 1e-2 of error to values in [-1, 1] at 50-bit scaling (the
+    deep CNN example: 8 bootstraps, logits 3% off plaintext, classes
+    unchanged); 55 bits would be far more precise but leaves only 20
+    levels at ring 2^16.
 
 ### Rotation-key ladder
 
@@ -288,9 +291,15 @@ depends on `budget + bootstrap depth` only, not on the network's depth.
 - **Budget.** `Network::max_bootstrap_budget(options, max_ring)` gives the
   largest stretch that keeps the bootstrapping context at `max_ring`. With
   uniform ternary secrets the bootstrap itself costs 20 levels (level budget
-  {3,3}) or 18 ({2,2}); at ring 2^16, 128-bit and 50-bit scaling that leaves
-  4 or 6 levels per stretch. A degree-15 Chebyshev ReLU with its interval
-  folded costs 5, so a conv + ReLU block fits a stretch of 6 with {2,2}.
+  {3,3}) or 18 ({2,2}) plus the spare level `EvalBootstrap` wants at its
+  input; at ring 2^16, 128-bit and 50-bit scaling (24 levels) that leaves 3
+  or 5 levels per stretch, and 5 or 7 with `key_switch_digits = 4` (26
+  levels). A degree-15 Chebyshev ReLU with its interval folded costs 5, so
+  a conv + ReLU block fits a stretch of 6; the deep CNN example gets by with
+  5 because the conv's level is spent before the bootstrap that precedes
+  each ReLU. 45-bit scaling would give more levels, but at 256 slots its
+  bootstrap error was 7e-2 here (first modulus 52), unusable, so 50 bits is
+  the floor.
   `fheml.auto_bootstrap(net, calibration)` does all three steps in Python.
 - Training through placed bootstraps works: the trainer bootstraps the
   activation forward and the gradient backward (`tests/test_train.cpp`).
