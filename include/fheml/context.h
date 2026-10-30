@@ -104,6 +104,10 @@ class FHEContext {
   // result is a fresh CKKS ciphertext at level compare_depth() whatever the
   // inputs' levels, which only need two levels left.
   Ctxt compare(const Ctxt& a, const Ctxt& b, double range = 1.0) const;
+  // Sign test [x > 0] per slot for |x| <= range: compare(0, x) with the
+  // FHEW scaling set for a difference of at most range (not 2 range), so
+  // small values are resolved twice as finely as by compare().
+  Ctxt positive(const Ctxt& x, double range = 1.0) const;
   // Levels of a compare() result, i.e. what OpenFHE's FHEW-to-CKKS decoding
   // consumes (constant for the parameter sets used here).
   static uint32_t compare_depth() { return 12; }

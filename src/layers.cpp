@@ -23,6 +23,13 @@ size_t Layout::slot(const Shape& s, size_t logical) const {
   return slot(logical / hw, (logical % hw) / s.w, logical % s.w);
 }
 
+size_t Layout::span(const Shape& s) const {
+  // With multiplexing the last channel need not have the highest offset.
+  size_t hi = 0;
+  for (size_t c = 0; c < static_cast<size_t>(s.c); ++c) hi = std::max(hi, channel_offset(c));
+  return hi + (s.h - 1) * ys + (s.w - 1) * xs + 1;
+}
+
 uint32_t poly_depth(uint32_t degree) {
   // Levels consumed by OpenFHE v1.4 EvalPoly / EvalChebyshevSeries on [-1, 1]
   // (Paterson-Stockmeyer), measured; tests/test_fheml.cpp re-checks them.
@@ -57,22 +64,101 @@ void split(const std::vector<double>& p, std::vector<double>& w, std::vector<dou
 
 // ----------------------------------------------------------------- LinearLayer
 
-Layout LinearLayer::configure_layout(const Layout& in, bool gapped) {
+namespace {
+
+// True when no two elements of shape s share a slot under layout l.
+bool injective(const Layout& l, const Shape& s) {
+  std::vector<char> used(l.span(s), 0);
+  for (size_t i = 0; i < s.size(); ++i) {
+    size_t sl = l.slot(s, i);
+    if (used[sl]) return false;
+    used[sl] = 1;
+  }
+  return true;
+}
+
+// Multiplexed layout for the output (shape out) of a stride-s layer reading
+// layout in: the output grid is s times coarser than the input's, and the
+// gaps to the fine grid (in.fy, in.fx) hold other channels. The block stride
+// grows past in.cs when the output rows overhang the input block (padding).
+// Returns false when the gaps are not square or the layout would collide.
+bool multiplexed_layout(const Layout& in, const Shape& out, size_t s, Layout& res) {
+  if (!in.fy || !in.fx) return false;
+  const size_t ys = in.ys * s, xs = in.xs * s;
+  if (ys % in.fy || xs % in.fx || ys / in.fy != xs / in.fx) return false;
+  const size_t m = ys / in.fy;
+  if (m < 2) return false;
+  Layout l{0, ys, xs, m, in.fy, in.fx};
+  Shape block{static_cast<int>(std::min<size_t>(m * m, static_cast<size_t>(out.c))), out.h, out.w};
+  l.cs = std::max(in.cs, l.span(block));
+  if (!injective(l, out)) return false;
+  res = l;
+  return true;
+}
+
+// Estimated cost of a linear layer whose matrix m maps layout il to ol on
+// `slots` slots: one plaintext product per diagonal plus BSGS rotations
+// (weighted like the fold decision in compile()).
+double layout_cost(const SparseMatrix& m, const Shape& in, const Layout& il, const Shape& out, const Layout& ol,
+                   uint32_t slots) {
+  std::vector<char> seen(slots, 0);
+  size_t n = 0;
+  for (size_t r = 0; r < m.rows(); ++r) {
+    const int64_t rs = static_cast<int64_t>(ol.slot(out, r));
+    for (const auto& e : m.row(r)) {
+      int64_t d = (static_cast<int64_t>(il.slot(in, e.first)) - rs) % slots;
+      if (d < 0) d += slots;
+      if (!seen[static_cast<size_t>(d)]) {
+        seen[static_cast<size_t>(d)] = 1;
+        ++n;
+      }
+    }
+  }
+  return static_cast<double>(n) + 8.0 * std::sqrt(static_cast<double>(n));
+}
+
+}  // namespace
+
+Layout LinearLayer::configure_layout(const Layout& in, Packing packing) {
   in_layout_ = in;
   const size_t s = static_cast<size_t>(gap_stride());
   out_layout_ = Layout::compact(out_);
-  if (gapped && s) {
-    // Gapped output: same channel stride as the input, spatial strides scaled,
-    // as long as no two outputs land in the same slot.
-    Layout cand{in.cs, in.ys * s, in.xs * s};
-    std::vector<char> used(cand.span(out_), 0);
-    bool ok = true;
-    for (size_t i = 0; i < out_.size() && ok; ++i) {
-      size_t sl = cand.slot(out_, i);
-      ok = !used[sl];
-      used[sl] = 1;
+  if (packing == Packing::kCompact || !s) return out_layout_;
+  Layout gapped = in.strided(s);
+  const bool gapped_ok = injective(gapped, out_);
+  if (packing == Packing::kGapped) {
+    // Same channel stride as the input, spatial strides scaled, as long as
+    // no two outputs land in the same slot.
+    if (gapped_ok) out_layout_ = gapped;
+    return out_layout_;
+  }
+  // Multiplexed: among the layouts that work (multiplexed, gapped, compact)
+  // take the cheapest, weighting the BSGS cost by the slots the layout needs
+  // (an op on twice the slots costs about twice as much, and the slot count
+  // of the whole network is set by its widest layout). A stride-1 layer
+  // after a gapped input (max pooling) re-packs it this way; a stride-1 conv
+  // on a compact input stays compact.
+  auto pow2 = [](size_t n) {
+    size_t p = 1;
+    while (p < n) p <<= 1;
+    return p;
+  };
+  const size_t base = pow2(std::max(in.span(in_), out_.size()));
+  std::vector<Layout> cands;
+  Layout mux;
+  if (multiplexed_layout(in, out_, s, mux)) cands.push_back(mux);
+  if (gapped_ok && gapped != mux) cands.push_back(gapped);
+  cands.push_back(out_layout_);
+  if (cands.size() == 1) return out_layout_;
+  const SparseMatrix m = matrix();
+  double best = 0;
+  for (size_t i = 0; i < cands.size(); ++i) {
+    const size_t slots = std::max(base, pow2(cands[i].span(out_)));
+    const double c = layout_cost(m, in_, in, out_, cands[i], static_cast<uint32_t>(slots)) * static_cast<double>(slots);
+    if (i == 0 || c < best) {
+      best = c;
+      out_layout_ = cands[i];
     }
-    if (ok) out_layout_ = cand;
   }
   return out_layout_;
 }
@@ -153,7 +239,10 @@ std::string LinearLayer::describe() const {
      << lt_.num_baby_steps() << " baby x " << lt_.num_giant_steps() << " giant steps";
   if (lt_.fold_block()) os << ", folded R=" << lt_.fold_block();
   if (lt_.weights_encrypted()) os << ", encrypted weights";
-  if (!out_layout_.is_compact(out_)) os << ", gapped out";
+  if (out_layout_.m > 1)
+    os << ", multiplexed out m=" << out_layout_.m;
+  else if (!out_layout_.is_compact(out_))
+    os << ", gapped out";
   os << "]";
   return os.str();
 }
@@ -355,11 +444,11 @@ Shape MaxPool2d::configure(const Shape& in) {
 }
 
 // Always gapped: output (c, y, x) lives in the slot of input (c, y*s, x*s).
-Layout MaxPool2d::configure_layout(const Layout& in, bool gapped) {
-  (void)gapped;
+// With multiplexed packing the next linear layer re-packs the gaps.
+Layout MaxPool2d::configure_layout(const Layout& in, Packing packing) {
+  (void)packing;
   in_layout_ = in;
-  const size_t s = static_cast<size_t>(stride_);
-  out_layout_ = Layout{in.cs, in.ys * s, in.xs * s};
+  out_layout_ = in.strided(static_cast<size_t>(stride_));
   return out_layout_;
 }
 
@@ -682,6 +771,57 @@ void ChebyshevActivation::save(std::ostream& os) const {
      << b_ << " " << degree_;
   if (ea_ != a_ || eb_ != b_ || out_scale_ != 1.0) os << " map " << ea_ << " " << eb_ << " " << out_scale_;
   os << "\n";
+}
+
+// --------------------------------------------------------------- ExactReLU
+
+ExactReLU::ExactReLU(double range, double out_scale, bool after_bootstrap)
+    : range_(range), out_scale_(out_scale), after_bootstrap_(after_bootstrap) {
+  if (!(range > 0.0)) throw std::invalid_argument("exactrelu: range must be positive");
+}
+
+std::string ExactReLU::describe() const {
+  std::ostringstream os;
+  os << "exactrelu (scheme switching) on [" << -range_ << ", " << range_ << "]";
+  if (out_scale_ != 1.0) os << " x " << out_scale_;
+  if (after_bootstrap_) os << ", past a bootstrap";
+  return os.str();
+}
+
+std::vector<double> ExactReLU::forward_plain(const std::vector<double>& x) const {
+  std::vector<double> y(x.size());
+  for (size_t i = 0; i < x.size(); ++i) y[i] = out_scale_ * std::max(x[i], 0.0);
+  return y;
+}
+
+// y = (out_scale x) [x > 0]. The sign is at compare_depth() whatever x's
+// level, so the product lands one level below the deeper of the two. Past a
+// bootstrap x is the deeper one and the output scale goes on the sign
+// instead, keeping the layer at one level.
+Ctxt ExactReLU::forward(const FHEContext& ctx, const Ctxt& x) const {
+  if (!ctx.scheme_switching())
+    throw std::logic_error("exactrelu needs a context with ContextOptions::scheme_switching");
+  const CC& cc = ctx.cc();
+  const uint32_t used = x->GetLevel() + (x->GetNoiseScaleDeg() > 1 ? 1 : 0);
+  if (after_bootstrap_ && used < FHEContext::compare_depth() + 1)
+    throw std::logic_error("exactrelu: planned for inputs past a bootstrap (" +
+                           std::to_string(FHEContext::compare_depth() + 1) + "+ levels deep), got one " +
+                           std::to_string(used) + " levels deep");
+  Ctxt sel = ctx.positive(x, range_);
+  if (out_scale_ == 1.0) return cc->EvalMult(x, sel);
+  if (after_bootstrap_) return cc->EvalMult(x, cc->EvalMult(sel, out_scale_));
+  return cc->EvalMult(cc->EvalMult(x, out_scale_), sel);
+}
+
+void ExactReLU::rescale(double in, double out) {
+  if (!(in > 0.0)) throw std::invalid_argument("exactrelu: input scale must be positive");
+  out_scale_ *= out * in;
+  range_ /= in;
+}
+
+void ExactReLU::save(std::ostream& os) const {
+  os << std::setprecision(std::numeric_limits<double>::max_digits10) << "exactrelu " << range_ << " " << out_scale_
+     << " " << (after_bootstrap_ ? 1 : 0) << "\n";
 }
 
 void Bootstrap::save(std::ostream& os) const { os << "bootstrap\n"; }

@@ -125,6 +125,14 @@ PYBIND11_MODULE(_fheml, m) {
            py::arg("degree"))
       .def(py::init<std::string, double, double, uint32_t, double, double, double>(), py::arg("fn"), py::arg("a"),
            py::arg("b"), py::arg("degree"), py::arg("eval_a"), py::arg("eval_b"), py::arg("out_scale") = 1.0);
+  py::class_<ExactReLU, Layer, std::shared_ptr<ExactReLU>>(m, "ExactReLU")
+      .def(py::init<double, double, bool>(), py::arg("range") = 1.0, py::arg("out_scale") = 1.0,
+           py::arg("after_bootstrap") = false,
+           "Exact ReLU: sign through CKKS<->FHEW scheme switching; inputs must lie in [-range, range]. "
+           "after_bootstrap: inputs are past a CKKS bootstrap, the layer then costs one level "
+           "(set by place_bootstraps).")
+      .def_property_readonly("range", &ExactReLU::range)
+      .def_property("after_bootstrap", &ExactReLU::after_bootstrap, &ExactReLU::set_after_bootstrap);
   py::class_<Bootstrap, Layer, std::shared_ptr<Bootstrap>>(m, "Bootstrap").def(py::init<>());
   py::class_<Residual, Layer, std::shared_ptr<Residual>>(m, "Residual")
       .def(py::init<std::vector<LayerPtr>>(), py::arg("body"));
@@ -165,6 +173,8 @@ PYBIND11_MODULE(_fheml, m) {
           "add", [](Network& n, LayerPtr l) -> Network& { return n.add(std::move(l)); }, py::arg("layer"),
           py::return_value_policy::reference_internal)
       .def("fuse_linear", &Network::fuse_linear)
+      .def("use_exact_relu", &Network::use_exact_relu, py::arg("range") = 0.0,
+           "Replace Chebyshev relu activations by scheme-switching ExactReLU; returns how many.")
       .def("place_bootstraps", &Network::place_bootstraps, py::arg("budget"),
            py::arg("calibration") = std::vector<std::vector<double>>{}, py::arg("headroom") = 1.5,
            "Insert bootstraps so no stretch exceeds `budget` levels; compile() again afterwards.")
@@ -176,6 +186,24 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("uses_scheme_switching", &Network::uses_scheme_switching)
       .def("compile", &Network::compile, py::arg("slots") = 0, py::call_guard<py::gil_scoped_release>())
       .def("set_gapped_layouts", &Network::set_gapped_layouts)
+      .def_property(
+          "packing",
+          [](const Network& n) {
+            switch (n.packing()) {
+              case Packing::kCompact: return std::string("compact");
+              case Packing::kGapped: return std::string("gapped");
+              default: return std::string("multiplexed");
+            }
+          },
+          [](Network& n, const std::string& p) {
+            if (p == "compact") n.set_packing(Packing::kCompact);
+            else if (p == "gapped") n.set_packing(Packing::kGapped);
+            else if (p == "multiplexed") n.set_packing(Packing::kMultiplexed);
+            else throw std::invalid_argument("packing must be compact, gapped or multiplexed");
+          },
+          "Layout of strided conv/pool outputs: 'gapped' (default, fewest diagonals), 'compact' (fewest "
+          "slots) or 'multiplexed' (compact slot count, few diagonals; Lee et al. ICML'22). Compile again "
+          "afterwards.")
       .def("set_cache_plaintexts", &Network::set_cache_plaintexts)
       .def_property_readonly("depth", &Network::depth)
       .def_property_readonly("slots", &Network::slots)

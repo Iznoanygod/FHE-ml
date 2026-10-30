@@ -13,6 +13,7 @@
 //   square
 //   poly N                                        followed by N coefficients c0..c{N-1}
 //   chebyshev FN A B DEGREE [scale IN OUT]        FN in relu|silu|gelu|sigmoid|tanh; computes OUT*FN(IN*x)
+//   exactrelu RANGE OUT_SCALE                     OUT_SCALE*relu(x) via scheme switching, inputs in [-RANGE, RANGE]
 //   scale C                                       followed by C per-channel factors (fixed, not trained)
 //   bootstrap
 //   tokendense N IN OUT NB                        followed by weights [OUT][IN], NB bias values (0, OUT or N*OUT)
@@ -55,9 +56,13 @@ class Network {
 
   // Propagates shapes and slot layouts. Called automatically by add().
   Shape configure();
-  // Strided conv/pool outputs stay gapped (default, fewer diagonals) or are
-  // compacted (fewer slots). Takes effect at the next configure()/compile().
-  void set_gapped_layouts(bool on) { gapped_ = on; }
+  // How strided conv/pool outputs are packed (see Packing): gapped (default,
+  // fewest diagonals), compact (fewest slots) or multiplexed (compact slot
+  // count with few diagonals). Takes effect at the next configure()/compile().
+  void set_packing(Packing p) { packing_ = p; }
+  Packing packing() const { return packing_; }
+  // Gapped (true) or compact (false) packing.
+  void set_gapped_layouts(bool on) { packing_ = on ? Packing::kGapped : Packing::kCompact; }
   // Keep encoded weight diagonals between inferences: much faster repeated
   // inference, at one plaintext (ring_dim * towers * 8 bytes) per diagonal.
   void set_cache_plaintexts(bool on);
@@ -72,6 +77,12 @@ class Network {
   // Merges runs of adjacent linear layers into one matrix each: saves one
   // level per merged layer at the cost of more diagonals.
   void fuse_linear();
+  // Replaces every Chebyshev "relu" activation (also inside residual blocks)
+  // by an ExactReLU (scheme-switching sign, no approximation error). The
+  // input range is `range`, or the activation's evaluation interval when
+  // range is 0. Activations whose interval map has an offset (relu(s x + t),
+  // t != 0) are left alone. Returns the number replaced; compile again.
+  size_t use_exact_relu(double range = 0.0);
   // Lowers every linear layer to a BSGS plan for `slots` (0 = required_slots()).
   void compile(uint32_t slots = 0);
 
@@ -106,7 +117,7 @@ class Network {
   uint32_t depth_between_bootstraps() const;
   bool uses_bootstrapping() const;
   // True when a layer compares through CKKS <-> FHEW scheme switching
-  // (MaxPool2d); context_options() then enables it.
+  // (MaxPool2d, ExactReLU, softmax row maximum); context_options() then enables it.
   bool uses_scheme_switching() const;
   // Rotation keys to generate. ladder = true (the context has a rotation-key
   // ladder, ContextOptions::rotation_window): only the rotations of layers
@@ -143,7 +154,7 @@ class Network {
   Shape input_;
   std::vector<std::shared_ptr<Layer>> layers_;
   uint32_t slots_ = 0;
-  bool gapped_ = true;
+  Packing packing_ = Packing::kGapped;
 };
 
 }  // namespace fheml

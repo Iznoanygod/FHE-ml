@@ -59,6 +59,7 @@ AvgPool2d = _fheml.AvgPool2d
 MaxPool2d = _fheml.MaxPool2d
 ChannelAffine = _accepting_numpy(_fheml.ChannelAffine)
 Chebyshev = _fheml.Chebyshev
+ExactReLU = _fheml.ExactReLU
 Conv2d = _accepting_numpy(_fheml.Conv2d)
 Dense = _accepting_numpy(_fheml.Dense)
 Poly = _accepting_numpy(_fheml.Poly)

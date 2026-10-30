@@ -11,8 +11,10 @@
   (quadratic or softmax scores), LayerNorm, Residual, PosEmbedding, TokenMean.
 * ``(k,)`` vector: Linear, BatchNorm1d.
 
-Activations must be ``fheml.nn`` polynomials (Poly, Square, Chebyshev):
-``nn.ReLU`` and friends have no exact encrypted equivalent.
+Activations must be ``fheml.nn`` polynomials (Poly, Square, Chebyshev).
+``nn.ReLU`` exports only with ``exact_relu=RANGE``: it then becomes an
+``fheml.ExactReLU`` (sign through CKKS<->FHEW scheme switching, inputs in
+[-RANGE, RANGE]), as do ``fheml.nn.Chebyshev('relu', ...)`` modules.
 """
 import numpy as np
 import torch
@@ -44,8 +46,9 @@ class _Exporter:
     """Walks the module tree tracking the activation shape and emits a list of
     layer specs (plain tuples), so later passes can fold or pad weights."""
 
-    def __init__(self):
+    def __init__(self, exact_relu=None):
         self.max_token_width = 0
+        self.exact_relu = exact_relu
 
     def run(self, modules, state):
         out = []
@@ -142,6 +145,9 @@ class _Exporter:
         if isinstance(m, hnn.Poly):
             out.append(("poly", _np(m.coeffs)))
             return state
+        if self.exact_relu and (isinstance(m, nn.ReLU) or (isinstance(m, hnn.Chebyshev) and m.fn == "relu")):
+            out.append(("exactrelu", float(self.exact_relu)))
+            return state
         if isinstance(m, hnn.Chebyshev):
             out.append(("chebyshev", m.fn, m.a, m.b, m.degree))
             return state
@@ -180,8 +186,9 @@ class _Exporter:
             return ("vector", d)
 
         if isinstance(m, (nn.ReLU, nn.GELU, nn.SiLU, nn.Sigmoid, nn.Tanh, nn.LeakyReLU)):
+            hint = " or from_torch(..., exact_relu=RANGE) (scheme switching)" if name == "ReLU" else ""
             raise ValueError(f"nn.{name} has no exact encrypted form: use fheml.nn.Chebyshev"
-                             f"('{name.lower()}', a, b, degree) or a trained fheml.nn.Poly")
+                             f"('{name.lower()}', a, b, degree) or a trained fheml.nn.Poly{hint}")
         if isinstance(m, nn.MaxPool2d):
             raise ValueError("nn.MaxPool2d needs an input bound: use fheml.nn.MaxPool2d(k, stride, range=R) "
                              "(exact, via CKKS<->FHEW scheme switching, 15+ levels; |x| <= R) or nn.AvgPool2d")
@@ -256,6 +263,8 @@ def _build(s):
         return _fheml.Poly(_flat(s[1]))
     if k == "chebyshev":
         return _fheml.Chebyshev(*s[1:])
+    if k == "exactrelu":
+        return _fheml.ExactReLU(s[1])
     if k == "bootstrap":
         return _fheml.Bootstrap()
     if k == "attention":
@@ -275,7 +284,7 @@ def _build(s):
     raise AssertionError(k)
 
 
-def from_torch(model, input_shape, token_width="auto", check=True):
+def from_torch(model, input_shape, token_width="auto", check=True, exact_relu=None):
     """Converts a trained torch model to an ``fheml.Network`` (not yet compiled).
 
     token_width: for token inputs, zero-pad each input token to this width
@@ -283,7 +292,11 @@ def from_torch(model, input_shape, token_width="auto", check=True):
       stride makes per-token layers much cheaper under encryption; the
       helpers ``fheml.infer``/``encrypt``/``plain`` pad inputs automatically.
     check: compare the fheml plaintext reference with the torch model on a
-      random input and raise if they disagree.
+      random input and raise if they disagree (skipped for Chebyshev relus
+      replaced by exact_relu, which no longer match the torch polynomial).
+    exact_relu: input bound R; nn.ReLU and Chebyshev relu modules become
+      fheml.ExactReLU(R), the exact ReLU through CKKS<->FHEW scheme switching
+      (12+ levels and one FHEW bootstrap per slot each, see the README).
     """
     shape = tuple(int(v) for v in input_shape)
     if len(shape) == 3:
@@ -295,7 +308,7 @@ def from_torch(model, input_shape, token_width="auto", check=True):
     else:
         raise ValueError("input_shape must be (C, H, W), (tokens, dim) or (features,)")
 
-    ex = _Exporter()
+    ex = _Exporter(exact_relu)
     modules = model if isinstance(model, nn.Sequential) else [model]
     with torch.no_grad():
         specs, _ = ex.run(modules, state)
@@ -315,7 +328,8 @@ def from_torch(model, input_shape, token_width="auto", check=True):
     for s in specs:
         net.add(_build(s))
 
-    if check:
+    replaced_poly = exact_relu and any(isinstance(m, hnn.Chebyshev) and m.fn == "relu" for m in model.modules())
+    if check and not replaced_poly:
         _check(model, net, shape)
     return net
 

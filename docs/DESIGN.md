@@ -29,6 +29,47 @@ kernel tap): 125 diagonals for the same layer. It needs more slots
 (Co·H·W instead of Co·H/s·W/s). That costs nothing until it forces a larger
 ring.
 
+### Multiplexed packing
+
+`Network::set_packing(Packing::kMultiplexed)` (Python: `net.packing =
+"multiplexed"`) fills the gaps with other channels, as in the multiplexed
+parallel convolutions of Lee et al. (ICML'22). A layout carries a
+multiplexing factor `m` and the fine grid `(fy, fx)` of the original image;
+`m²` channels share one block of `cs` slots, and channel `c` sits at
+sub-offset `(i, j) = ((c mod m²) / m, c mod m)`:
+
+    slot = (c / m²)·cs + i·fy + j·fx + y·ys + x·xs
+
+After a stride-2 conv on a compact `H×W` input, `ys = 2W`, `xs = 2`, `m = 2`,
+`(fy, fx) = (W, 1)`: the four channels of a block interleave like the pixels
+of a 2×2 window, and a second stride-2 stage makes `m = 4`. The offset
+between an input and an output element still depends only on (input
+channel, output channel, kernel tap), so a strided conv keeps few diagonals,
+while the activation needs `C·H·W/m²` slots, like a compact one.
+
+There is no new evaluation algorithm: a layout is only a map from elements to
+slots, and every linear layer's slot matrix is built from its input and output
+layouts, so the BSGS diagonal method handles any layout. The masks of Lee et
+al. are the zeros of the diagonals. That also makes re-packing free: a
+stride-1 conv after max pooling (whose output stays gapped) writes its output
+multiplexed.
+
+**Choosing a layout per layer.** Multiplexing is not always cheapest. A stride-1
+conv on a compact input already has constant offsets (`(Ci+Co-1)·k²`
+diagonals), while the interleaved sub-offsets of a multiplexed one give up to
+`(Ci/m²+Co/m²-1)·((k+1)m-1)²`. With `kMultiplexed`, each strided (or
+re-packing) linear layer considers the multiplexed, gapped and compact output
+layouts that are collision-free, and takes the one with the lowest estimated
+cost `(diagonals + 8·sqrt(diagonals)) × slots`, where slots is the power of
+two that holds both the input and that output. Weighting by slots stops a
+gapped layout from winning on diagonals when it would double the ring.
+Odd sizes (7×7 → 4×4 with padding) can't interleave without collisions and
+fall back to gapped or compact. `kGapped` stays the default; `kCompact` is
+`set_gapped_layouts(false)`.
+
+Measured numbers (`packing_bench`, `mnist_cnn --packing`) are in the README section
+"Multiplexed packing".
+
 ## Linear layers → one BSGS transform
 
 `LinearLayer::compile` works in three steps:
@@ -65,10 +106,19 @@ cryptography.
 | `poly` degree 2 | `x·(c2·x + c1) + c0` | 2 (1 if c2 = 1) |
 | `poly` degree d > 2 | `EvalPoly` | `poly_depth(d)` |
 | `chebyshev f a b d` | `EvalChebyshevSeries` | `poly_depth(d)` (+1 unless [a,b] = [-1,1]) |
+| `exactrelu R s` | `EvalCompareSchemeSwitching(0, x)` (FHEW sign), `x · sign` | 13; 1 past a bootstrap |
 
 The plaintext reference evaluates the *same* approximation
 (`EvalChebyshevFunctionPtxt`). Encrypted-vs-plaintext error therefore measures
 only the CKKS noise. The approximation error is a training-time concern.
+
+`exactrelu` has no approximation: its reference is `max(x, 0)`. Its sign
+comes back from FHEW as a fresh ciphertext 12 levels deep regardless of the
+input, so its cost in levels depends on where it sits: 13 from a fresh
+input, 1 when the input is already deeper than 12, which always holds past a
+CKKS bootstrap (18–20 levels). The additive depth model expresses this with a
+per-layer flag (`after_bootstrap`) that `place_bootstraps` sets, and the
+layer checks at run time that its input really is that deep.
 
 ## Transformers
 
@@ -449,7 +499,8 @@ bit-identical to the CPU ones.
 ## Status
 
 All of the following are tested under encryption:
-- Convolutions with stride, padding and multiple channels.
+- Convolutions with stride, padding and multiple channels, with gapped,
+  compact or multiplexed outputs (also through encrypted training).
 - Dense layers, average pooling and channel affine layers.
 - Exact max pooling through CKKS ↔ FHEW scheme switching (TOY FHEW
   parameters in the tests; the STD128 numbers are in the README).
@@ -457,7 +508,8 @@ All of the following are tested under encryption:
   block) and softmax attention, with and without the scheme-switching
   maximum subtraction.
 - Fused linear layers.
-- The square, polynomial and Chebyshev activations.
+- The square, polynomial and Chebyshev activations, and the exact
+  scheme-switching ReLU (checked against `max(x, 0)`, also past bootstraps).
 - Bootstrapping in the middle of a network, placed by hand or by
   `place_bootstraps` (with scale folding and interval folding).
 - Rotations composed from a key ladder, for inference and training.
@@ -487,9 +539,10 @@ All of the following are tested under encryption:
      data alone.
    - Serialize the encrypted weights so the server never sees them in the
      clear.
-3. **Multiplexed packing (Lee et al. ICML'22, Orion).** After stride-2 layers,
-   re-pack gapped outputs densely so deep networks (ResNet-20 on CIFAR-10) fit
-   in fewer slots and need fewer bootstraps.
+3. **Multiplexed packing**: done (`Packing::kMultiplexed`, see above). Next:
+   residual blocks on images (a residual `Add` that lines up multiplexed
+   layouts), and a network-level layout search instead of the per-layer
+   greedy choice.
 4. **Better activations.**
    - Composite minimax sign/ReLU, built by composing `EvalChebyshevSeries`
      calls.
