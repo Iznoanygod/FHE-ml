@@ -259,6 +259,13 @@ PYBIND11_MODULE(_fheml, m) {
            py::arg("loss") = Loss{}, py::keep_alive<1, 2>())
       .def_property_readonly("loss", &Trainer::loss)
       .def_property_readonly("step_depth", &Trainer::step_depth)
+      .def_property_readonly("unbounded_step_depth", &Trainer::unbounded_step_depth)
+      .def("set_level_budget", &Trainer::set_level_budget, py::arg("levels"), py::arg("range") = 1.0,
+           "Bootstrap activations and gradients so that no ciphertext of a step goes deeper than `levels`.")
+      .def_property_readonly("level_budget", &Trainer::level_budget)
+      .def_property_readonly("bootstrap_range", &Trainer::bootstrap_range)
+      .def_property_readonly("min_level_budget", &Trainer::min_level_budget)
+      .def_property_readonly("sample_bootstraps", &Trainer::sample_bootstraps)
       .def_property_readonly("weight_ciphertexts", &Trainer::weight_ciphertexts)
       .def_property_readonly("first_trained_layer", &Trainer::first_trained_layer)
       .def_property_readonly("weight_level", &Trainer::weight_level)

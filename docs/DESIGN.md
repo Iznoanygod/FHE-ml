@@ -221,8 +221,6 @@ with 3H score coefficients; single-head files are unchanged.
 
 ### Next steps
 
-- Bootstrapping inside the max-subtracted softmax block.
-- Bootstrapping between blocks for deeper models.
 - An example model that uses them (both train under encryption and export
   from `fheml.nn.LayerNorm` / `fheml.nn.Attention(softmax=...)`).
 
@@ -338,6 +336,22 @@ that.
   update.
 - Bootstrapping uses 55-bit scaling: at 50 bits, full-slot bootstrapping
   error is about 1e-2.
+- **Level budget** (`Trainer::set_level_budget(K, range)`): for steps
+  deeper than one bootstrapping context holds, every ciphertext stays within
+  K levels of the weights. The passes call `fit(c, d)` on each operand before
+  an operation that consumes d levels; it bootstraps c when its level plus d
+  would pass K. Decisions use the ciphertexts' real levels, so nothing has to
+  be planned per layer: activations, gradients, the forward values kept for
+  the backward pass (bootstrapped in place, so later uses see the fresh copy)
+  and the intermediate values of attention and layer norm are refreshed
+  exactly where needed, including between the comparison tournament, the exp
+  series and the 1/x series of the max-subtracted softmax. Fits run between
+  the parallel loops, never inside them. Indivisible operations (a
+  polynomial, the layer norm's `normalize`, a frozen layer) must fit K
+  (`min_level_budget()`). Values are divided by `range` (a power of two, one
+  level) before each of these bootstraps and doubled back after it with
+  additions (no level), so the context needs K + 3 levels plus the
+  bootstrap's. The weights are still refreshed once per update, packed.
 
 **Cost and limits.**
 - **Rotation keys:** by default one per diagonal offset, plus its negative.
