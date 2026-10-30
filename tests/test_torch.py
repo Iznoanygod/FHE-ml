@@ -44,6 +44,14 @@ cnn = nn.Sequential(
     nn.Linear(6, 3))
 run("cnn", cnn, (2, 8, 8))
 
+# Exact max pooling (scheme switching): small conv weights keep the pooled
+# values inside range.
+pooled = nn.Sequential(nn.Conv2d(1, 2, 3, padding=1), hnn.MaxPool2d(2, range=2.0), hnn.Square(), nn.Flatten(),
+                       nn.Linear(8, 2))
+with torch.no_grad():
+    pooled[0].weight.mul_(0.5)
+run("max pool", pooled, (1, 4, 4))
+
 n, d, h = 4, 8, 16
 vit = nn.Sequential(
     nn.Linear(6, d), hnn.PosEmbedding(n, d),
@@ -102,6 +110,7 @@ for bad in ({"heads": 3}, {"heads": 2, "score": [[1, 2, 3]]}):
 for bad, msg in ((nn.Sequential(nn.Linear(4, 4), nn.ReLU()), "Chebyshev"),
                  (nn.Sequential(nn.Linear(4, 4), nn.LayerNorm(4)), "fheml.nn.LayerNorm"),
                  (nn.Sequential(nn.Linear(4, 4), nn.Softmax(-1)), "softmax="),
+                 (nn.Sequential(nn.Conv2d(1, 1, 3), nn.MaxPool2d(2)), "fheml.nn.MaxPool2d"),
                  (nn.Sequential(nn.Conv2d(1, 1, 3), nn.Linear(6, 2)), "Flatten")):
     try:
         fheml.from_torch(bad, (4,) if isinstance(bad[0], nn.Linear) else (1, 8, 8))

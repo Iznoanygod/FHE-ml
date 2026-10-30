@@ -285,6 +285,10 @@ class AvgPool2d : public LinearLayer {
 // maximum of a window lands in the slot of its top-left input. Slots between
 // outputs hold maxima of other windows (bounded by range); the next linear
 // layer ignores them.
+//
+// Trainer backpropagates through it with the forward's comparison bits: the
+// gradient of max(a, b) = a + [a < b] (b - a) is (1 - [a < b], [a < b]), so
+// the backward pass needs no further comparisons.
 class MaxPool2d : public Layer {
  public:
   MaxPool2d(int k, int stride, double range = 1.0);
@@ -303,10 +307,11 @@ class MaxPool2d : public Layer {
   double range() const { return range_; }
   // Comparison rounds of the tournament: ceil(log2(k^2)).
   uint32_t rounds() const;
+  // Slot offsets of the window taps relative to the top-left input, in
+  // tournament order (row-major over the window).
+  std::vector<int32_t> offsets() const;
 
  private:
-  // Slot offsets of the window taps relative to the top-left input.
-  std::vector<int32_t> offsets() const;
   int k_, stride_;
   double range_;
 };

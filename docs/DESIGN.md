@@ -276,9 +276,44 @@ encryption:
 - `chebyshev`: the derivative Chebyshev series (Numerical Recipes `chder`,
   same `c0/2` convention as OpenFHE).
 
+**Max pooling** reuses the forward's comparisons. Each round of the
+tournament computes `max(a, b) = a + s (b - a)` with `s = [a < b]`, so
+`∂max/∂a = 1 - s` and `∂max/∂b = s`. The forward keeps `s ⊙ m` and
+`m - s ⊙ m`, where `m` masks the pool's output slots. The backward walks the
+tournament from the root, multiplying the gradient by these, and rotates
+each tap's gradient back by `-offset` to its input slot (overlapping windows
+add up). That is `ceil(log2 k²)` levels and no scheme switching. The mask
+matters when the pool is the output layer: `g = y - t` is nonzero in the
+gap slots there and must not reach the layer below. `train_plain` runs the
+same tournament in the clear (a tie keeps the first tap, as `[a < b] = 0`
+does).
+
 The loss is `0.5 |y - t|²`, so `g = y - t` with an encrypted target `t`. No
 masking is needed: unused slots of `y` only meet zero rows of the matrices,
 and the update masks keep gradients out of unused weight slots.
+
+With `Loss::cross_entropy` the loss is `-Σ t log softmax(y)` against a one-hot
+`t`, so `g = softmax(y) - t` (`Trainer::loss_gradient`):
+
+1. `z = y + pad`, where `pad` puts the interval midpoint in every non-output
+   slot (they hold 0 after a linear last layer; otherwise `y` is masked
+   first, one level), so the exp series never sees a value off its interval.
+2. `e = mask (*) exp~(z)`: Chebyshev series on `[lo, hi]` (+1 level for the
+   interval map), masked to the output slots (+1).
+3. `S = Σ_k rot_k(e)` over log2(slots) power-of-two rotations: the sum in
+   every slot, so the 1/x series has no padding problem.
+4. `r = inv~(S)`: Chebyshev series of 1/x on `[sum_lo, sum_hi]` plus Newton
+   steps `r <- r (2 - S r)` (2 levels each); `g = e (*) r - t`.
+
+With `subtract_max` the logits are first masked and padded with `lo` (never
+above a logit); a max tree `m <- m + [m < rot_t(m)] (rot_t(m) - m)` over
+`t = 1, 2, ..., window/2` (the comparison through `FHEContext::compare`, fresh
+at `compare_depth()`) leaves the maximum in slot 0, which is masked and
+broadcast back over the window and subtracted. Slots outside the window get
+`(lo - hi)/2`, so every slot lands in `[lo - hi, 0]`. `train_plain` runs the
+same polynomials (`softmax_plain`); `tests/test_train.cpp` checks the gradient
+against finite differences of the exact cross-entropy and the encrypted
+update against `train_plain`.
 
 **Levels.** `Trainer::step_depth()` simulates the levels of a whole step
 (forward, backward, update) and `context_options()` sizes the context from
@@ -304,8 +339,6 @@ that.
   rotation from 2·log2(slots) keys instead; `Trainer::rotation_indices(true)`
   then lists only the hoisted rotations of the frozen prefix.
 - **Attention:** no backward pass yet.
-- **Loss:** cross-entropy needs an encrypted softmax (exp and inverse
-  approximations).
 
 ## Parameters and bootstrapping
 
@@ -454,7 +487,8 @@ All of the following are tested under encryption:
 - Encrypted training (`Trainer`): SGD updates on encrypted data and weights
   match plaintext SGD, with and without bootstrapping; this includes
   layer norm (gamma, beta) and attention (quadratic or softmax scores),
-  whose backward passes reuse the forward's rotations and masks.
+  whose backward passes reuse the forward's rotations and masks, and exact
+  max pooling, whose backward pass reuses the forward's comparison bits.
 - PyTorch export (`fheml.from_torch`): torch-trained CNN and ViT run
   encrypted with logits matching torch to about 1e-6.
 

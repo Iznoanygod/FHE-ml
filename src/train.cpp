@@ -126,7 +126,7 @@ size_t first_trainable(const Network& net, const std::vector<size_t>& frozen) {
 // ----------------------------------------------------------------------- Node
 
 struct Trainer::Node {
-  enum Kind { kLinear, kSquare, kPoly, kCheb, kBoot, kResidual, kNorm, kAttn } kind = kLinear;
+  enum Kind { kLinear, kSquare, kPoly, kCheb, kBoot, kResidual, kNorm, kAttn, kMax } kind = kLinear;
   Layer* layer = nullptr;
   bool trainable = false;
 
@@ -170,12 +170,107 @@ struct Trainer::Node {
   std::vector<Ctxt> p, aw, A;  // scores, head-slot weights, weights broadcast over the head
   Ctxt q, o, y;               // queries, sum_s A_s (*) v_s before the softmax division, 1 / row sum
 
+  // kMax: per tournament round, the number of values entering it and, per
+  // pair, the comparison bit [a < b] and its complement, both masked to the
+  // output slots (the backward pass routes the gradient with them).
+  MaxPool2d* pool = nullptr;
+  std::vector<double> out_mask;
+  std::vector<size_t> round_sizes;
+  std::vector<std::vector<Ctxt>> pick_b, pick_a;
+
   std::vector<std::unique_ptr<Node>> body;  // kResidual, kAttn
 };
+
+// Softmax cross-entropy (see Loss): the exp and 1/x series, and for the
+// encrypted pass the output-slot masks.
+struct Trainer::CrossEntropy {
+  SoftmaxOptions o;
+  size_t k = 0;  // outputs
+  double exp_lo = 0.0, exp_hi = 0.0, sum_lo = 0.0, sum_hi = 0.0;
+  std::vector<double> exp_c, inv_c;
+
+  // Encrypted pass only (set_layout). mask: 1 at the output slots; pad: added
+  // to the masked logits so that every slot is inside the exp interval;
+  // first: 1 at slot 0; window: power of two covering the output slots (the
+  // max tree); mask_input: the logits' padding slots may be nonzero.
+  bool mask_input = false;
+  int window = 1;
+  std::vector<double> mask, pad, first;
+
+  CrossEntropy(const SoftmaxOptions& opts, size_t outputs) : o(opts), k(outputs) {
+    if (!(o.lo < o.hi)) throw std::invalid_argument("cross-entropy softmax: need lo < hi");
+    if (o.exp_degree < 1 || o.inv_degree < 1) throw std::invalid_argument("cross-entropy softmax: degrees must be >= 1");
+    if ((o.sum_lo != 0.0 || o.sum_hi != 0.0) && !(0.0 < o.sum_lo && o.sum_lo < o.sum_hi))
+      throw std::invalid_argument("cross-entropy softmax: need 0 < sum_lo < sum_hi");
+    const double n = static_cast<double>(k);
+    exp_lo = o.subtract_max ? o.lo - o.hi : o.lo;
+    exp_hi = o.subtract_max ? 0.0 : o.hi;
+    sum_lo = o.sum_lo != 0.0 ? o.sum_lo : (o.subtract_max ? 1.0 : n * std::exp(o.lo));
+    sum_hi = o.sum_hi != 0.0 ? o.sum_hi : (o.subtract_max ? n : n * std::exp(o.hi));
+    if (o.subtract_max && sum_lo == sum_hi) sum_hi = sum_lo + 1.0;  // one output: the sum is exactly 1
+    exp_c = lbcrypto::EvalChebyshevCoefficients([](double x) { return std::exp(x); }, exp_lo, exp_hi, o.exp_degree);
+    inv_c = lbcrypto::EvalChebyshevCoefficients([](double x) { return 1.0 / x; }, sum_lo, sum_hi, o.inv_degree);
+  }
+
+  void set_layout(const Layer& last, uint32_t slots, bool linear_last) {
+    const Shape& out = last.out_shape();
+    const Layout& ol = last.out_layout();
+    mask_input = !linear_last;
+    window = 1;
+    while (static_cast<size_t>(window) < ol.span(out)) window *= 2;
+    mask.assign(slots, 0.0);
+    first.assign(slots, 0.0);
+    first[0] = 1.0;
+    for (size_t i = 0; i < k; ++i) mask[ol.slot(out, i)] = 1.0;
+    // Without the maximum: the interval midpoint. With it: lo inside the max
+    // window (never above a logit), and outside it a value whose difference
+    // to the (zero) broadcast maximum is inside [lo - hi, 0].
+    pad.assign(slots, 0.0);
+    for (uint32_t s = 0; s < slots; ++s)
+      if (mask[s] == 0.0)
+        pad[s] = !o.subtract_max ? 0.5 * (o.lo + o.hi) : (s < static_cast<uint32_t>(window) ? o.lo : 0.5 * (o.lo - o.hi));
+  }
+
+  double inv(double x) const {
+    double y = lbcrypto::EvalChebyshevFunctionPtxt([](double u) { return 1.0 / u; }, {x}, sum_lo, sum_hi, o.inv_degree)[0];
+    for (uint32_t i = 0; i < o.newton; ++i) y = y * (2.0 - x * y);
+    return y;
+  }
+
+  std::vector<double> softmax(std::vector<double> z) const {
+    if (o.subtract_max) {
+      const double m = *std::max_element(z.begin(), z.end());
+      for (double& v : z) v -= m;
+    }
+    std::vector<double> e =
+        lbcrypto::EvalChebyshevFunctionPtxt([](double x) { return std::exp(x); }, z, exp_lo, exp_hi, o.exp_degree);
+    double S = 0.0;
+    for (double v : e) S += v;
+    const double r = inv(S);
+    for (double& v : e) v *= r;
+    return e;
+  }
+};
+
+std::vector<double> softmax_plain(const Loss& loss, const std::vector<double>& y) {
+  return Trainer::CrossEntropy(loss.softmax, y.size()).softmax(y);
+}
+
+double cross_entropy_plain(const std::vector<double>& y, const std::vector<double>& t) {
+  if (y.size() != t.size() || y.empty()) throw std::invalid_argument("cross_entropy_plain: size mismatch");
+  const double m = *std::max_element(y.begin(), y.end());
+  double S = 0.0;
+  for (double v : y) S += std::exp(v - m);
+  const double lse = m + std::log(S);
+  double l = 0.0;
+  for (size_t i = 0; i < y.size(); ++i) l += t[i] * (lse - y[i]);
+  return l;
+}
 
 namespace {
 
 using Node = Trainer::Node;
+using CrossEntropy = Trainer::CrossEntropy;
 
 std::unique_ptr<Node> build(Layer* l, bool train, uint32_t slots) {
   auto n = std::make_unique<Node>();
@@ -204,6 +299,13 @@ std::unique_ptr<Node> build(Layer* l, bool train, uint32_t slots) {
   }
   if (dynamic_cast<Bootstrap*>(l)) {
     n->kind = Node::kBoot;
+    return n;
+  }
+  if (auto* mp = dynamic_cast<MaxPool2d*>(l)) {
+    n->kind = Node::kMax;
+    n->pool = mp;
+    n->out_mask.assign(slots, 0.0);
+    for (size_t i = 0; i < mp->out_shape().size(); ++i) n->out_mask[mp->out_layout().slot(mp->out_shape(), i)] = 1.0;
     return n;
   }
   if (auto* at = dynamic_cast<Attention*>(l)) {
@@ -405,6 +507,19 @@ AttnLevels attention_levels(Sim& s, const Node& n, uint32_t z) {
   return L;
 }
 
+// MaxPool2d forward from input level x: every round compares (inputs two
+// levels above the bottom) and selects with the fresh comparison bit; the
+// masked bits sit one level below it.
+uint32_t sim_maxpool_forward(Sim& s, const Node& n, uint32_t x) {
+  const uint32_t c = FHEContext::compare_depth();
+  if (n.pool->rounds()) s.see(c + 1);
+  for (uint32_t r = 0; r < n.pool->rounds(); ++r) {
+    s.see(x + 2);
+    x = s.see(std::max(x, c) + 1);
+  }
+  return x;
+}
+
 uint32_t sim_linear_backward(Sim& s, const Node& n, uint32_t g, uint32_t z) {
   if (n.trainable) {
     uint32_t grad = s.see(std::max(g, z) + 1);
@@ -429,6 +544,7 @@ uint32_t sim_forward(Sim& s, const std::vector<std::unique_ptr<Node>>& nodes, ui
         break;
       }
       case Node::kAttn: x = attention_levels(s, n, x).out; break;
+      case Node::kMax: x = sim_maxpool_forward(s, n, x); break;
       case Node::kSquare:
       case Node::kPoly:
       case Node::kCheb: x = s.see(x + n.layer->depth()); break;
@@ -495,11 +611,33 @@ uint32_t sim_backward(Sim& s, const std::vector<std::unique_ptr<Node>>& nodes, c
         else
           g = s.see(g + 1);
         break;
+      case Node::kMax:
+        for (uint32_t r = 0; r < n.pool->rounds(); ++r) g = s.see(std::max(g, FHEContext::compare_depth() + 1) + 1);
+        break;
       case Node::kBoot: g = std::min(g, 0u); break;
       case Node::kResidual: g = std::max(sim_backward(s, n.body, tr.body[k], g), g); break;
     }
   }
   return g;
+}
+
+// Level of dL/dy from the output level y (see Trainer::loss_gradient).
+uint32_t sim_loss(Sim& s, const CrossEntropy* ce, uint32_t y) {
+  if (!ce) return y;
+  const SoftmaxOptions& o = ce->o;
+  uint32_t z;
+  if (o.subtract_max) {
+    const uint32_t m0 = s.see(y + 1);
+    uint32_t m = m0;
+    for (int t = 1; t < ce->window; t *= 2) m = s.see(std::max(FHEContext::compare_depth(), m) + 1);
+    m = s.see(m + 1);  // keep slot 0
+    z = std::max(m0, m);
+  } else {
+    z = s.see(y + (ce->mask_input ? 1 : 0));
+  }
+  const uint32_t e = s.see(z + poly_depth(o.exp_degree) + 1 + 1);
+  const uint32_t r = s.see(e + poly_depth(o.inv_degree) + 1 + 2 * o.newton);
+  return s.see(std::max(e, r) + 1);
 }
 
 void collect_rotations(const std::vector<std::unique_ptr<Node>>& nodes, uint32_t slots, std::set<int32_t>& r,
@@ -512,6 +650,11 @@ void collect_rotations(const std::vector<std::unique_ptr<Node>>& nodes, uint32_t
     if (n->kind == Node::kResidual || n->kind == Node::kAttn) collect_rotations(n->body, slots, r, allsum);
     if (n->kind == Node::kNorm)
       for (int32_t k : n->norm->rotation_indices()) add(k);
+    if (n->kind == Node::kMax)
+      for (int32_t k : n->pool->offsets()) {
+        add(k);
+        add(-static_cast<int64_t>(k));
+      }
     if (n->kind == Node::kAttn) {
       const Attention& at = *n->att;
       const int64_t nd = static_cast<int64_t>(at.tokens()) * at.stride();
@@ -754,6 +897,68 @@ Ctxt attention_backward(const FHEContext& ctx, Node& n, const Ctxt& g, bool need
   return gx;
 }
 
+// MaxPool2d::forward, keeping the comparison bits: max(a, b) = a + [a < b] (b - a).
+Ctxt maxpool_forward(const FHEContext& ctx, Node& n, const Ctxt& x) {
+  if (!ctx.scheme_switching())
+    throw std::logic_error("maxpool2d needs a context with ContextOptions::scheme_switching");
+  const CC& cc = ctx.cc();
+  std::vector<Ctxt> vals = ctx.rotate_many(x, n.pool->offsets());
+  n.round_sizes.clear();
+  n.pick_b.clear();
+  n.pick_a.clear();
+  while (vals.size() > 1) {
+    const size_t pairs = vals.size() / 2;
+    std::vector<Ctxt> next((vals.size() + 1) / 2), pb(pairs), pa(pairs);
+    for (size_t i = 0; i < pairs; ++i) {
+      const Ctxt& a = vals[2 * i];
+      const Ctxt& b = vals[2 * i + 1];
+      Ctxt sel = ctx.compare(a, b, n.pool->range());  // [a < b]
+      next[i] = cc->EvalAdd(a, cc->EvalMult(sel, cc->EvalSub(b, a)));
+      // Masked to the output slots: a gradient in any other slot (an output
+      // layer's g = y - t there) must not leak into the inputs.
+      pb[i] = mul_plain(ctx, sel, n.out_mask);
+      pa[i] = add_plain(ctx, cc->EvalNegate(pb[i]), n.out_mask);
+    }
+    if (vals.size() % 2) next.back() = vals.back();
+    n.round_sizes.push_back(vals.size());
+    n.pick_b.push_back(std::move(pb));
+    n.pick_a.push_back(std::move(pa));
+    vals.swap(next);
+  }
+  return vals[0];
+}
+
+// Routes g down the tournament (d max / da = 1 - [a < b], d max / db = [a < b])
+// to the window taps, then rotates each tap's gradient back to its input slot.
+// Overlapping windows (stride < k) add up.
+Ctxt maxpool_backward(const FHEContext& ctx, Node& n, const Ctxt& g, bool need) {
+  const CC& cc = ctx.cc();
+  std::vector<Ctxt> gs;
+  if (need) {
+    gs.push_back(g);
+    for (size_t r = n.round_sizes.size(); r-- > 0;) {
+      const size_t m = n.round_sizes[r];
+      std::vector<Ctxt> prev(m);
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+      for (size_t i = 0; i < m / 2; ++i) {
+        prev[2 * i] = cc->EvalMult(gs[i], n.pick_a[r][i]);
+        prev[2 * i + 1] = cc->EvalMult(gs[i], n.pick_b[r][i]);
+      }
+      if (m % 2) prev.back() = gs.back();
+      gs.swap(prev);
+    }
+  }
+  n.round_sizes.clear();
+  n.pick_b.clear();
+  n.pick_a.clear();
+  if (!need) return nullptr;
+  const std::vector<int32_t> offs = n.pool->offsets();
+  std::vector<Ctxt> terms(offs.size());
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+  for (size_t j = 0; j < offs.size(); ++j) terms[j] = ctx.rotate(gs[j], -offs[j]);
+  return sum(ctx, std::move(terms));
+}
+
 Ctxt forward_nodes(const FHEContext& ctx, std::vector<std::unique_ptr<Node>>& nodes, Ctxt x) {
   for (auto& np : nodes) {
     Node& n = *np;
@@ -770,6 +975,7 @@ Ctxt forward_nodes(const FHEContext& ctx, std::vector<std::unique_ptr<Node>>& no
         break;
       }
       case Node::kAttn: x = attention_forward(ctx, n, x); break;
+      case Node::kMax: x = maxpool_forward(ctx, n, x); break;
       case Node::kResidual: {
         n.in = x;
         Ctxt y = forward_nodes(ctx, n.body, x);
@@ -813,6 +1019,7 @@ Ctxt backward_nodes(const FHEContext& ctx, std::vector<std::unique_ptr<Node>>& n
         break;
       }
       case Node::kAttn: g = attention_backward(ctx, n, g, need); break;
+      case Node::kMax: g = maxpool_backward(ctx, n, g, need); break;
       case Node::kSquare:
       case Node::kPoly:
       case Node::kCheb:
@@ -1056,6 +1263,33 @@ std::vector<double> plain_attention_backward(Attention* at, bool train, const st
   return gx;
 }
 
+// The gradient goes to the winner of the same tournament the encrypted layer
+// runs (a tie keeps the first tap, like [a < b] = 0).
+std::vector<double> plain_maxpool_backward(const MaxPool2d* mp, const std::vector<double>& x,
+                                           const std::vector<double>& g) {
+  const Shape& in = mp->in_shape();
+  const Shape& out = mp->out_shape();
+  const int k = mp->k(), st = mp->stride();
+  std::vector<double> gx(x.size(), 0.0);
+  for (int c = 0; c < out.c; ++c)
+    for (int oy = 0; oy < out.h; ++oy)
+      for (int ox = 0; ox < out.w; ++ox) {
+        std::vector<size_t> vals;
+        for (int dy = 0; dy < k; ++dy)
+          for (int dx = 0; dx < k; ++dx)
+            vals.push_back((static_cast<size_t>(c) * in.h + oy * st + dy) * in.w + ox * st + dx);
+        while (vals.size() > 1) {
+          std::vector<size_t> next((vals.size() + 1) / 2);
+          for (size_t i = 0; i + 1 < vals.size(); i += 2)
+            next[i / 2] = x[vals[i]] < x[vals[i + 1]] ? vals[i + 1] : vals[i];
+          if (vals.size() % 2) next.back() = vals.back();
+          vals.swap(next);
+        }
+        gx[vals[0]] += g[(static_cast<size_t>(c) * out.h + oy) * out.w + ox];
+      }
+  return gx;
+}
+
 // Attention keeps copies of its projections' weights: refresh them after the
 // projections were updated.
 void sync_attention(const std::vector<std::shared_ptr<Layer>>& layers) {
@@ -1098,6 +1332,8 @@ std::vector<double> plain_backward(const std::vector<std::shared_ptr<Layer>>& la
       g = plain_layernorm_backward(ln, train[k], x, g, grads);
     } else if (auto* at = dynamic_cast<Attention*>(l)) {
       g = plain_attention_backward(at, train[k], x, g, grads);
+    } else if (auto* mp = dynamic_cast<MaxPool2d*>(l)) {
+      g = plain_maxpool_backward(mp, x, g);
     } else if (dynamic_cast<Bootstrap*>(l)) {
       // identity
     } else {
@@ -1112,12 +1348,17 @@ std::vector<double> plain_backward(const std::vector<std::shared_ptr<Layer>>& la
 
 // -------------------------------------------------------------------- Trainer
 
-Trainer::Trainer(Network& net, std::vector<size_t> frozen) : net_(net) {
+Trainer::Trainer(Network& net, std::vector<size_t> frozen, Loss loss) : net_(net), loss_(loss) {
   if (!net.slots()) throw std::logic_error("train: compile() the network first");
   slots_ = net.slots();
   first_ = first_trainable(net, frozen);
   const auto& layers = net.layers();
   for (size_t i = first_; i < layers.size(); ++i) nodes_.push_back(build(layers[i].get(), !contains(frozen, i), slots_));
+  if (loss_.kind == Loss::kCrossEntropy) {
+    const Layer& last = *layers.back();
+    ce_ = std::make_unique<CrossEntropy>(loss_.softmax, last.out_shape().size());
+    ce_->set_layout(last, slots_, nodes_.back()->kind == Node::kLinear);
+  }
 }
 
 Trainer::~Trainer() = default;
@@ -1130,7 +1371,7 @@ uint32_t Trainer::step_depth() const {
   Sim s{0};
   SimTrace tr;
   uint32_t y = sim_forward(s, nodes_, prefix, tr);
-  sim_backward(s, nodes_, tr, y);
+  sim_backward(s, nodes_, tr, sim_loss(s, ce_.get(), y));
   return std::max(s.max, s.new_w);
 }
 
@@ -1142,6 +1383,11 @@ std::vector<int32_t> Trainer::rotation_indices(bool ladder) const {
   if (ladder) return std::vector<int32_t>(r.begin(), r.end());
   bool all = false;
   collect_rotations(nodes_, slots_, r, all);
+  if (ce_) {
+    all = true;  // the softmax sum; the max tree uses its first steps
+    if (ce_->o.subtract_max)
+      for (int t = 1; t < ce_->window; t *= 2) r.insert(normalize_rotation(-static_cast<int64_t>(t), slots_));
+  }
   if (all)
     for (uint32_t k = 1; k < slots_; k *= 2) r.insert(static_cast<int32_t>(k));
   return std::vector<int32_t>(r.begin(), r.end());
@@ -1154,6 +1400,7 @@ ContextOptions Trainer::context_options(bool secure, bool bootstrapping, uint32_
   o.secure = secure;
   o.bootstrapping = bootstrapping;
   o.rotation_window = rotation_window;
+  o.scheme_switching = net_.uses_scheme_switching() || (ce_ && ce_->o.subtract_max);
   if (bootstrapping) {
     // +1: weights restart one level below a fresh bootstrap (unpacking mask);
     // +1: EvalBootstrap needs one level left.
@@ -1172,14 +1419,17 @@ ContextOptions Trainer::context_options(bool secure, bool bootstrapping, uint32_
       Sim s{w};
       SimTrace tr;
       uint32_t y = sim_forward(s, nodes_, std::max(prefix, 0u), tr);
-      sim_backward(s, nodes_, tr, std::max(y, 0u));
+      sim_backward(s, nodes_, tr, sim_loss(s, ce_.get(), y));
       top = std::max({top, s.max, s.new_w});
       w = s.new_w;
     }
-    // One more forward pass to use the trained weights.
+    // One more forward pass to use the trained weights. s.max, not just the
+    // output level: a max pool's comparisons need two levels below their
+    // inputs.
     Sim s{w};
     SimTrace tr;
-    top = std::max(top, sim_forward(s, nodes_, prefix, tr));
+    sim_forward(s, nodes_, prefix, tr);
+    top = std::max(top, s.max);
     o.mult_depth = top;
   }
   return o;
@@ -1222,10 +1472,40 @@ Ctxt Trainer::forward(const FHEContext& ctx, const Ctxt& x) {
 
 Ctxt Trainer::accumulate(const FHEContext& ctx, const Ctxt& x, const Ctxt& target) {
   Ctxt y = forward(ctx, x);
-  Ctxt g = ctx.cc()->EvalSub(y, target);  // d(0.5 |y - t|^2)/dy
-  backward_nodes(ctx, nodes_, g, false);
+  backward_nodes(ctx, nodes_, loss_gradient(ctx, y, target), false);
   ++batch_;
   return y;
+}
+
+Ctxt Trainer::loss_gradient(const FHEContext& ctx, const Ctxt& y, const Ctxt& target) const {
+  const CC& cc = ctx.cc();
+  if (!ce_) return cc->EvalSub(y, target);  // d(0.5 |y - t|^2)/dy
+  const CrossEntropy& ce = *ce_;
+  Ctxt z;
+  if (ce.o.subtract_max) {
+    // Max tree over the window: after it slot 0 holds the largest logit (the
+    // padding holds lo); keep slot 0 and spread it back over the window.
+    z = add_plain(ctx, mul_plain(ctx, y, ce.mask), ce.pad);
+    const double range = 2.0 * std::max(std::fabs(ce.o.lo), std::fabs(ce.o.hi));
+    Ctxt m = z;
+    for (int t = 1; t < ce.window; t *= 2) {
+      Ctxt r = ctx.rotate(m, t);
+      Ctxt sel = ctx.compare(m, r, range);  // 1 where m < r
+      m = cc->EvalAdd(m, cc->EvalMult(sel, cc->EvalSub(r, m)));
+    }
+    z = cc->EvalSub(z, window_broadcast(ctx, mul_plain(ctx, m, ce.first), ce.window));
+  } else {
+    z = add_plain(ctx, ce.mask_input ? mul_plain(ctx, y, ce.mask) : y, ce.pad);
+  }
+  std::vector<double> c = ce.exp_c;
+  Ctxt e = mul_plain(ctx, cc->EvalChebyshevSeries(z, c, ce.exp_lo, ce.exp_hi), ce.mask);
+  // Sum of every slot, in every slot (not allsum(): that adds in place).
+  Ctxt S = e;
+  for (uint32_t k = 1; k < ctx.slots(); k *= 2) S = cc->EvalAdd(S, ctx.rotate(S, static_cast<int32_t>(k)));
+  c = ce.inv_c;
+  Ctxt r = cc->EvalChebyshevSeries(S, c, ce.sum_lo, ce.sum_hi);
+  for (uint32_t i = 0; i < ce.o.newton; ++i) r = cc->EvalMult(r, cc->EvalSub(2.0, cc->EvalMult(S, r)));
+  return cc->EvalSub(cc->EvalMult(e, r), target);  // softmax(y) - t
 }
 
 void Trainer::update(const FHEContext& ctx, double lr) {
@@ -1305,6 +1585,12 @@ std::string Trainer::summary() const {
       os << "frozen";
     os << "\n";
   });
+  if (ce_)
+    os << "loss: softmax cross-entropy (exp degree " << ce_->o.exp_degree << " on [" << ce_->exp_lo << ", " << ce_->exp_hi
+       << "], 1/x degree " << ce_->o.inv_degree << " on [" << ce_->sum_lo << ", " << ce_->sum_hi << "], " << ce_->o.newton
+       << " newton" << (ce_->o.subtract_max ? ", max subtracted" : "") << ")\n";
+  else
+    os << "loss: mean squared error\n";
   os << "weight ciphertexts " << weight_ciphertexts() << ", step depth " << step_depth();
   return os.str();
 }
@@ -1312,19 +1598,22 @@ std::string Trainer::summary() const {
 // ------------------------------------------------------------- train_plain
 
 void train_plain(Network& net, const std::vector<std::vector<double>>& xs, const std::vector<std::vector<double>>& ts,
-                 double lr, const std::vector<size_t>& frozen) {
+                 double lr, const std::vector<size_t>& frozen, const Loss& loss) {
   if (xs.size() != ts.size() || xs.empty()) throw std::invalid_argument("train_plain: need matching, non-empty batches");
   const auto& layers = net.layers();
   const size_t first = first_trainable(net, frozen);
   std::vector<char> train(layers.size());
   for (size_t i = 0; i < layers.size(); ++i) train[i] = !contains(frozen, i);
   Grads grads;
+  std::unique_ptr<CrossEntropy> ce;
+  if (loss.kind == Loss::kCrossEntropy) ce = std::make_unique<CrossEntropy>(loss.softmax, layers.back()->out_shape().size());
   for (size_t s = 0; s < xs.size(); ++s) {
     std::vector<double> x = xs[s];
     for (size_t i = 0; i < first; ++i) x = layers[i]->forward_plain(x);
     PlainTrace tr;
     std::vector<double> y = plain_forward(layers, first, x, tr);
     if (y.size() != ts[s].size()) throw std::invalid_argument("train_plain: target size mismatch");
+    if (ce) y = ce->softmax(y);  // d(cross-entropy)/dy = softmax(y) - t
     for (size_t i = 0; i < y.size(); ++i) y[i] -= ts[s][i];
     plain_backward(layers, first, train, tr, y, grads);
   }
