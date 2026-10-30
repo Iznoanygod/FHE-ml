@@ -30,9 +30,13 @@ That code is kept in [`legacy/`](legacy/) for reference.
 * **Small transformers.**
   * `TokenDense` is a per-token linear layer.
   * `Attention` is fully homomorphic self-attention: ct×ct QKᵀ and AV, with
-    a trainable quadratic in place of softmax. `heads=H` gives multi-head
+    a trainable quadratic in place of softmax, or real softmax
+    (`set_softmax`: polynomial exp and 1/x, optionally with the row maximum
+    subtracted through scheme switching). `heads=H` gives multi-head
     attention with the heads as sub-blocks of each token, which costs fewer
     rotations than one wide head and no extra levels.
+  * `LayerNorm` normalises each token with a Chebyshev + Newton inverse
+    square root on a calibrated variance interval (10–12 levels).
   * `Residual` and `TokenMean` complete the block.
   * See [docs/DESIGN.md](docs/DESIGN.md#transformers).
 * **A Python package**, `import fheml`, wraps the same API with numpy in and
@@ -240,15 +244,19 @@ logits = fheml.infer(net, ctx, image)        # image: (1, 28, 28) numpy array
 | `nn.Flatten`, `nn.Dropout`, `nn.Identity` | nothing |
 | `hnn.Poly`, `hnn.Square`, `hnn.Chebyshev` | `poly`, `square`, `chebyshev` |
 | `hnn.Attention(dim, tokens, heads=H)`, `hnn.Residual`, `hnn.TokenMean`, `hnn.PosEmbedding` | `attention` (single or multi-head), `residual`, `tokenmean`, per-token bias |
+| `hnn.Attention(..., softmax={...})` | `attention` with softmax scores (`SoftmaxOptions`) |
+| `hnn.LayerNorm(dim, eps, var_min, var_max, degree, newton)` | `layernorm` |
 | `hnn.Bootstrap` | `bootstrap` |
 
-`nn.ReLU`, softmax and LayerNorm have no exact encrypted form and are
-rejected with a message naming the replacement. `nn.MaxPool2d` is rejected
+`nn.ReLU`, `nn.LayerNorm` and `nn.Softmax` have no exact encrypted form and
+are rejected with a message naming the replacement (`hnn.Chebyshev`,
+`hnn.LayerNorm`, `hnn.Attention(softmax=...)`). `nn.MaxPool2d` is rejected
 too for now: the library has an exact `MaxPool2d` layer (see below), but at
 15+ levels and a FHEW bootstrap per slot and comparison it is not something
-an exporter should insert silently. `hnn.Chebyshev`
-evaluates the same polynomial approximation in torch that runs encrypted,
-so training sees what inference computes. For token inputs the exporter pads
+an exporter should insert silently. `hnn.Chebyshev`, `hnn.LayerNorm` and the
+softmax of `hnn.Attention` evaluate the same polynomial approximations in
+torch that run encrypted, so training sees what inference computes (and
+pushes the model to keep its variances and scores inside the intervals). For token inputs the exporter pads
 each token to the widest per-token layer, which makes those layers much cheaper
 under encryption; `fheml.infer` pads inputs to match.
 
@@ -315,6 +323,33 @@ through the layer yet and inserts a `scale` layer when it has to; the trainer
 has no backward for it; the FIDESlib (GPU) backend does not support scheme
 switching.
 
+## LayerNorm and softmax
+
+Both are polynomial, with intervals to calibrate like a Chebyshev
+activation's (see `docs/DESIGN.md#softmax-and-normalisation`):
+
+```cpp
+net.emplace<LayerNorm>(n, d, gamma, beta, /*eps=*/1e-5, /*var_min=*/0.05, /*var_max=*/1.2,
+                       /*degree=*/31, /*newton=*/1);          // 12 levels
+SoftmaxOptions sm;                                            // scores q.k in [lo, hi]
+sm.lo = -2; sm.hi = 2; sm.exp_degree = 15; sm.inv_degree = 31; sm.newton = 2;
+attention->set_softmax(sm);                                   // 23 levels instead of 6
+sm.subtract_max = true;                                       // exact row max via scheme switching: 33 levels for n = 4
+```
+
+`LayerNorm` computes the token mean and variance with rotations and inverts
+`sqrt(var + eps)` with a Chebyshev series refined by Newton steps (two
+levels each). Softmax attention evaluates a Chebyshev `exp` on every score
+ciphertext and divides by the row sum with a Chebyshev `1/x` plus Newton
+steps. With `subtract_max` the row maximum is first found with a tournament
+of the scheme-switching comparisons above and subtracted, so the
+exponentials are bounded by 1 and the sums lie in `[1, n]` with nothing to
+calibrate; it costs n − 1 comparisons (each a FHEW bootstrap per slot) and
+about 12 + log2(n) extra levels, which is beyond one bootstrapping budget at
+ring 2^16. Both train under encryption (see below) and export from
+`fheml.nn.LayerNorm` / `fheml.nn.Attention(softmax=...)`; the example models
+do not use them yet.
+
 ## Encrypted training
 
 `Trainer` trains a network on encrypted data. The client encrypts inputs and
@@ -332,10 +367,15 @@ trainer.decrypt_weights(ctx)                             # key holder: trained w
 ```
 
 * **What trains:** conv2d, dense, tokendense and affine weights and biases,
-  with shared weights handled exactly. Gradients flow through square, poly,
-  chebyshev, average pooling, token mean, residual and bootstrap layers.
-* **What does not:** attention layers can't be trained or backpropagated
-  through yet. They can sit in a frozen prefix, which only runs forward.
+  layernorm's gamma and beta, and the four projections of attention
+  (quadratic or softmax scores, any number of heads), with shared weights
+  handled exactly. Gradients flow through square, poly, chebyshev, average
+  pooling, token mean, layernorm, attention, residual and bootstrap layers.
+  The softmax and the layer norm's inverse square root are differentiated as
+  the functions they approximate (`exp' = exp`, `(1/S)' = -1/S²`), so their
+  gradients match the exact ones up to the approximation error.
+* **What does not:** max pooling has no backward. Layers in a frozen prefix
+  only run forward.
 * **Fine-tuning:** `frozen=[...]` keeps layers fixed. Everything before the
   first trainable layer runs as ordinary encrypted inference.
 * **Loss:** squared error against the encrypted target. Softmax

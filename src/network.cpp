@@ -110,12 +110,35 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
       is.seekg(pos);
     }
     if (heads < 1) throw std::runtime_error("model file: bad attention head count");
+    // Optional "softmax LO HI EXP_DEG INV_DEG NEWTON SUBTRACT_MAX SUM_LO SUM_HI".
+    bool softmax = false;
+    SoftmaxOptions sm;
+    pos = is.tellg();
+    if (is >> next && next == "softmax") {
+      int subtract_max;
+      is >> sm.lo >> sm.hi >> sm.exp_degree >> sm.inv_degree >> sm.newton >> subtract_max >> sm.sum_lo >> sm.sum_hi;
+      sm.subtract_max = subtract_max != 0;
+      softmax = true;
+    } else {
+      is.clear();
+      is.seekg(pos);
+    }
     std::vector<double> w[4], b[4];
     for (auto& wi : w) wi = read_vec(is, static_cast<size_t>(d) * d, "attention weights");
     if (hb)
       for (auto& bi : b) bi = read_vec(is, d, "attention bias");
     auto score = read_vec(is, 3u * heads, "attention score polynomial");
-    layer = std::make_shared<Attention>(n, d, w[0], w[1], w[2], w[3], b[0], b[1], b[2], b[3], score, heads);
+    auto att = std::make_shared<Attention>(n, d, w[0], w[1], w[2], w[3], b[0], b[1], b[2], b[3], score, heads);
+    if (softmax) att->set_softmax(sm);
+    layer = att;
+  } else if (tok == "layernorm") {
+    int n, d;
+    double eps, vmin, vmax;
+    uint32_t degree, newton;
+    is >> n >> d >> eps >> vmin >> vmax >> degree >> newton;
+    auto g = read_vec(is, d, "layernorm gamma");
+    auto b = read_vec(is, d, "layernorm beta");
+    layer = std::make_shared<LayerNorm>(n, d, std::move(g), std::move(b), eps, vmin, vmax, degree, newton);
   } else if (tok == "residual") {
     size_t k;
     is >> k;
@@ -233,7 +256,7 @@ enum class Fold {
 Fold fold_kind(const Layer& l) {
   if (dynamic_cast<const Square*>(&l)) return Fold::kSquare;
   if (dynamic_cast<const PolyActivation*>(&l) || dynamic_cast<const ChebyshevActivation*>(&l) ||
-      dynamic_cast<const Scale*>(&l) || dynamic_cast<const FusedLinear*>(&l))
+      dynamic_cast<const Scale*>(&l) || dynamic_cast<const FusedLinear*>(&l) || dynamic_cast<const LayerNorm*>(&l))
     return Fold::kAbsorb;
   if (l.is_bootstrap()) return Fold::kPass;
   if (auto* lin = dynamic_cast<const LinearLayer*>(&l)) {
@@ -266,6 +289,7 @@ void scale_output(std::shared_ptr<Layer>& l, double f) {
   if (auto* c = dynamic_cast<ChebyshevActivation*>(l.get())) return c->rescale(1.0, f);
   if (auto* sc = dynamic_cast<Scale*>(l.get())) return sc->multiply(f);
   if (auto* fu = dynamic_cast<FusedLinear*>(l.get())) return fu->scale(f, f);
+  if (auto* ln = dynamic_cast<LayerNorm*>(l.get())) return ln->scale_output(f);
   auto* lin = dynamic_cast<LinearLayer*>(l.get());
   if (!lin || !lin->trainable()) throw std::logic_error("place_bootstraps: cannot scale " + l->type());
   std::vector<double> p = lin->params();
@@ -294,6 +318,7 @@ void absorb_input(std::shared_ptr<Layer>& l, double c) {
   if (auto* ch = dynamic_cast<ChebyshevActivation*>(l.get())) return ch->rescale(1.0 / c, 1.0);
   if (auto* sc = dynamic_cast<Scale*>(l.get())) return sc->multiply(1.0 / c);
   if (auto* fu = dynamic_cast<FusedLinear*>(l.get())) return fu->scale(1.0 / c, 1.0);
+  if (auto* ln = dynamic_cast<LayerNorm*>(l.get())) return ln->absorb_input_scale(c);
   auto* lin = dynamic_cast<LinearLayer*>(l.get());
   if (!lin || !lin->trainable()) throw std::logic_error("place_bootstraps: cannot rescale " + l->type());
   std::vector<double> p = lin->params();

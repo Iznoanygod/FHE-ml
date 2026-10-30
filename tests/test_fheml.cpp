@@ -338,6 +338,83 @@ void scheme_switching_tests(bool quick) {
   }
 }
 
+// Softmax attention: the polynomial exp / 1/x approximation against exact
+// softmax in the clear, then encrypted, with and without the
+// scheme-switching maximum subtraction.
+std::shared_ptr<Attention> softmax_attention(int n, int d, const SoftmaxOptions& o) {
+  // Small projections keep the scores q.k inside [lo, hi].
+  auto att = std::make_shared<Attention>(n, d, rand_vec(d * d, -0.25, 0.25), rand_vec(d * d, -0.25, 0.25),
+                                         rand_vec(d * d, -0.3, 0.3), rand_vec(d * d, -0.3, 0.3), rand_vec(d, -0.1, 0.1),
+                                         rand_vec(d, -0.1, 0.1), rand_vec(d, -0.1, 0.1), rand_vec(d, -0.1, 0.1),
+                                         std::vector<double>{0.0, 0.0, 1.0}, 2);
+  att->set_softmax(o);
+  return att;
+}
+
+// Exact softmax attention from the layer's own projections.
+std::vector<double> exact_softmax_attention(const Attention& att, const std::vector<double>& x, int n, int d,
+                                            double* max_score) {
+  auto proj = [&](int i, const std::vector<double>& in) {
+    Network pn(Shape{n, 1, d});
+    pn.emplace<TokenDense>(n, d, d, att.weights(i), att.bias(i));
+    return pn.forward_plain(in);
+  };
+  std::vector<double> q = proj(0, x), k = proj(1, x), v = proj(2, x);
+  const int heads = att.heads(), dh = d / heads;
+  std::vector<double> out(n * d, 0.0);
+  *max_score = 0.0;
+  for (int h = 0; h < heads; ++h)
+    for (int i = 0; i < n; ++i) {
+      std::vector<double> sc(n);
+      double m = -1e300;
+      for (int j = 0; j < n; ++j) {
+        sc[j] = 0;
+        for (int c = h * dh; c < (h + 1) * dh; ++c) sc[j] += q[i * d + c] * k[j * d + c];
+        m = std::max(m, sc[j]);
+        *max_score = std::max(*max_score, std::fabs(sc[j]));
+      }
+      double sum = 0;
+      for (double& z : sc) {
+        z = std::exp(z - m);
+        sum += z;
+      }
+      for (int j = 0; j < n; ++j)
+        for (int c = h * dh; c < (h + 1) * dh; ++c) out[i * d + c] += sc[j] / sum * v[j * d + c];
+    }
+  return proj(3, out);
+}
+
+void softmax_tests(bool quick) {
+  const int n = 4, d = 8;
+  for (int subtract_max = 0; subtract_max < 2; ++subtract_max) {
+    SoftmaxOptions o;
+    o.lo = -1.5;
+    o.hi = 1.5;
+    o.exp_degree = 15;
+    o.inv_degree = 31;
+    o.newton = subtract_max ? 1 : 2;
+    o.subtract_max = subtract_max != 0;
+    const std::string what = subtract_max ? "softmax attention, max subtracted" : "softmax attention";
+    Network net(Shape{n, 1, d});
+    auto att = softmax_attention(n, d, o);
+    net.add(att);
+    auto x = rand_vec(n * d);
+    double max_score = 0;
+    auto ref = exact_softmax_attention(*att, x, n, d, &max_score);
+    check(max_score <= 1.5, what + " scores in range", "(max |q.k| " + std::to_string(max_score) + ")");
+    check_err(what + " plain vs exact softmax", max_err(ref, net.forward_plain(x), ref.size()), 1e-4);
+    const char* path = "test_softmax_rt.fheml";
+    net.save(path);
+    Network back = Network::load(path);
+    std::remove(path);
+    check_err(what + " save/load round trip", max_err(net.forward_plain(x), back.forward_plain(x), ref.size()),
+              1e-12);
+    if (quick && subtract_max) continue;
+    if (subtract_max && gpu_backend_built()) continue;
+    check_encrypted(what, net, 1e-3);
+  }
+}
+
 void transformer_tests() {
   {
     Network n(Shape{5, 1, 6});
@@ -355,6 +432,37 @@ void transformer_tests() {
     std::remove(path);
     auto x = rand_vec(20);
     check_err("transformer save/load round trip", max_err(net.forward_plain(x), back.forward_plain(x), 3), 1e-12);
+  }
+  {
+    // LayerNorm in the clear against the exact formula, save/load, and the
+    // scale folds place_bootstraps relies on.
+    const int n = 3, d = 8;
+    auto gamma = rand_vec(d, 0.5, 1.5), beta = rand_vec(d, -0.2, 0.2);
+    Network net(Shape{n, 1, d});
+    net.emplace<LayerNorm>(n, d, gamma, beta, 1e-5, 0.05, 1.2, 31, 1);
+    auto x = rand_vec(n * d);
+    auto y = net.forward_plain(x);
+    std::vector<double> ref(x.size());
+    for (int t = 0; t < n; ++t) {
+      double mean = 0, var = 0;
+      for (int j = 0; j < d; ++j) mean += x[t * d + j] / d;
+      for (int j = 0; j < d; ++j) var += (x[t * d + j] - mean) * (x[t * d + j] - mean) / d;
+      for (int j = 0; j < d; ++j) ref[t * d + j] = gamma[j] * (x[t * d + j] - mean) / std::sqrt(var + 1e-5) + beta[j];
+    }
+    check_err("layernorm plain vs exact", max_err(ref, y, ref.size()), 1e-6);
+    const char* path = "test_layernorm.fheml";
+    net.save(path);
+    Network back = Network::load(path);
+    std::remove(path);
+    check_err("layernorm save/load round trip", max_err(y, back.forward_plain(x), y.size()), 1e-12);
+    auto* ln = dynamic_cast<LayerNorm*>(net.layers()[0].get());
+    ln->absorb_input_scale(0.25);
+    std::vector<double> xs(x);
+    for (double& v : xs) v *= 0.25;
+    check_err("layernorm absorbs an input scale", max_err(y, net.forward_plain(xs), y.size()), 1e-9);
+    ln->scale_output(3.0);
+    for (double& v : y) v *= 3.0;
+    check_err("layernorm scales its output", max_err(y, net.forward_plain(xs), y.size()), 1e-9);
   }
   {
     // Attention alone; n = 5 is not a power of two on purpose.
@@ -434,6 +542,43 @@ void transformer_tests() {
     net3.compile();
     check(net3.layers()[1]->in_layout().cs == 16, "transformer keeps the padded token stride");
     check_encrypted("tiny transformer, strided tokens", net3, 1e-3);
+  }
+  {
+    // The variance interval is calibrated like a Chebyshev interval: here
+    // from the per-token variance of d uniform(-1, 1) values (about 1/3).
+    const int n = 3, d = 8;
+    Network a(Shape{n, 1, d});
+    a.emplace<LayerNorm>(n, d, rand_vec(d, 0.5, 1.5), rand_vec(d, -0.2, 0.2), 1e-5, 0.05, 1.2, 31, 1);
+    check_encrypted("layernorm", a, 1e-3);
+    // Padded token stride: tokendense keeps the 16-slot stride, the norm
+    // must not read the padding. The tokendense outputs have a smaller,
+    // input-dependent variance; the test checks what it will be.
+    Network b(Shape{n, 1, 16});
+    b.emplace<TokenDense>(n, 16, d, rand_vec(16 * d, -0.3, 0.3), rand_vec(d, -0.1, 0.1));
+    {
+      double lo = 1e9, hi = 0;
+      for (int probe = 0; probe < 20; ++probe) {
+        auto h = b.forward_plain(rand_vec(n * 16));
+        for (int t = 0; t < n; ++t) {
+          double mean = 0, var = 0;
+          for (int j = 0; j < d; ++j) mean += h[t * d + j] / d;
+          for (int j = 0; j < d; ++j) var += (h[t * d + j] - mean) * (h[t * d + j] - mean) / d;
+          lo = std::min(lo, var);
+          hi = std::max(hi, var);
+        }
+      }
+      b.emplace<LayerNorm>(n, d, rand_vec(d, 0.5, 1.5), rand_vec(d, -0.2, 0.2), 1e-5, 0.25 * lo, 4.0 * hi, 31, 1);
+    }
+    check_encrypted("layernorm, strided tokens", b, 1e-3);
+    // Pre-norm residual MLP block.
+    std::vector<std::shared_ptr<Layer>> body = {
+        std::make_shared<LayerNorm>(n, d, rand_vec(d, 0.5, 1.5), rand_vec(d, -0.2, 0.2), 1e-5, 0.05, 1.2, 31, 1),
+        std::make_shared<TokenDense>(n, d, 2 * d, rand_vec(2 * d * d, -0.3, 0.3), rand_vec(2 * d, -0.1, 0.1)),
+        std::make_shared<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25}),
+        std::make_shared<TokenDense>(n, 2 * d, d, rand_vec(2 * d * d, -0.3, 0.3), rand_vec(d, -0.1, 0.1))};
+    Network c(Shape{n, 1, d});
+    c.add(std::make_shared<Residual>(body));
+    check_encrypted("pre-norm residual block", c, 1e-3);
   }
 }
 
@@ -694,6 +839,7 @@ int main(int argc, char** argv) {
   encrypted_tests(quick);
   scheme_switching_tests(quick);
   transformer_tests();
+  softmax_tests(quick);
   std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");
   return g_failures ? 1 : 0;
 }

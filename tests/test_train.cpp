@@ -48,17 +48,16 @@ using Layers = std::vector<std::shared_ptr<Layer>>;
 using Builder = std::function<Network()>;
 
 // Every trainable layer, depth first.
-void linear_layers(const Layers& ls, std::vector<LinearLayer*>& out) {
+void trainable_layers(const Layers& ls, std::vector<Layer*>& out) {
   for (const auto& l : ls) {
-    if (auto* r = dynamic_cast<Residual*>(l.get())) linear_layers(r->body(), out);
-    if (auto* lin = dynamic_cast<LinearLayer*>(l.get()))
-      if (lin->trainable()) out.push_back(lin);
+    if (auto* r = dynamic_cast<Residual*>(l.get())) trainable_layers(r->body(), out);
+    if (l->trainable()) out.push_back(l.get());
   }
 }
 
 std::vector<double> all_params(const Network& net) {
-  std::vector<LinearLayer*> ls;
-  linear_layers(net.layers(), ls);
+  std::vector<Layer*> ls;
+  trainable_layers(net.layers(), ls);
   std::vector<double> p;
   for (auto* l : ls) {
     auto q = l->params();
@@ -122,6 +121,93 @@ Network tokens(unsigned seed) {
   return n;
 }
 
+// LayerNorm over 4 features per token (variance range calibrated on random
+// inputs; eps keeps 1/sqrt(v + eps) smooth down to v = 0), trained gamma and
+// beta.
+std::shared_ptr<LayerNorm> layernorm(int t, int d, Rng& r, const Network& prefix) {
+  std::vector<double> gamma(d), beta = r.vec(d, 0.2);
+  for (double& g : gamma) g = 1.0 + r.vec(1, 0.5)[0];
+  double var_max = 0.0;
+  Rng cal(55);
+  for (int i = 0; i < 32; ++i) {
+    std::vector<double> x = prefix.forward_plain(cal.vec(prefix.input_shape().size(), 1.0));
+    for (int tok = 0; tok < t; ++tok) {
+      double m = 0.0, m2 = 0.0;
+      for (int j = 0; j < d; ++j) {
+        m += x[tok * d + j];
+        m2 += x[tok * d + j] * x[tok * d + j];
+      }
+      var_max = std::max(var_max, m2 / d - (m / d) * (m / d));
+    }
+  }
+  return std::make_shared<LayerNorm>(t, d, gamma, beta, 0.05, 0.0, 2.0 * var_max, 31, 1);
+}
+
+Network norm_tokens(unsigned seed) {
+  Rng r(seed);
+  const int t = 3, d = 4;
+  const std::vector<double> w = r.vec(20, 0.4), b = r.vec(d, 0.1);
+  Network prefix(Shape{t, 1, 5});
+  prefix.emplace<TokenDense>(t, 5, d, w, b);
+  prefix.compile();
+  Network n(Shape{t, 1, 5});
+  n.emplace<TokenDense>(t, 5, d, w, b)
+      .add(layernorm(t, d, r, prefix))
+      .emplace<TokenMean>(t, d)
+      .emplace<Dense>(d, 2, r.vec(8, 0.4), r.vec(2, 0.1));
+  return n;
+}
+
+std::shared_ptr<Attention> attention(int t, int d, Rng& r, bool softmax) {
+  auto a = std::make_shared<Attention>(t, d, r.vec(d * d, 0.2), r.vec(d * d, 0.2), r.vec(d * d, 0.2), r.vec(d * d, 0.2),
+                                       r.vec(d, 0.1), r.vec(d, 0.1), r.vec(d, 0.1), r.vec(d, 0.1),
+                                       std::vector<double>{4.0 / (8 * t), 4.0 / (8 * t), 1.0 / (8 * t)}, 2);
+  if (softmax) {
+    SoftmaxOptions o;
+    o.lo = -1.5;
+    o.hi = 1.5;
+    o.exp_degree = 15;
+    o.inv_degree = 31;
+    o.newton = 2;
+    a->set_softmax(o);
+  }
+  return a;
+}
+
+// Two-head attention (quadratic or softmax scores) between token layers.
+Network attention_tokens(unsigned seed, bool softmax) {
+  Rng r(seed);
+  const int t = 4, d = 8;
+  Network n(Shape{t, 1, 5});
+  n.emplace<TokenDense>(t, 5, d, r.vec(40, 0.4), r.vec(d, 0.1))
+      .add(attention(t, d, r, softmax))
+      .emplace<TokenMean>(t, d)
+      .emplace<Dense>(d, 2, r.vec(16, 0.4), r.vec(2, 0.1));
+  return n;
+}
+
+// A pre-norm transformer block: LayerNorm + softmax attention, LayerNorm +
+// MLP, each with a residual connection.
+Network transformer_block(unsigned seed) {
+  Rng r(seed);
+  const int t = 4, d = 8;
+  const std::vector<double> w = r.vec(40, 0.4), b = r.vec(d, 0.1);
+  Network prefix(Shape{t, 1, 5});
+  prefix.emplace<TokenDense>(t, 5, d, w, b);
+  prefix.compile();
+  Layers attn = {layernorm(t, d, r, prefix), attention(t, d, r, true)};
+  Layers mlp = {layernorm(t, d, r, prefix), std::make_shared<TokenDense>(t, d, 16, r.vec(128, 0.3), r.vec(16, 0.1)),
+                std::make_shared<ChebyshevActivation>("silu", -3.0, 3.0, 7),
+                std::make_shared<TokenDense>(t, 16, d, r.vec(128, 0.2), r.vec(d, 0.1))};
+  Network n(Shape{t, 1, 5});
+  n.emplace<TokenDense>(t, 5, d, w, b)
+      .add(std::make_shared<Residual>(attn))
+      .add(std::make_shared<Residual>(mlp))
+      .emplace<TokenMean>(t, d)
+      .emplace<Dense>(d, 2, r.vec(16, 0.4), r.vec(2, 0.1));
+  return n;
+}
+
 struct Batch {
   std::vector<std::vector<double>> xs, ts;
 };
@@ -161,8 +247,8 @@ void gradient_check(const std::string& name, const Builder& make, const std::vec
   double err = 0, scale = 0;
   size_t k = 0;
   for (size_t top = 0; top < ref.layers().size(); ++top) {
-    std::vector<LinearLayer*> ls;
-    linear_layers({ref.layers()[top]}, ls);
+    std::vector<Layer*> ls;
+    trainable_layers({ref.layers()[top]}, ls);
     const bool is_frozen = std::find(frozen.begin(), frozen.end(), top) != frozen.end();
     for (auto* l : ls) {
       std::vector<double> p = l->params();
@@ -235,9 +321,9 @@ void encrypted_check(const std::string& name, const Builder& make, size_t update
   if (!frozen.empty()) {
     // Frozen layers keep their weights.
     Network orig = make();
-    auto* a = dynamic_cast<LinearLayer*>(orig.layers()[frozen[0]].get());
-    auto* c = dynamic_cast<LinearLayer*>(enc.layers()[frozen[0]].get());
-    check(a && c && max_diff(a->params(), c->params()) == 0.0, name + " frozen layer unchanged");
+    Layer* a = orig.layers()[frozen[0]].get();
+    Layer* c = enc.layers()[frozen[0]].get();
+    check(max_diff(a->params(), c->params()) == 0.0, name + " frozen layer unchanged");
   }
 }
 
@@ -252,6 +338,11 @@ int main(int argc, char** argv) {
   gradient_check("strided cnn", [] { return strided_cnn(3); });
   gradient_check("tokens (residual, chebyshev, per-token bias)", [] { return tokens(4); });
   gradient_check("mlp, first layer frozen", [] { return mlp(5); }, {0});
+  gradient_check("layernorm (gamma, beta, backward through the normalisation)", [] { return norm_tokens(9); });
+  gradient_check("quadratic attention (two heads)", [] { return attention_tokens(10, false); });
+  gradient_check("softmax attention (two heads)", [] { return attention_tokens(11, true); });
+  gradient_check("softmax attention, frozen", [] { return attention_tokens(11, true); }, {1});
+  gradient_check("pre-norm transformer block", [] { return transformer_block(12); });
 
   encrypted_check("mlp", [] { return mlp(1); }, 1, false, 1e-4);
   encrypted_check("mlp, two updates", [] { return mlp(1); }, 2, false, 1e-4);
@@ -259,6 +350,10 @@ int main(int argc, char** argv) {
   encrypted_check("strided cnn", [] { return strided_cnn(3); }, 1, false, 1e-4);
   encrypted_check("tokens", [] { return tokens(4); }, 1, false, 1e-4);
   encrypted_check("mlp, fine-tune last layer", [] { return mlp(5); }, 1, false, 1e-4, {0});
+  encrypted_check("layernorm", [] { return norm_tokens(9); }, 1, false, 1e-4);
+  encrypted_check("quadratic attention", [] { return attention_tokens(10, false); }, 1, false, 1e-4);
+  encrypted_check("softmax attention", [] { return attention_tokens(11, true); }, 1, false, 1e-4);
+  if (!quick) encrypted_check("softmax attention, frozen (forward only)", [] { return attention_tokens(11, true); }, 1, false, 1e-4, {1});
   // Rotation-key ladder: the same training with composed rotations.
   encrypted_check("cnn, ladder window 1", [] { return cnn(2); }, 1, false, 1e-4, {}, 0.5, 1);
   encrypted_check("mlp, fine-tune last layer, ladder window 3", [] { return mlp(5); }, 1, false, 1e-4, {0}, 0.5, 3);

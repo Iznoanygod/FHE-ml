@@ -78,12 +78,14 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("depth", &Layer::depth)
       .def_property_readonly("in_shape", &Layer::in_shape)
       .def_property_readonly("out_shape", &Layer::out_shape)
-      .def("forward_plain", &Layer::forward_plain);
+      .def("forward_plain", &Layer::forward_plain)
+      .def("params", &Layer::params,
+           "Trainable values: weights then biases (linear layers), gamma then beta (layernorm), the four "
+           "projections' params (attention); empty for other layers.")
+      .def("set_params", &Layer::set_params, py::arg("params"))
+      .def_property_readonly("trainable", &Layer::trainable);
 
-  py::class_<LinearLayer, Layer, std::shared_ptr<LinearLayer>>(m, "LinearLayer")
-      .def("params", &LinearLayer::params, "Trainable values: weights, then biases.")
-      .def("set_params", &LinearLayer::set_params, py::arg("params"))
-      .def_property_readonly("trainable", &LinearLayer::trainable);
+  py::class_<LinearLayer, Layer, std::shared_ptr<LinearLayer>>(m, "LinearLayer");
   py::class_<Conv2d, LinearLayer, std::shared_ptr<Conv2d>>(m, "Conv2d")
       .def(py::init<int, int, int, int, int, int, Vec, Vec>(), py::arg("in_channels"), py::arg("out_channels"),
            py::arg("kh"), py::arg("kw"), py::arg("stride"), py::arg("pad"), py::arg("weights"),
@@ -115,13 +117,34 @@ PYBIND11_MODULE(_fheml, m) {
   py::class_<Bootstrap, Layer, std::shared_ptr<Bootstrap>>(m, "Bootstrap").def(py::init<>());
   py::class_<Residual, Layer, std::shared_ptr<Residual>>(m, "Residual")
       .def(py::init<std::vector<LayerPtr>>(), py::arg("body"));
+  py::class_<LayerNorm, Layer, std::shared_ptr<LayerNorm>>(m, "LayerNorm")
+      .def(py::init<int, int, Vec, Vec, double, double, double, uint32_t, uint32_t>(), py::arg("tokens"),
+           py::arg("dim"), py::arg("gamma"), py::arg("beta"), py::arg("eps") = 1e-5, py::arg("var_min") = 0.1,
+           py::arg("var_max") = 1.0, py::arg("degree") = 15, py::arg("newton") = 1,
+           "Per-token layer norm; 1/sqrt(var + eps) is a degree-`degree` Chebyshev series on "
+           "[var_min, var_max] refined by `newton` Newton steps.")
+      .def("inv_sqrt", &LayerNorm::inv_sqrt, py::arg("var"));
+  py::class_<SoftmaxOptions>(m, "SoftmaxOptions")
+      .def(py::init<>())
+      .def_readwrite("lo", &SoftmaxOptions::lo)
+      .def_readwrite("hi", &SoftmaxOptions::hi)
+      .def_readwrite("exp_degree", &SoftmaxOptions::exp_degree)
+      .def_readwrite("inv_degree", &SoftmaxOptions::inv_degree)
+      .def_readwrite("newton", &SoftmaxOptions::newton)
+      .def_readwrite("subtract_max", &SoftmaxOptions::subtract_max)
+      .def_readwrite("sum_lo", &SoftmaxOptions::sum_lo)
+      .def_readwrite("sum_hi", &SoftmaxOptions::sum_hi);
   py::class_<Attention, Layer, std::shared_ptr<Attention>>(m, "Attention")
       .def(py::init<int, int, Vec, Vec, Vec, Vec, Vec, Vec, Vec, Vec, Vec, int>(), py::arg("tokens"), py::arg("dim"),
            py::arg("wq"), py::arg("wk"), py::arg("wv"), py::arg("wo"), py::arg("bq") = Vec{}, py::arg("bk") = Vec{},
            py::arg("bv") = Vec{}, py::arg("bo") = Vec{}, py::arg("score") = Vec{0.0, 0.0, 1.0}, py::arg("heads") = 1,
            "Self-attention with `heads` heads of width dim/heads; score is (c0, c1, c2) shared by all heads "
            "or 3*heads values, one polynomial per head.")
-      .def_property_readonly("heads", &Attention::heads);
+      .def_property_readonly("heads", &Attention::heads)
+      .def("set_softmax", &Attention::set_softmax, py::arg("options"),
+           "Softmax scores (polynomial exp and 1/x, optionally with the row maximum subtracted through "
+           "scheme switching) instead of the quadratic score function; compile the network again afterwards.")
+      .def_property_readonly("softmax", &Attention::softmax);
 
   py::class_<Network>(m, "Network")
       .def(py::init<Shape>(), py::arg("input_shape"))

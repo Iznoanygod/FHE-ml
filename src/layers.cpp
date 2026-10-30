@@ -57,10 +57,6 @@ void split(const std::vector<double>& p, std::vector<double>& w, std::vector<dou
 
 // ----------------------------------------------------------------- LinearLayer
 
-void LinearLayer::set_params(const std::vector<double>& p) {
-  if (!p.empty()) throw std::logic_error(type() + ": has no trainable parameters");
-}
-
 Layout LinearLayer::configure_layout(const Layout& in, bool gapped) {
   in_layout_ = in;
   const size_t s = static_cast<size_t>(gap_stride());

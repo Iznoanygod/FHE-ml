@@ -19,9 +19,14 @@
 // update, after which the weights are bootstrapped so the next step starts
 // fresh; without bootstrapping only as many updates fit as the depth allows.
 //
-// The layers before the first trainable layer (`frozen`, or untrainable layers
-// such as attention) only run forward, with their ordinary encrypted
-// evaluation, so fine-tuning the last layers of any network is the same API.
+// Layer norms train gamma and beta (shared over the tokens like a conv tap)
+// and backpropagate through the normalisation with the forward's 1/sqrt;
+// attention trains its four projections and backpropagates through the
+// scores (quadratic or softmax) with the forward's rotated keys and values.
+//
+// The layers before the first trainable layer (`frozen`) only run forward,
+// with their ordinary encrypted evaluation, so fine-tuning the last layers
+// of any network is the same API.
 //
 // This is slow: every weight diagonal is a ciphertext, and each update
 // bootstraps all of them. It exists to show the full pipeline works.
@@ -41,7 +46,7 @@ class Trainer {
   // `net` must be compiled and outlive the trainer. `frozen` lists top-level
   // layer indices whose weights stay fixed. From the first trainable layer on
   // the network may contain linear layers, square / poly / chebyshev
-  // activations, bootstrap and residual layers.
+  // activations, layernorm, attention, bootstrap and residual layers.
   explicit Trainer(Network& net, std::vector<size_t> frozen = {});
   ~Trainer();
   Trainer(const Trainer&) = delete;

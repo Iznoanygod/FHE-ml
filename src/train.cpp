@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include "fheml/transformer.h"
+#include "math/chebyshev.h"
 
 namespace fheml {
 
@@ -31,6 +32,12 @@ Ctxt sum(const FHEContext& ctx, std::vector<Ctxt> v) {
   for (size_t step = 1; step < v.size(); step *= 2)
     for (size_t i = 0; i + step < v.size(); i += 2 * step) ctx.cc()->EvalAddInPlace(v[i], v[i + step]);
   return v.at(0);
+}
+
+std::vector<double> scaled(const std::vector<double>& mask, double s) {
+  std::vector<double> v(mask);
+  for (double& x : v) x *= s;
+  return v;
 }
 
 void add_to(const FHEContext& ctx, Ctxt& acc, const Ctxt& c) {
@@ -99,7 +106,7 @@ std::vector<double> activation_derivative_plain(const Layer& l, const std::vecto
 bool contains(const std::vector<size_t>& v, size_t x) { return std::find(v.begin(), v.end(), x) != v.end(); }
 
 bool has_trainable(const Layer& l) {
-  if (auto* lin = dynamic_cast<const LinearLayer*>(&l)) return lin->trainable();
+  if (l.trainable()) return true;
   if (auto* r = dynamic_cast<const Residual*>(&l)) {
     for (const auto& b : r->body())
       if (has_trainable(*b)) return true;
@@ -119,12 +126,15 @@ size_t first_trainable(const Network& net, const std::vector<size_t>& frozen) {
 // ----------------------------------------------------------------------- Node
 
 struct Trainer::Node {
-  enum Kind { kLinear, kSquare, kPoly, kCheb, kBoot, kResidual } kind = kLinear;
+  enum Kind { kLinear, kSquare, kPoly, kCheb, kBoot, kResidual, kNorm, kAttn } kind = kLinear;
   Layer* layer = nullptr;
   bool trainable = false;
 
   // kLinear: y = sum_i D_i (*) rot_{offs[i]}(x) + B
+  // kNorm: y = D_0 (*) (x - mean) (*) r + B with gamma in D_0 and beta in B
+  // (the diagonal/bias machinery below handles their sharing over the tokens).
   LinearLayer* lin = nullptr;
+  LayerNorm* norm = nullptr;
   std::vector<int32_t> offs;
   std::vector<std::vector<double>> diag;  // initial values (and the constants of a frozen layer)
   std::vector<double> bias;               // in output slots; empty = no bias
@@ -150,7 +160,17 @@ struct Trainer::Node {
   std::vector<double> dcoef;
   double a = -1.0, b = 1.0;
 
-  std::vector<std::unique_ptr<Node>> body;  // kResidual
+  // kNorm: x - mean and 1/sqrt(var + eps) of the current sample.
+  Ctxt centred, r;
+
+  // kAttn: body holds the four projection nodes (q, k, v, o); the rest is
+  // the current sample's attention internals (see attention_forward).
+  Attention* att = nullptr;
+  std::vector<Ctxt> kr, vr;  // rotated (cyclic) keys and values per token offset
+  std::vector<Ctxt> p, aw, A;  // scores, head-slot weights, weights broadcast over the head
+  Ctxt q, o, y;               // queries, sum_s A_s (*) v_s before the softmax division, 1 / row sum
+
+  std::vector<std::unique_ptr<Node>> body;  // kResidual, kAttn
 };
 
 namespace {
@@ -184,6 +204,62 @@ std::unique_ptr<Node> build(Layer* l, bool train, uint32_t slots) {
   }
   if (dynamic_cast<Bootstrap*>(l)) {
     n->kind = Node::kBoot;
+    return n;
+  }
+  if (auto* at = dynamic_cast<Attention*>(l)) {
+    n->kind = Node::kAttn;
+    n->att = at;
+    n->trainable = train;
+    for (int i = 0; i < 4; ++i) n->body.push_back(build(at->projection(i).get(), train, slots));
+    return n;
+  }
+  if (auto* ln = dynamic_cast<LayerNorm*>(l)) {
+    n->kind = Node::kNorm;
+    n->norm = ln;
+    n->trainable = train;
+    const Shape& out = ln->out_shape();
+    const Layout& ol = ln->out_layout();
+    n->window = 1;
+    while (n->window < ol.span(out)) n->window *= 2;
+    const int d = ln->dim(), tokens = ln->tokens();
+    n->offs = {0};
+    n->diag.emplace_back(slots, 0.0);
+    n->bias.assign(slots, 0.0);
+    n->unshared.assign(1, {});
+    if (n->trainable) {
+      n->owner.emplace_back(slots, -1);
+      n->bias_owner.assign(slots, -1);
+    }
+    std::vector<std::vector<double>> masks(static_cast<size_t>(d), std::vector<double>(slots, 0.0));
+    for (int t = 0; t < tokens; ++t)
+      for (int j = 0; j < d; ++j) {
+        const size_t sl = ol.slot(out, static_cast<size_t>(t) * d + j);
+        n->diag[0][sl] = ln->gamma()[static_cast<size_t>(j)];
+        n->bias[sl] = ln->beta()[static_cast<size_t>(j)];
+        if (n->trainable) {
+          n->owner[0][sl] = j;
+          n->bias_owner[sl] = d + j;
+        }
+        masks[static_cast<size_t>(j)][sl] = 1.0;
+      }
+    if (n->trainable) {
+      if (tokens == 1) {
+        n->unshared[0].assign(slots, 0.0);
+        n->bias_unshared.assign(slots, 0.0);
+        for (int j = 0; j < d; ++j)
+          for (uint32_t sl = 0; sl < slots; ++sl)
+            if (masks[static_cast<size_t>(j)][sl] != 0.0) n->unshared[0][sl] = n->bias_unshared[sl] = 1.0;
+      } else {
+        // gamma_j and beta_j are shared by every token.
+        for (int j = 0; j < d; ++j) {
+          Node::Group gg, gb;
+          gg.masks.emplace_back(0, masks[static_cast<size_t>(j)]);
+          gb.masks.emplace_back(-1, masks[static_cast<size_t>(j)]);
+          n->groups.push_back(std::move(gg));
+          n->groups.push_back(std::move(gb));
+        }
+      }
+    }
     return n;
   }
   auto* lin = dynamic_cast<LinearLayer*>(l);
@@ -298,6 +374,46 @@ struct SimTrace {
   std::vector<SimTrace> body;
 };
 
+// Levels of the attention internals of forward (see attention_forward), from
+// the input level z.
+struct AttnLevels {
+  uint32_t q, p, a, osum, y, o, out;
+};
+
+AttnLevels attention_levels(Sim& s, const Node& n, uint32_t z) {
+  const Attention& at = *n.att;
+  AttnLevels L{};
+  L.q = s.see(std::max(z, n.body[0]->trainable ? s.w : z) + 1);
+  L.p = s.see(L.q + 1);
+  if (at.softmax()) {
+    const SoftmaxOptions& o = at.softmax_options();
+    if (o.subtract_max) {
+      uint32_t rounds = 0;
+      for (int m = at.tokens(); m > 1; m = (m + 1) / 2) ++rounds;
+      L.p = s.see(std::max(L.p, FHEContext::compare_depth() + rounds));
+    }
+    L.a = s.see(L.p + poly_depth(o.exp_degree) + 1 + 1);
+    L.osum = s.see(L.a + 1);
+    L.y = s.see(L.a + poly_depth(o.inv_degree) + 1 + 2 * o.newton);
+    L.o = s.see(std::max(L.osum, L.y) + 1);
+  } else {
+    L.a = s.see(L.p + 2);
+    L.osum = L.o = s.see(L.a + 1);
+    L.y = 0;
+  }
+  L.out = s.see(std::max(L.o, n.body[3]->trainable ? s.w : L.o) + 1);
+  return L;
+}
+
+uint32_t sim_linear_backward(Sim& s, const Node& n, uint32_t g, uint32_t z) {
+  if (n.trainable) {
+    uint32_t grad = s.see(std::max(g, z) + 1);
+    uint32_t upd = s.see(grad + (n.groups.empty() ? 1 : 2));
+    s.new_w = std::max(s.new_w, std::max(s.w, upd));
+  }
+  return s.see(std::max(g, n.trainable ? s.w : g) + 1);
+}
+
 uint32_t sim_forward(Sim& s, const std::vector<std::unique_ptr<Node>>& nodes, uint32_t x, SimTrace& tr) {
   tr.in.assign(nodes.size(), 0);
   tr.body.assign(nodes.size(), {});
@@ -306,6 +422,13 @@ uint32_t sim_forward(Sim& s, const std::vector<std::unique_ptr<Node>>& nodes, ui
     tr.in[i] = x;
     switch (n.kind) {
       case Node::kLinear: x = s.see(std::max(x, n.trainable ? s.w : x) + 1); break;
+      case Node::kNorm: {
+        const uint32_t rl = s.see(x + n.norm->inv_sqrt_depth());
+        const uint32_t cg = s.see(std::max(x, n.trainable ? s.w : x) + 1);
+        x = s.see(std::max(cg, rl) + 1);
+        break;
+      }
+      case Node::kAttn: x = attention_levels(s, n, x).out; break;
       case Node::kSquare:
       case Node::kPoly:
       case Node::kCheb: x = s.see(x + n.layer->depth()); break;
@@ -328,14 +451,42 @@ uint32_t sim_backward(Sim& s, const std::vector<std::unique_ptr<Node>>& nodes, c
     const Node& n = *nodes[k];
     const uint32_t z = tr.in[k];
     switch (n.kind) {
-      case Node::kLinear:
+      case Node::kLinear: g = sim_linear_backward(s, n, g, z); break;
+      case Node::kNorm: {
+        const uint32_t rl = z + n.norm->inv_sqrt_depth();
+        const uint32_t xh = s.see(rl + 1);  // x_hat = centred (*) r
+        const uint32_t gg = s.see(std::max(g, n.trainable ? s.w : g) + 1);
         if (n.trainable) {
-          uint32_t grad = s.see(std::max(g, z) + 1);
+          uint32_t grad = s.see(std::max(g, xh) + 1);
           uint32_t upd = s.see(grad + (n.groups.empty() ? 1 : 2));
           s.new_w = std::max(s.new_w, std::max(s.w, upd));
         }
-        g = s.see(std::max(g, n.trainable ? s.w : g) + 1);
+        const uint32_t m2 = s.see(std::max(gg, xh) + 2);  // block mean of gg (*) x_hat
+        const uint32_t inner = s.see(m2 + 1);            // gg - m1 - x_hat (*) m2
+        g = s.see(std::max(inner, rl) + 1);
         break;
+      }
+      case Node::kAttn: {
+        const AttnLevels L = attention_levels(s, n, z);
+        const uint32_t g3 = sim_linear_backward(s, *n.body[3], g, L.o);
+        uint32_t ldo = g3, dp;
+        if (n.att->softmax()) {
+          ldo = s.see(std::max(g3, L.y) + 1);
+          const uint32_t c = s.see(std::max(s.see(std::max(g3, L.osum) + 1), L.y + 1) + 1);
+          const uint32_t dA = s.see(std::max(s.see(std::max(ldo, L.q) + 1), c));
+          dp = s.see(std::max(dA, L.a) + 1);
+        } else {
+          const uint32_t dA = s.see(std::max(g3, L.q) + 1);
+          dp = s.see(std::max(dA, L.p + 1) + 1);
+        }
+        const uint32_t dq = s.see(std::max(dp, L.q) + 1);
+        const uint32_t dv = s.see(std::max(ldo, L.a) + 1);
+        uint32_t gx = sim_linear_backward(s, *n.body[0], dq, z);
+        gx = std::max(gx, sim_linear_backward(s, *n.body[1], dq, z));
+        gx = std::max(gx, sim_linear_backward(s, *n.body[2], dv, z));
+        g = gx;
+        break;
+      }
       case Node::kSquare:
       case Node::kPoly:
       case Node::kCheb:
@@ -353,9 +504,29 @@ uint32_t sim_backward(Sim& s, const std::vector<std::unique_ptr<Node>>& nodes, c
 
 void collect_rotations(const std::vector<std::unique_ptr<Node>>& nodes, uint32_t slots, std::set<int32_t>& r,
                        bool& allsum) {
+  auto add = [&](int64_t k) {
+    int32_t m = normalize_rotation(k, slots);
+    if (m) r.insert(m);
+  };
   for (const auto& n : nodes) {
-    if (n->kind == Node::kResidual) collect_rotations(n->body, slots, r, allsum);
-    if (n->kind != Node::kLinear) continue;
+    if (n->kind == Node::kResidual || n->kind == Node::kAttn) collect_rotations(n->body, slots, r, allsum);
+    if (n->kind == Node::kNorm)
+      for (int32_t k : n->norm->rotation_indices()) add(k);
+    if (n->kind == Node::kAttn) {
+      const Attention& at = *n->att;
+      const int64_t nd = static_cast<int64_t>(at.tokens()) * at.stride();
+      add(nd);
+      add(-nd);
+      for (int s = 1; s < at.tokens(); ++s) {
+        add(static_cast<int64_t>(s) * at.stride());
+        add(-static_cast<int64_t>(s) * at.stride());
+      }
+      for (int t = 1; t < at.head_width(); t *= 2) {
+        add(t);
+        add(-t);
+      }
+    }
+    if (n->kind != Node::kLinear && n->kind != Node::kNorm) continue;
     for (int32_t d : n->offs) {
       if (d) r.insert(d);
       int32_t m = normalize_rotation(-static_cast<int64_t>(d), slots);
@@ -370,19 +541,29 @@ void collect_rotations(const std::vector<std::unique_ptr<Node>>& nodes, uint32_t
   }
 }
 
+// Every node with weight ciphertexts (linear layers, layer norms, the
+// attention projections), depth first.
 template <typename F>
-void for_each_linear(std::vector<std::unique_ptr<Node>>& nodes, F f) {
+void for_each_weighted(std::vector<std::unique_ptr<Node>>& nodes, F f) {
   for (auto& n : nodes) {
-    if (n->kind == Node::kResidual) for_each_linear(n->body, f);
-    if (n->kind == Node::kLinear) f(*n);
+    if (n->kind == Node::kResidual || n->kind == Node::kAttn) for_each_weighted(n->body, f);
+    if (n->kind == Node::kLinear || n->kind == Node::kNorm) f(*n);
   }
 }
 
 template <typename F>
-void for_each_linear(const std::vector<std::unique_ptr<Node>>& nodes, F f) {
+void for_each_weighted(const std::vector<std::unique_ptr<Node>>& nodes, F f) {
   for (const auto& n : nodes) {
-    if (n->kind == Node::kResidual) for_each_linear(n->body, f);
-    if (n->kind == Node::kLinear) f(*n);
+    if (n->kind == Node::kResidual || n->kind == Node::kAttn) for_each_weighted(n->body, f);
+    if (n->kind == Node::kLinear || n->kind == Node::kNorm) f(*n);
+  }
+}
+
+template <typename F>
+void for_each_attention(std::vector<std::unique_ptr<Node>>& nodes, F f) {
+  for (auto& n : nodes) {
+    if (n->kind == Node::kResidual) for_each_attention(n->body, f);
+    if (n->kind == Node::kAttn) f(*n);
   }
 }
 
@@ -405,11 +586,190 @@ Ctxt linear_forward(const FHEContext& ctx, Node& n, const Ctxt& x) {
   return y;
 }
 
+// dL/dD_i = g (*) rot_i(x) summed over the batch; returns dL/dx when asked.
+Ctxt linear_backward(const FHEContext& ctx, Node& n, const Ctxt& g, bool need) {
+  const CC& cc = ctx.cc();
+  if (n.trainable) {
+    const std::vector<Ctxt> rot = ctx.rotate_many(n.in, n.offs);
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+    for (size_t i = 0; i < n.offs.size(); ++i) add_to(ctx, n.gD[i], cc->EvalMult(g, rot[i]));
+    if (n.B) add_to(ctx, n.gB, g);
+  }
+  n.in = nullptr;
+  if (!need) return nullptr;
+  std::vector<Ctxt> terms(n.offs.size());
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+  for (size_t i = 0; i < n.offs.size(); ++i) {
+    Ctxt t = n.trainable ? cc->EvalMult(n.D[i], g) : mul_plain(ctx, g, n.diag[i]);
+    terms[i] = ctx.rotate(t, -n.offs[i]);
+  }
+  return sum(ctx, std::move(terms));
+}
+
+// Sum of the slots c .. c+width-1 into slot c (the token or head window),
+// and its adjoint: slot c spread over c .. c+width-1. Neither touches the
+// caller's ciphertext.
+Ctxt window_sum(const FHEContext& ctx, const Ctxt& c, int width) {
+  if (width < 2) return c;
+  Ctxt s = ctx.cc()->EvalAdd(c, ctx.rotate(c, 1));
+  for (int t = 2; t < width; t *= 2) ctx.cc()->EvalAddInPlace(s, ctx.rotate(s, t));
+  return s;
+}
+
+Ctxt window_broadcast(const FHEContext& ctx, const Ctxt& c, int width) {
+  if (width < 2) return c;
+  Ctxt s = ctx.cc()->EvalAdd(c, ctx.rotate(c, -1));
+  for (int t = 2; t < width; t *= 2) ctx.cc()->EvalAddInPlace(s, ctx.rotate(s, -t));
+  return s;
+}
+
+// Attention::forward with the projections as trainable nodes and every
+// rotation through the context (so a rotation-key ladder works); keeps what
+// the backward pass needs.
+Ctxt attention_forward(const FHEContext& ctx, Node& n, const Ctxt& x) {
+  const CC& cc = ctx.cc();
+  const Attention& at = *n.att;
+  const int tokens = at.tokens(), dh = at.head_width(), B = at.stride();
+  const int32_t nd = tokens * B;
+  n.q = linear_forward(ctx, *n.body[0], x);
+  Ctxt k = linear_forward(ctx, *n.body[1], x);
+  Ctxt v = linear_forward(ctx, *n.body[2], x);
+  // Cyclic copies in [n*B, 2n*B) so rotating by s*B maps token i to (i + s) mod n.
+  k = cc->EvalAdd(k, ctx.rotate(k, -nd));
+  v = cc->EvalAdd(v, ctx.rotate(v, -nd));
+  std::vector<int32_t> offs(static_cast<size_t>(tokens));
+  for (int s = 0; s < tokens; ++s) offs[static_cast<size_t>(s)] = s * B;
+  n.kr = ctx.rotate_many(k, offs);
+  n.vr = ctx.rotate_many(v, offs);
+  // score[i][h] = q_i . k_{i+s} over head h, in slot i*B + h*dh.
+  n.p.assign(static_cast<size_t>(tokens), nullptr);
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+  for (int s = 0; s < tokens; ++s) n.p[static_cast<size_t>(s)] = window_sum(ctx, cc->EvalMult(n.q, n.kr[static_cast<size_t>(s)]), dh);
+  const bool softmax = at.softmax();
+  if (softmax && at.softmax_options().subtract_max) {
+    const SoftmaxOptions& o = at.softmax_options();
+    const double range = 2.0 * std::max(std::fabs(o.lo), std::fabs(o.hi));
+    std::vector<Ctxt> vals = n.p;
+    while (vals.size() > 1) {
+      std::vector<Ctxt> next((vals.size() + 1) / 2);
+      for (size_t i = 0; i + 1 < vals.size(); i += 2) {
+        Ctxt sel = ctx.compare(vals[i], vals[i + 1], range);
+        next[i / 2] = cc->EvalAdd(vals[i], cc->EvalMult(sel, cc->EvalSub(vals[i + 1], vals[i])));
+      }
+      if (vals.size() % 2) next.back() = vals.back();
+      vals.swap(next);
+    }
+    for (auto& p : n.p) p = cc->EvalSub(p, vals[0]);
+  }
+  n.aw.assign(static_cast<size_t>(tokens), nullptr);
+  n.A.assign(static_cast<size_t>(tokens), nullptr);
+  std::vector<Ctxt> partial(static_cast<size_t>(tokens));
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+  for (int s = 0; s < tokens; ++s) {
+    const size_t i = static_cast<size_t>(s);
+    Ctxt a;
+    if (softmax) {
+      std::vector<double> c = at.exp_coeffs();
+      a = mul_plain(ctx, cc->EvalChebyshevSeries(n.p[i], c, at.exp_lo(), at.exp_hi()), at.head_mask());
+    } else {
+      a = add_plain(ctx, mul_plain(ctx, n.p[i], at.score_mask(2)), at.score_mask(1));
+      a = add_plain(ctx, cc->EvalMult(n.p[i], a), at.score_mask(0));
+    }
+    n.aw[i] = a;
+    n.A[i] = window_broadcast(ctx, a, dh);
+    partial[i] = cc->EvalMult(n.A[i], n.vr[i]);
+  }
+  Ctxt o = sum(ctx, std::move(partial));
+  if (softmax) {
+    const SoftmaxOptions& sm = at.softmax_options();
+    Ctxt S = tokens > 1 ? cc->EvalAdd(n.A[0], n.A[1]) : n.A[0];
+    for (int s = 2; s < tokens; ++s) cc->EvalAddInPlace(S, n.A[static_cast<size_t>(s)]);
+    S = add_plain(ctx, S, at.pad_sum());
+    std::vector<double> c = at.inv_coeffs();
+    Ctxt y = cc->EvalChebyshevSeries(S, c, at.sum_lo(), at.sum_hi());
+    for (uint32_t i = 0; i < sm.newton; ++i) y = cc->EvalMult(y, cc->EvalSub(2.0, cc->EvalMult(S, y)));
+    n.y = y;
+    n.o = o;
+    o = cc->EvalMult(o, y);
+  }
+  return linear_forward(ctx, *n.body[3], o);
+}
+
+// The gradient of attention_forward. The softmax and 1/x are differentiated
+// as the functions they approximate (exp' = exp, (1/S)' = -1/S^2), so the
+// gradient matches the exact softmax up to the approximation error.
+Ctxt attention_backward(const FHEContext& ctx, Node& n, const Ctxt& g, bool need) {
+  const CC& cc = ctx.cc();
+  const Attention& at = *n.att;
+  const int tokens = at.tokens(), dh = at.head_width(), B = at.stride();
+  const int32_t nd = tokens * B;
+  const bool softmax = at.softmax();
+  Ctxt go = linear_backward(ctx, *n.body[3], g, true);
+  Ctxt dO = go, c;
+  if (softmax) {
+    // out = o (*) y, y = 1 / S, S = sum_s A_s: dL/dA_s = dO (*) v_s - go (*) o (*) y^2.
+    dO = cc->EvalMult(go, n.y);
+    c = cc->EvalMult(cc->EvalMult(go, n.o), cc->EvalMult(n.y, n.y));
+  }
+  std::vector<Ctxt> P(static_cast<size_t>(tokens)), dqs(static_cast<size_t>(tokens)), dks(static_cast<size_t>(tokens)),
+      dvs(static_cast<size_t>(tokens));
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+  for (int s = 0; s < tokens; ++s) {
+    const size_t i = static_cast<size_t>(s);
+    Ctxt dA = cc->EvalMult(dO, n.vr[i]);
+    if (c) dA = cc->EvalSub(dA, c);
+    // A_s broadcasts a_s over the head: da_s = window sum of dA_s; then through
+    // the (masked) score function to the q.k sums.
+    Ctxt da = window_sum(ctx, dA, dh);
+    Ctxt dp;
+    if (softmax) {
+      dp = cc->EvalMult(da, n.aw[i]);
+    } else {
+      Ctxt slope = add_plain(ctx, mul_plain(ctx, n.p[i], scaled(at.score_mask(2), 2.0)), at.score_mask(1));
+      dp = cc->EvalMult(da, slope);
+    }
+    P[i] = window_broadcast(ctx, dp, dh);  // the q.k sums spread over the head
+    dqs[i] = cc->EvalMult(P[i], n.kr[i]);
+    dks[i] = ctx.rotate(cc->EvalMult(P[i], n.q), -s * B);
+    dvs[i] = ctx.rotate(cc->EvalMult(dO, n.A[i]), -s * B);
+  }
+  Ctxt dq = sum(ctx, std::move(dqs));
+  // Fold the cyclic copies [n*B, 2n*B) back onto the tokens.
+  Ctxt dk = sum(ctx, std::move(dks));
+  dk = cc->EvalAdd(dk, ctx.rotate(dk, nd));
+  Ctxt dv = sum(ctx, std::move(dvs));
+  dv = cc->EvalAdd(dv, ctx.rotate(dv, nd));
+  Ctxt gx = linear_backward(ctx, *n.body[0], dq, need);
+  Ctxt gk = linear_backward(ctx, *n.body[1], dk, need);
+  Ctxt gv = linear_backward(ctx, *n.body[2], dv, need);
+  n.kr.clear();
+  n.vr.clear();
+  n.p.clear();
+  n.aw.clear();
+  n.A.clear();
+  n.q = n.o = n.y = nullptr;
+  if (!need) return nullptr;
+  cc->EvalAddInPlace(gx, gk);
+  cc->EvalAddInPlace(gx, gv);
+  return gx;
+}
+
 Ctxt forward_nodes(const FHEContext& ctx, std::vector<std::unique_ptr<Node>>& nodes, Ctxt x) {
   for (auto& np : nodes) {
     Node& n = *np;
     switch (n.kind) {
       case Node::kLinear: x = linear_forward(ctx, n, x); break;
+      case Node::kNorm: {
+        n.norm->normalize(ctx, x, n.centred, n.r);
+        Ctxt cg = n.trainable ? ctx.cc()->EvalMult(n.centred, n.D[0]) : mul_plain(ctx, n.centred, n.diag[0]);
+        x = ctx.cc()->EvalMult(cg, n.r);
+        if (n.trainable)
+          ctx.cc()->EvalAddInPlace(x, n.B);
+        else
+          x = add_plain(ctx, x, n.bias);
+        break;
+      }
+      case Node::kAttn: x = attention_forward(ctx, n, x); break;
       case Node::kResidual: {
         n.in = x;
         Ctxt y = forward_nodes(ctx, n.body, x);
@@ -432,26 +792,27 @@ Ctxt backward_nodes(const FHEContext& ctx, std::vector<std::unique_ptr<Node>>& n
     Node& n = *nodes[k];
     const bool need = k > 0 || need_input_grad;
     switch (n.kind) {
-      case Node::kLinear: {
+      case Node::kLinear: g = linear_backward(ctx, n, g, need); break;
+      case Node::kNorm: {
+        // y = gamma (*) x_hat + beta, x_hat = centred (*) r:
+        // dgamma = g (*) x_hat, dbeta = g (summed over the tokens at update),
+        // dx = r (*) (gg - mean(gg) - x_hat (*) mean(gg (*) x_hat)), gg = g (*) gamma.
+        Ctxt xhat = cc->EvalMult(n.centred, n.r);
         if (n.trainable) {
-          // dL/dD_i = g (*) rot_i(x), summed over the batch.
-          const std::vector<Ctxt> rot = ctx.rotate_many(n.in, n.offs);
-#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
-          for (size_t i = 0; i < n.offs.size(); ++i) add_to(ctx, n.gD[i], cc->EvalMult(g, rot[i]));
-          if (n.B) add_to(ctx, n.gB, g);
+          add_to(ctx, n.gD[0], cc->EvalMult(g, xhat));
+          add_to(ctx, n.gB, g);
         }
         if (need) {
-          std::vector<Ctxt> terms(n.offs.size());
-#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
-          for (size_t i = 0; i < n.offs.size(); ++i) {
-            Ctxt t = n.trainable ? cc->EvalMult(n.D[i], g) : mul_plain(ctx, g, n.diag[i]);
-            terms[i] = ctx.rotate(t, -n.offs[i]);
-          }
-          g = sum(ctx, std::move(terms));
+          Ctxt gg = n.trainable ? cc->EvalMult(g, n.D[0]) : mul_plain(ctx, g, n.diag[0]);
+          Ctxt m1 = n.norm->block_mean(ctx, gg);
+          Ctxt m2 = n.norm->block_mean(ctx, cc->EvalMult(gg, xhat));
+          Ctxt inner = cc->EvalSub(cc->EvalSub(gg, m1), cc->EvalMult(xhat, m2));
+          g = cc->EvalMult(inner, n.r);
         }
-        n.in = nullptr;
+        n.centred = n.r = nullptr;
         break;
       }
+      case Node::kAttn: g = attention_backward(ctx, n, g, need); break;
       case Node::kSquare:
       case Node::kPoly:
       case Node::kCheb:
@@ -481,12 +842,6 @@ Ctxt backward_nodes(const FHEContext& ctx, std::vector<std::unique_ptr<Node>>& n
     if (!need) return nullptr;
   }
   return g;
-}
-
-std::vector<double> scaled(const std::vector<double>& mask, double s) {
-  std::vector<double> v(mask);
-  for (double& x : v) x *= s;
-  return v;
 }
 
 // Sum of all slots, in every slot.
@@ -567,7 +922,148 @@ struct PlainTrace {
   std::vector<PlainTrace> body;
 };
 
-using Grads = std::map<LinearLayer*, std::vector<double>>;
+using Grads = std::map<Layer*, std::vector<double>>;
+
+// Backward through a linear layer; adds its parameter gradient when trained.
+std::vector<double> plain_linear_backward(LinearLayer* lin, bool train, const std::vector<double>& x,
+                                          const std::vector<double>& g, Grads& grads) {
+  std::vector<double> gx(x.size(), 0.0);
+  if (train && lin->trainable()) {
+    const std::vector<double> p = lin->params();
+    auto& gr = grads[lin];
+    if (gr.empty()) gr.assign(p.size(), 0.0);
+    for (const auto& e : lin->weight_refs()) {
+      gx[e.col] += p[static_cast<size_t>(e.param)] * g[e.row];
+      gr[static_cast<size_t>(e.param)] += g[e.row] * x[e.col];
+    }
+    const auto br = lin->bias_refs();
+    for (size_t i = 0; i < br.size(); ++i) gr[static_cast<size_t>(br[i])] += g[i];
+  } else {
+    const SparseMatrix m = lin->matrix();
+    for (size_t r = 0; r < m.rows(); ++r)
+      for (const auto& e : m.row(r)) gx[e.first] += e.second * g[r];
+  }
+  return gx;
+}
+
+std::vector<double> plain_layernorm_backward(LayerNorm* ln, bool train, const std::vector<double>& x,
+                                             const std::vector<double>& g, Grads& grads) {
+  std::vector<double> centred, r;
+  ln->normalize_plain(x, centred, r);
+  const int d = ln->dim();
+  const std::vector<double>& gamma = ln->gamma();
+  std::vector<double>* gr = nullptr;
+  if (train) {
+    gr = &grads[ln];
+    if (gr->empty()) gr->assign(2u * d, 0.0);
+  }
+  std::vector<double> gx(x.size(), 0.0), xh(static_cast<size_t>(d)), gg(static_cast<size_t>(d));
+  for (int t = 0; t < ln->tokens(); ++t) {
+    const size_t base = static_cast<size_t>(t) * d;
+    double m1 = 0.0, m2 = 0.0;
+    for (int j = 0; j < d; ++j) {
+      xh[j] = centred[base + j] * r[static_cast<size_t>(t)];
+      gg[j] = g[base + j] * gamma[static_cast<size_t>(j)];
+      m1 += gg[j];
+      m2 += gg[j] * xh[j];
+      if (gr) {
+        (*gr)[static_cast<size_t>(j)] += g[base + j] * xh[j];
+        (*gr)[static_cast<size_t>(d + j)] += g[base + j];
+      }
+    }
+    m1 /= d;
+    m2 /= d;
+    for (int j = 0; j < d; ++j) gx[base + j] = r[static_cast<size_t>(t)] * (gg[j] - m1 - xh[j] * m2);
+  }
+  return gx;
+}
+
+// Same derivatives as attention_backward (exp and 1/x differentiated as the
+// exact functions).
+std::vector<double> plain_attention_backward(Attention* at, bool train, const std::vector<double>& x,
+                                             const std::vector<double>& g, Grads& grads) {
+  const int n = at->tokens(), d = at->dim(), H = at->heads(), dh = at->head_width();
+  TokenDense* pr[4];
+  for (int i = 0; i < 4; ++i) pr[i] = at->projection(i).get();
+  const std::vector<double> q = pr[0]->forward_plain(x), k = pr[1]->forward_plain(x), v = pr[2]->forward_plain(x);
+  const bool softmax = at->softmax();
+  const SoftmaxOptions& sm = at->softmax_options();
+  // Forward again, keeping the weights.
+  const size_t nd = static_cast<size_t>(n) * d;
+  std::vector<double> o(nd, 0.0), sc(static_cast<size_t>(H) * n * n), e(sc.size()), a(sc.size()), y(static_cast<size_t>(H) * n, 1.0);
+  for (int h = 0; h < H; ++h)
+    for (int i = 0; i < n; ++i) {
+      double* s = &sc[(static_cast<size_t>(h) * n + i) * n];
+      double* es = &e[(static_cast<size_t>(h) * n + i) * n];
+      double* as = &a[(static_cast<size_t>(h) * n + i) * n];
+      for (int j = 0; j < n; ++j) {
+        s[j] = 0.0;
+        for (int c = h * dh; c < (h + 1) * dh; ++c) s[j] += q[static_cast<size_t>(i) * d + c] * k[static_cast<size_t>(j) * d + c];
+      }
+      if (softmax) {
+        std::vector<double> sv(s, s + n);
+        if (sm.subtract_max) {
+          const double m = *std::max_element(sv.begin(), sv.end());
+          for (double& z : sv) z -= m;
+        }
+        std::vector<double> ev = lbcrypto::EvalChebyshevFunctionPtxt([](double z) { return std::exp(z); }, sv,
+                                                                     at->exp_lo(), at->exp_hi(), sm.exp_degree);
+        double S = 0.0;
+        for (int j = 0; j < n; ++j) S += (es[j] = ev[static_cast<size_t>(j)]);
+        y[static_cast<size_t>(h) * n + i] = at->inv_plain(S);
+        for (int j = 0; j < n; ++j) as[j] = es[j] * y[static_cast<size_t>(h) * n + i];
+      } else {
+        const double c0 = at->score_coeff(h, 0), c1 = at->score_coeff(h, 1), c2 = at->score_coeff(h, 2);
+        for (int j = 0; j < n; ++j) as[j] = c0 + c1 * s[j] + c2 * s[j] * s[j];
+      }
+      for (int j = 0; j < n; ++j)
+        for (int c = h * dh; c < (h + 1) * dh; ++c) o[static_cast<size_t>(i) * d + c] += as[j] * v[static_cast<size_t>(j) * d + c];
+    }
+  const std::vector<double> go = plain_linear_backward(pr[3], train, o, g, grads);
+  std::vector<double> dq(nd, 0.0), dk(nd, 0.0), dv(nd, 0.0), da(static_cast<size_t>(n)), ds(static_cast<size_t>(n));
+  for (int h = 0; h < H; ++h)
+    for (int i = 0; i < n; ++i) {
+      const double* s = &sc[(static_cast<size_t>(h) * n + i) * n];
+      const double* es = &e[(static_cast<size_t>(h) * n + i) * n];
+      const double* as = &a[(static_cast<size_t>(h) * n + i) * n];
+      for (int j = 0; j < n; ++j) {
+        da[j] = 0.0;
+        for (int c = h * dh; c < (h + 1) * dh; ++c) {
+          da[j] += go[static_cast<size_t>(i) * d + c] * v[static_cast<size_t>(j) * d + c];
+          dv[static_cast<size_t>(j) * d + c] += as[j] * go[static_cast<size_t>(i) * d + c];
+        }
+      }
+      if (softmax) {
+        const double yi = y[static_cast<size_t>(h) * n + i];
+        double dy = 0.0;
+        for (int j = 0; j < n; ++j) dy += da[j] * es[j];
+        const double dS = -yi * yi * dy;
+        for (int j = 0; j < n; ++j) ds[j] = (da[j] * yi + dS) * es[j];
+      } else {
+        const double c1 = at->score_coeff(h, 1), c2 = at->score_coeff(h, 2);
+        for (int j = 0; j < n; ++j) ds[j] = da[j] * (c1 + 2.0 * c2 * s[j]);
+      }
+      for (int j = 0; j < n; ++j)
+        for (int c = h * dh; c < (h + 1) * dh; ++c) {
+          dq[static_cast<size_t>(i) * d + c] += ds[j] * k[static_cast<size_t>(j) * d + c];
+          dk[static_cast<size_t>(j) * d + c] += ds[j] * q[static_cast<size_t>(i) * d + c];
+        }
+    }
+  std::vector<double> gx = plain_linear_backward(pr[0], train, x, dq, grads);
+  const std::vector<double> gk = plain_linear_backward(pr[1], train, x, dk, grads);
+  const std::vector<double> gv = plain_linear_backward(pr[2], train, x, dv, grads);
+  for (size_t i = 0; i < gx.size(); ++i) gx[i] += gk[i] + gv[i];
+  return gx;
+}
+
+// Attention keeps copies of its projections' weights: refresh them after the
+// projections were updated.
+void sync_attention(const std::vector<std::shared_ptr<Layer>>& layers) {
+  for (const auto& l : layers) {
+    if (auto* r = dynamic_cast<Residual*>(l.get())) sync_attention(r->body());
+    if (auto* at = dynamic_cast<Attention*>(l.get())) at->set_params(at->params());
+  }
+}
 
 std::vector<double> plain_forward(const std::vector<std::shared_ptr<Layer>>& layers, size_t from, std::vector<double> x,
                                   PlainTrace& tr) {
@@ -597,23 +1093,11 @@ std::vector<double> plain_backward(const std::vector<std::shared_ptr<Layer>>& la
       std::vector<double> gb = plain_backward(r->body(), 0, t, tr.body[k], g, grads);
       for (size_t i = 0; i < g.size(); ++i) g[i] += gb[i];
     } else if (auto* lin = dynamic_cast<LinearLayer*>(l)) {
-      std::vector<double> gx(x.size(), 0.0);
-      if (train[k] && lin->trainable()) {
-        const std::vector<double> p = lin->params();
-        auto& gr = grads[lin];
-        if (gr.empty()) gr.assign(p.size(), 0.0);
-        for (const auto& e : lin->weight_refs()) {
-          gx[e.col] += p[static_cast<size_t>(e.param)] * g[e.row];
-          gr[static_cast<size_t>(e.param)] += g[e.row] * x[e.col];
-        }
-        const auto br = lin->bias_refs();
-        for (size_t i = 0; i < br.size(); ++i) gr[static_cast<size_t>(br[i])] += g[i];
-      } else {
-        const SparseMatrix m = lin->matrix();
-        for (size_t r = 0; r < m.rows(); ++r)
-          for (const auto& e : m.row(r)) gx[e.first] += e.second * g[r];
-      }
-      g = std::move(gx);
+      g = plain_linear_backward(lin, train[k], x, g, grads);
+    } else if (auto* ln = dynamic_cast<LayerNorm*>(l)) {
+      g = plain_layernorm_backward(ln, train[k], x, g, grads);
+    } else if (auto* at = dynamic_cast<Attention*>(l)) {
+      g = plain_attention_backward(at, train[k], x, g, grads);
     } else if (dynamic_cast<Bootstrap*>(l)) {
       // identity
     } else {
@@ -704,7 +1188,7 @@ ContextOptions Trainer::context_options(bool secure, bool bootstrapping, uint32_
 void Trainer::encrypt_weights(const FHEContext& ctx) {
   if (ctx.slots() != slots_) throw std::invalid_argument("train: context slot count differs from the network");
   base_level_ = ctx.options().bootstrapping ? ctx.bootstrap_depth() + 1 : 0;
-  for_each_linear(nodes_, [&](Node& n) {
+  for_each_weighted(nodes_, [&](Node& n) {
     if (!n.trainable) return;
     n.D.assign(n.offs.size(), nullptr);
     n.gD.assign(n.offs.size(), nullptr);
@@ -747,12 +1231,12 @@ Ctxt Trainer::accumulate(const FHEContext& ctx, const Ctxt& x, const Ctxt& targe
 void Trainer::update(const FHEContext& ctx, double lr) {
   if (!batch_) throw std::logic_error("train: no accumulated gradients");
   const double step = -lr / static_cast<double>(batch_);
-  for_each_linear(nodes_, [&](Node& n) {
+  for_each_weighted(nodes_, [&](Node& n) {
     if (n.trainable) update_linear(ctx, n, step);
   });
   if (ctx.options().bootstrapping) {
     std::map<uint32_t, std::vector<Ctxt*>> by_window;
-    for_each_linear(nodes_, [&](Node& n) {
+    for_each_weighted(nodes_, [&](Node& n) {
       if (!n.trainable) return;
       for (auto& d : n.D) by_window[n.window].push_back(&d);
       if (n.B) by_window[n.window].push_back(&n.B);
@@ -768,9 +1252,9 @@ std::vector<double> Trainer::decrypt_output(const FHEContext& ctx, const Ctxt& y
 
 void Trainer::decrypt_weights(const FHEContext& ctx) {
   if (!encrypted_) throw std::logic_error("train: encrypt_weights() first");
-  for_each_linear(nodes_, [&](Node& n) {
+  for_each_weighted(nodes_, [&](Node& n) {
     if (!n.trainable) return;
-    std::vector<double> p = n.lin->params(), total(p.size(), 0.0), count(p.size(), 0.0);
+    std::vector<double> p = n.layer->params(), total(p.size(), 0.0), count(p.size(), 0.0);
     auto take = [&](const Ctxt& c, const std::vector<int>& owner) {
       std::vector<double> v = ctx.decrypt(c, slots_);
       for (uint32_t s = 0; s < slots_; ++s)
@@ -784,14 +1268,15 @@ void Trainer::decrypt_weights(const FHEContext& ctx) {
     // Shared weights hold the same value in every slot (up to CKKS noise).
     for (size_t k = 0; k < p.size(); ++k)
       if (count[k] > 0) p[k] = total[k] / count[k];
-    n.lin->set_params(p);
+    n.layer->set_params(p);
   });
+  for_each_attention(nodes_, [](Node& n) { n.att->set_params(n.att->params()); });
   net_.compile(slots_);
 }
 
 size_t Trainer::weight_ciphertexts() const {
   size_t k = 0;
-  for_each_linear(nodes_, [&](const Node& n) {
+  for_each_weighted(nodes_, [&](const Node& n) {
     if (n.trainable) k += n.offs.size() + (n.bias.empty() ? 0 : 1);
   });
   return k;
@@ -799,7 +1284,7 @@ size_t Trainer::weight_ciphertexts() const {
 
 uint32_t Trainer::weight_level() const {
   uint32_t l = 0;
-  for_each_linear(nodes_, [&](const Node& n) {
+  for_each_weighted(nodes_, [&](const Node& n) {
     for (const auto& d : n.D) l = std::max(l, lvl(d));
     if (n.B) l = std::max(l, lvl(n.B));
   });
@@ -812,8 +1297,8 @@ std::string Trainer::summary() const {
   os << "training from layer " << first_ << " (" << layers[first_]->type() << ")";
   if (first_) os << ", layers 0.." << first_ - 1 << " run forward only";
   os << "\n";
-  for_each_linear(nodes_, [&](const Node& n) {
-    os << "  " << n.lin->type() << ": " << n.offs.size() << " diagonals, ";
+  for_each_weighted(nodes_, [&](const Node& n) {
+    os << "  " << n.layer->type() << ": " << n.offs.size() << (n.kind == Node::kNorm ? " gamma, " : " diagonals, ");
     if (n.trainable)
       os << n.groups.size() << " shared weights";
     else
@@ -849,6 +1334,7 @@ void train_plain(Network& net, const std::vector<std::vector<double>>& xs, const
     for (size_t i = 0; i < p.size(); ++i) p[i] -= step * kv.second[i];
     kv.first->set_params(p);
   }
+  sync_attention(layers);
 }
 
 }  // namespace fheml
