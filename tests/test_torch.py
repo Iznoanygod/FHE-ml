@@ -48,10 +48,35 @@ n, d, h = 4, 8, 16
 vit = nn.Sequential(
     nn.Linear(6, d), hnn.PosEmbedding(n, d),
     hnn.Residual(hnn.Attention(d, n)),
+    hnn.Residual(hnn.Attention(d, n, heads=2, score=[[0.1, 0.1, 0.03], [0.1, 0.05, 0.02]])),
     hnn.Residual(nn.Linear(d, h), hnn.Poly([0, 0.5, 0.25], trainable=True), nn.Linear(h, d)),
     hnn.TokenMean(), nn.Linear(d, 3))
 net = run("transformer", vit, (n, 6))
 assert net.input_shape.w == h, "tokens are padded to the widest per-token layer"
+
+# hnn.Attention with heads > 1 is torch's multi-head split: same result as
+# running each head's slice of q/k/v through a single-head module.
+mha = hnn.Attention(d, n, heads=2, score=[[0.1, 0.1, 0.03], [0.1, 0.05, 0.02]]).double()
+x = torch.rand(2, n, d, dtype=torch.float64)
+with torch.no_grad():
+    cat = torch.zeros(2, n, d, dtype=torch.float64)
+    for hd in range(2):
+        sl = slice(hd * d // 2, (hd + 1) * d // 2)
+        one = hnn.Attention(d, n, score=mha.score[hd].tolist()).double()
+        for f, g in ((one.q, mha.q), (one.k, mha.k), (one.v, mha.v)):
+            f.weight.zero_(); f.bias.zero_()
+            f.weight[sl] = g.weight[sl]; f.bias[sl] = g.bias[sl]
+        one.o.weight.zero_(); one.o.bias.zero_()
+        one.o.weight[:, sl] = mha.o.weight[:, sl]
+        cat += one(x) - one.o.bias
+    cat += mha.o.bias
+    assert torch.allclose(mha(x), cat, atol=1e-12), "multi-head attention is the per-head split"
+for bad in ({"heads": 3}, {"heads": 2, "score": [[1, 2, 3]]}):
+    try:
+        hnn.Attention(d, n, **bad)
+        raise AssertionError("expected an error")
+    except ValueError:
+        pass
 
 # Errors name the offending module.
 for bad, msg in ((nn.Sequential(nn.Linear(4, 4), nn.ReLU()), "Chebyshev"),

@@ -35,8 +35,10 @@ from ._fheml import (  # noqa: F401
 
 
 def _arg(v):
-    # numpy arrays of any shape -> flat C-order lists (weights are [out][in]).
-    return np.ascontiguousarray(v, dtype=np.float64).ravel().tolist() if isinstance(v, np.ndarray) else v
+    # numpy arrays of any shape, and nested lists such as a per-head score
+    # [[c0, c1, c2], ...], -> flat C-order lists (weights are [out][in]).
+    nested = isinstance(v, (list, tuple)) and len(v) > 0 and isinstance(v[0], (list, tuple, np.ndarray))
+    return np.ascontiguousarray(v, dtype=np.float64).ravel().tolist() if isinstance(v, np.ndarray) or nested else v
 
 
 def _accepting_numpy(cls):

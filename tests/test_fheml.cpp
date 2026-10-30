@@ -275,6 +275,65 @@ void transformer_tests() {
     check_encrypted("attention n=5 d=8", net, 1e-4);
   }
   {
+    // Multi-head attention: 4 heads of width 2, one score polynomial per
+    // head. In plaintext it is the sum of the single-head attentions over
+    // each head's slice of Wq/Wk/Wv and Wo's columns.
+    const int n = 5, d = 8, heads = 4, dh = d / heads;
+    std::vector<double> w[4] = {rand_vec(d * d, -0.4, 0.4), rand_vec(d * d, -0.4, 0.4), rand_vec(d * d, -0.4, 0.4),
+                                rand_vec(d * d, -0.4, 0.4)};
+    std::vector<double> b[4] = {rand_vec(d), rand_vec(d), rand_vec(d), rand_vec(d)};
+    std::vector<double> score = rand_vec(3 * heads, 0.0, 0.3);
+    Attention mha(n, d, w[0], w[1], w[2], w[3], b[0], b[1], b[2], b[3], score, heads);
+    mha.configure(Shape{n, 1, d});
+    auto x = rand_vec(n * d);
+    std::vector<double> y = mha.forward_plain(x), sum(n * d, 0.0);
+    for (int h = 0; h < heads; ++h) {
+      std::vector<double> wh[4], bh[4];
+      for (int i = 0; i < 4; ++i) {
+        wh[i].assign(d * d, 0.0);
+        bh[i].assign(d, 0.0);
+        for (int o = 0; o < d; ++o)
+          for (int c = 0; c < d; ++c) {
+            bool keep = i < 3 ? (o / dh == h) : (c / dh == h);
+            if (keep) wh[i][o * d + c] = w[i][o * d + c];
+          }
+        if (i < 3)
+          for (int o = h * dh; o < (h + 1) * dh; ++o) bh[i][o] = b[i][o];
+      }
+      if (h == 0) bh[3] = b[3];
+      Attention one(n, d, wh[0], wh[1], wh[2], wh[3], bh[0], bh[1], bh[2], bh[3],
+                    std::vector<double>(score.begin() + 3 * h, score.begin() + 3 * h + 3));
+      one.configure(Shape{n, 1, d});
+      std::vector<double> yh = one.forward_plain(x);
+      for (size_t i = 0; i < sum.size(); ++i) sum[i] += yh[i];
+    }
+    check_err("multi-head attention = sum of per-head attentions", max_err(y, sum, n * d), 1e-12);
+
+    Network net(Shape{n, 1, d});
+    net.emplace<Attention>(n, d, w[0], w[1], w[2], w[3], b[0], b[1], b[2], b[3], score, heads);
+    const char* path = "test_mha.fheml";
+    net.save(path);
+    Network back = Network::load(path);
+    std::remove(path);
+    check_err("multi-head attention save/load round trip",
+              max_err(net.forward_plain(x), back.forward_plain(x), n * d), 1e-12);
+    check(back.layers()[0]->describe().find("heads=4") != std::string::npos, "loaded attention keeps its heads");
+    check_encrypted("multi-head attention n=5 d=8 heads=4", net, 1e-4);
+    // Shared score (3 coefficients) with heads > 1, and a padded token stride.
+    Network net2(Shape{n, 1, 16});
+    net2.emplace<TokenDense>(n, 16, d, rand_vec(16 * d, -0.3, 0.3), rand_vec(d, -0.1, 0.1))
+        .emplace<Attention>(n, d, w[0], w[1], w[2], w[3], b[0], b[1], b[2], b[3],
+                            std::vector<double>{0.2, 0.1, 0.05}, 2);
+    check_encrypted("2-head attention with stride 16", net2, 1e-4);
+    bool threw = false;
+    try {
+      Attention bad(n, d, w[0], w[1], w[2], w[3], b[0], b[1], b[2], b[3], score, 3);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    check(threw, "attention rejects a head count that does not divide d");
+  }
+  {
     Network net = tiny_transformer(4, 5, 8);
     check_encrypted("tiny transformer", net, 1e-3);
     Network net2 = tiny_transformer(4, 5, 8);
