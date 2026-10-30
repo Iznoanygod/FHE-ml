@@ -108,6 +108,28 @@ Network strided_cnn(unsigned seed) {
   return n;
 }
 
+// conv -> exact max pool (scheme switching) -> poly -> dense. Small conv
+// weights keep the pooled values inside the comparison range.
+Network pool_cnn(unsigned seed) {
+  Rng r(seed);
+  Network n(Shape{1, 4, 4});
+  n.emplace<Conv2d>(1, 2, 3, 3, 1, 1, r.vec(18, 0.2), r.vec(2, 0.1))
+      .emplace<MaxPool2d>(2, 2, 2.0)
+      .emplace<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25})
+      .emplace<Dense>(8, 2, r.vec(16, 0.4), r.vec(2, 0.1));
+  return n;
+}
+
+// Overlapping 3x3 windows (stride 1, odd carries in the tournament) as the
+// output layer: the loss gradient is nonzero in the gap slots too and the
+// backward pass must keep it out of the conv.
+Network pool_output(unsigned seed) {
+  Rng r(seed);
+  Network n(Shape{1, 4, 4});
+  n.emplace<Conv2d>(1, 1, 3, 3, 1, 1, r.vec(9, 0.2), r.vec(1, 0.1)).emplace<MaxPool2d>(3, 1, 2.0);
+  return n;
+}
+
 // Token layers with shared and per-token biases, a Chebyshev activation and a
 // residual connection.
 Network tokens(unsigned seed) {
@@ -365,6 +387,8 @@ int main(int argc, char** argv) {
   gradient_check("softmax attention (two heads)", [] { return attention_tokens(11, true); });
   gradient_check("softmax attention, frozen", [] { return attention_tokens(11, true); }, {1});
   gradient_check("pre-norm transformer block", [] { return transformer_block(12); });
+  gradient_check("max pool 2x2", [] { return pool_cnn(13); });
+  gradient_check("max pool 3x3 stride 1, output layer", [] { return pool_output(14); });
 
   encrypted_check("mlp", [] { return mlp(1); }, 1, false, 1e-4);
   encrypted_check("mlp, two updates", [] { return mlp(1); }, 2, false, 1e-4);
@@ -375,6 +399,10 @@ int main(int argc, char** argv) {
   encrypted_check("layernorm", [] { return norm_tokens(9); }, 1, false, 1e-4);
   encrypted_check("quadratic attention", [] { return attention_tokens(10, false); }, 1, false, 1e-4);
   encrypted_check("softmax attention", [] { return attention_tokens(11, true); }, 1, false, 1e-4);
+  // Scheme-switching comparisons in the forward pass; the backward pass
+  // reuses their bits.
+  encrypted_check("max pool 2x2", [] { return pool_cnn(13); }, 1, false, 1e-3);
+  if (!quick) encrypted_check("max pool 3x3 stride 1, output layer", [] { return pool_output(14); }, 1, false, 1e-3);
   if (!quick) encrypted_check("softmax attention, frozen (forward only)", [] { return attention_tokens(11, true); }, 1, false, 1e-4, {1});
   // Rotation-key ladder: the same training with composed rotations.
   encrypted_check("cnn, ladder window 1", [] { return cnn(2); }, 1, false, 1e-4, {}, 0.5, 1);

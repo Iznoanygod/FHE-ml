@@ -4,8 +4,9 @@
 (see ``fheml.nn`` for the HE-friendly modules) into an ``fheml.Network``.
 ``input_shape`` excludes the batch dimension:
 
-* ``(C, H, W)`` image: Conv2d, AvgPool2d, AdaptiveAvgPool2d(1), BatchNorm2d;
-  ``nn.Flatten`` then ``nn.Linear`` for the head.
+* ``(C, H, W)`` image: Conv2d, AvgPool2d, AdaptiveAvgPool2d(1), BatchNorm2d,
+  ``fheml.nn.MaxPool2d`` (exact, scheme switching); ``nn.Flatten`` then
+  ``nn.Linear`` for the head.
 * ``(n, d)`` token sequence: ``nn.Linear`` acts per token, plus Attention
   (quadratic or softmax scores), LayerNorm, Residual, PosEmbedding, TokenMean.
 * ``(k,)`` vector: Linear, BatchNorm1d.
@@ -90,6 +91,17 @@ class _Exporter:
             c, h, w = state[1:]
             out.append(("avgpool2d", k, s))
             return ("image", c, (h - k) // s + 1, (w - k) // s + 1)
+        if isinstance(m, hnn.MaxPool2d):
+            self.need(kind, "image", name)
+            if _pair(m.padding, "MaxPool2d padding") != 0 or _pair(m.dilation, "MaxPool2d dilation") != 1:
+                raise ValueError("MaxPool2d: padding and dilation are unsupported")
+            if m.ceil_mode or m.return_indices:
+                raise ValueError("MaxPool2d: ceil_mode and return_indices are unsupported")
+            k = _pair(m.kernel_size, "MaxPool2d kernel size")
+            s = _pair(m.stride if m.stride is not None else k, "MaxPool2d stride")
+            c, h, w = state[1:]
+            out.append(("maxpool2d", k, s, m.range))
+            return ("image", c, (h - k) // s + 1, (w - k) // s + 1)
         if isinstance(m, nn.AdaptiveAvgPool2d):
             self.need(kind, "image", name)
             c, h, w = state[1:]
@@ -171,8 +183,8 @@ class _Exporter:
             raise ValueError(f"nn.{name} has no exact encrypted form: use fheml.nn.Chebyshev"
                              f"('{name.lower()}', a, b, degree) or a trained fheml.nn.Poly")
         if isinstance(m, nn.MaxPool2d):
-            raise ValueError("nn.MaxPool2d is not exported: fheml.MaxPool2d (exact, via CKKS<->FHEW scheme "
-                             "switching) costs 15+ levels, add it to the fheml network by hand or use nn.AvgPool2d")
+            raise ValueError("nn.MaxPool2d needs an input bound: use fheml.nn.MaxPool2d(k, stride, range=R) "
+                             "(exact, via CKKS<->FHEW scheme switching, 15+ levels; |x| <= R) or nn.AvgPool2d")
         if isinstance(m, nn.LayerNorm):
             raise ValueError("nn.LayerNorm has no exact encrypted form: use fheml.nn.LayerNorm(dim, eps, var_min, "
                              "var_max, degree) on token sequences (a polynomial 1/sqrt on a calibrated variance range)")
@@ -228,6 +240,8 @@ def _build(s):
         return _fheml.Conv2d(*s[1:7], _flat(s[7]), _flat(s[8]))
     if k == "avgpool2d":
         return _fheml.AvgPool2d(*s[1:])
+    if k == "maxpool2d":
+        return _fheml.MaxPool2d(*s[1:])
     if k == "affine":
         return _fheml.ChannelAffine(_flat(s[1]), _flat(s[2]))
     if k == "dense":

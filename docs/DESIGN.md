@@ -233,6 +233,18 @@ encryption:
 - `chebyshev`: the derivative Chebyshev series (Numerical Recipes `chder`,
   same `c0/2` convention as OpenFHE).
 
+**Max pooling** reuses the forward's comparisons. Each round of the
+tournament computes `max(a, b) = a + s (b - a)` with `s = [a < b]`, so
+`∂max/∂a = 1 - s` and `∂max/∂b = s`. The forward keeps `s ⊙ m` and
+`m - s ⊙ m`, where `m` masks the pool's output slots. The backward walks the
+tournament from the root, multiplying the gradient by these, and rotates
+each tap's gradient back by `-offset` to its input slot (overlapping windows
+add up). That is `ceil(log2 k²)` levels and no scheme switching. The mask
+matters when the pool is the output layer: `g = y - t` is nonzero in the
+gap slots there and must not reach the layer below. `train_plain` runs the
+same tournament in the clear (a tie keeps the first tap, as `[a < b] = 0`
+does).
+
 The loss is `0.5 |y - t|²`, so `g = y - t` with an encrypted target `t`. No
 masking is needed: unused slots of `y` only meet zero rows of the matrices,
 and the update masks keep gradients out of unused weight slots.
@@ -426,7 +438,8 @@ All of the following are tested under encryption:
 - Encrypted training (`Trainer`): SGD updates on encrypted data and weights
   match plaintext SGD, with and without bootstrapping; this includes
   layer norm (gamma, beta) and attention (quadratic or softmax scores),
-  whose backward passes reuse the forward's rotations and masks.
+  whose backward passes reuse the forward's rotations and masks, and exact
+  max pooling, whose backward pass reuses the forward's comparison bits.
 - PyTorch export (`fheml.from_torch`): torch-trained CNN and ViT run
   encrypted with logits matching torch to about 1e-6.
 
