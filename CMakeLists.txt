@@ -71,6 +71,9 @@ target_link_libraries(conv_demo fheml)
 add_executable(relu_bench examples/relu_bench.cpp)
 target_link_libraries(relu_bench fheml)
 
+add_executable(packing_bench examples/packing_bench.cpp)
+target_link_libraries(packing_bench fheml)
+
 enable_testing()
 add_executable(test_fheml tests/test_fheml.cpp)
 target_link_libraries(test_fheml fheml)

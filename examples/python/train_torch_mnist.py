@@ -107,6 +107,8 @@ def main():
     ap.add_argument("--exact-relu", type=float, nargs="?", const=8.0, default=None, metavar="RANGE",
                     help="deepcnn: train with nn.ReLU and run it as the exact scheme-switching ReLU on "
                     "[-RANGE, RANGE] (default 8)")
+    ap.add_argument("--packing", choices=("gapped", "compact", "multiplexed"),
+                    help="layout of strided conv outputs (default: compact for deepcnn, gapped otherwise)")
     ap.add_argument("--data", default="data")
     ap.add_argument("--epochs", type=int, help="default: 3 (cnn), 15 (vit)")
     ap.add_argument("--out", help="also save the exported model here (.fheml)")
@@ -148,7 +150,9 @@ def main():
     if args.arch == "vit":
         net.fuse_linear()  # token mean + head -> one matrix, saves a level
     level_budget = [3, 3]
-    if args.arch == "deepcnn":
+    if args.packing:
+        net.packing = args.packing
+    elif args.arch == "deepcnn":
         net.set_gapped_layouts(False)  # compact activations: fewer slots, so fewer bootstrapping keys
     if args.bootstrap:
         # Levels per stretch at ring 2^16 and 50 bits: 5 with {2,2}, 3 with {3,3}, two more with --digits 4.

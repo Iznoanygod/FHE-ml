@@ -56,9 +56,13 @@ class Network {
 
   // Propagates shapes and slot layouts. Called automatically by add().
   Shape configure();
-  // Strided conv/pool outputs stay gapped (default, fewer diagonals) or are
-  // compacted (fewer slots). Takes effect at the next configure()/compile().
-  void set_gapped_layouts(bool on) { gapped_ = on; }
+  // How strided conv/pool outputs are packed (see Packing): gapped (default,
+  // fewest diagonals), compact (fewest slots) or multiplexed (compact slot
+  // count with few diagonals). Takes effect at the next configure()/compile().
+  void set_packing(Packing p) { packing_ = p; }
+  Packing packing() const { return packing_; }
+  // Gapped (true) or compact (false) packing.
+  void set_gapped_layouts(bool on) { packing_ = on ? Packing::kGapped : Packing::kCompact; }
   // Keep encoded weight diagonals between inferences: much faster repeated
   // inference, at one plaintext (ring_dim * towers * 8 bytes) per diagonal.
   void set_cache_plaintexts(bool on);
@@ -150,7 +154,7 @@ class Network {
   Shape input_;
   std::vector<std::shared_ptr<Layer>> layers_;
   uint32_t slots_ = 0;
-  bool gapped_ = true;
+  Packing packing_ = Packing::kGapped;
 };
 
 }  // namespace fheml
