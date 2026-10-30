@@ -67,6 +67,24 @@ err = np.abs(params(enc) - params(ref)).max()
 print(f"layernorm + attention: max weight error {err:.1e}")
 assert err < 1e-4
 assert np.abs(params(ref) - params(build_tokens())).max() > 1e-3
+# Softmax cross-entropy against one-hot targets.
+ce = fheml.cross_entropy(lo=-2.0, hi=2.0, exp_degree=15, inv_degree=31, newton=2)
+y = rng.uniform(-2, 2, 3)
+p = fheml.softmax(ce, y)
+assert np.abs(p - np.exp(y) / np.exp(y).sum()).max() < 1e-8
+xs, ts = rng.uniform(-1, 1, (2, 10)), np.eye(3)[[0, 2]]
+enc, ref = build(), build()
+trainer, ctx = fheml.make_trainer(enc, [], secure=False, bootstrapping=False, loss=ce)
+print(trainer.summary())
+trainer.encrypt_weights(ctx)
+outs = fheml.train_step(trainer, ctx, xs, ts, lr=0.5)
+print("cross-entropy before the update:", np.mean([fheml.cross_entropy_plain(o, t) for o, t in zip(outs, ts)]))
+fheml.train_plain(ref, xs, ts, lr=0.5, loss=ce)
+trainer.decrypt_weights(ctx)
+err = np.abs(params(enc) - params(ref)).max()
+print(f"cross-entropy: max weight error {err:.1e}")
+assert err < 1e-4
+assert np.abs(params(ref) - params(build())).max() > 1e-2
 
 # Bootstrapping activations and gradients inside the step (level budget).
 xs, ts = rng.uniform(-1, 1, (2, 10)), rng.uniform(-1, 1, (2, 3))
