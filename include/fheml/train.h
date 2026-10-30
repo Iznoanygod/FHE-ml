@@ -31,7 +31,8 @@
 // with their ordinary encrypted evaluation, so fine-tuning the last layers
 // of any network is the same API.
 //
-// Deep networks (a softmax transformer block takes 36 levels per step) do
+// Deep networks (a pre-norm softmax transformer block takes 80 levels per
+// step, softmax attention alone 36) do
 // not fit one bootstrapping context. set_level_budget(K) caps the step at K
 // levels: before any operation that would take a ciphertext deeper than K
 // levels below the weights, its operands are bootstrapped, so activations in

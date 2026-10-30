@@ -498,9 +498,9 @@ the activation on the way forward and the gradient on the way back.
 ### Training deep networks: bootstrapping inside the step
 
 `place_bootstraps` works layer by layer and only for inference. A training
-step is much deeper than the forward pass (one softmax transformer block
-takes 36 levels from the forward pass through the backward pass to the
-weight update), its activations are reused by the backward pass, and the
+step is much deeper than the forward pass (a pre-norm transformer block
+with softmax attention takes 80 levels from the forward pass through the
+backward pass to the weight update), its activations are reused by the backward pass, and the
 deepest pieces (softmax, layer norm) are single layers. With a level budget
 the trainer bootstraps inside the step instead:
 
@@ -520,6 +520,21 @@ by it (a power of two, one level) before and doubled back after (free).
 `min_level_budget` is the deepest indivisible operation (the 1/sqrt series
 of a layer norm, a softmax series, an activation polynomial),
 `sample_bootstraps` counts the bootstraps of the last sample.
+
+Measured in CI (`tests/test_train.cpp`, toy parameters: ring 4096, 55-bit
+scaling, bootstrap level budget {3,3}), one SGD update of 2 samples each,
+decrypted weights against the same update in the clear:
+
+| Network | Step depth without / with budget | Bootstraps per sample | Context depth | Weight error | Time per update |
+| --- | --- | --- | --- | --- | --- |
+| CNN (conv, affine, square, avgpool, dense) | 12 / 2 | 3 | 25 (5 + 20) | 1.4e-4 | about 1 min |
+| Pre-norm transformer block (layer norm + 2-head softmax attention, layer norm + SiLU MLP), 4 tokens | 80 / 12 | 13 | 35 (15 + 20) | 8.2e-5 | about 3.5 min |
+| Softmax attention with the scheme-switching row maximum | 47 / 8 | 15 | 31 (11 + 20) | 6.0e-6 | about 1.3 min |
+
+Without the budget the transformer block would need an 80-level step plus
+the bootstrap's 20 levels; at 128-bit security that is far beyond ring 2^17.
+With budget 12 it needs 35 levels, ring 2^16 territory at 128-bit with the
+larger rings' scaling (the toy runs above use 55-bit scaling at ring 4096).
 
 ## Using the library
 
