@@ -215,13 +215,13 @@ struct Trainer::Node {
   std::vector<Ctxt> p, aw, A;  // scores, head-slot weights, weights broadcast over the head
   Ctxt q, o, y;               // queries, sum_s A_s (*) v_s before the softmax division, 1 / row sum
 
-  // kMax: per tournament round, the number of values entering it and, per
-  // pair, the comparison bit [a < b] and its complement, both masked to the
-  // output slots (the backward pass routes the gradient with them).
+  // kMax: per tournament round (see MaxPool2d), the comparison bit [a < b]
+  // and its complement, both masked to the slots the round writes (the
+  // output slots in the last round; the backward pass routes the gradient
+  // with them).
   MaxPool2d* pool = nullptr;
-  std::vector<double> out_mask;
-  std::vector<size_t> round_sizes;
-  std::vector<std::vector<Ctxt>> pick_b, pick_a;
+  std::vector<std::vector<double>> round_mask;
+  std::vector<Ctxt> pick_b, pick_a;
 
   std::vector<std::unique_ptr<Node>> body;  // kResidual, kAttn
 };
@@ -349,8 +349,14 @@ std::unique_ptr<Node> build(Layer* l, bool train, uint32_t slots) {
   if (auto* mp = dynamic_cast<MaxPool2d*>(l)) {
     n->kind = Node::kMax;
     n->pool = mp;
-    n->out_mask.assign(slots, 0.0);
-    for (size_t i = 0; i < mp->out_shape().size(); ++i) n->out_mask[mp->out_layout().slot(mp->out_shape(), i)] = 1.0;
+    for (uint32_t h = mp->blocks() / 2; h >= 1; h /= 2) {
+      std::vector<double> m(slots, 0.0);
+      if (h > 1)
+        std::fill(m.begin(), m.begin() + static_cast<long>(h) * mp->block(), 1.0);
+      else
+        for (size_t i = 0; i < mp->out_shape().size(); ++i) m[mp->out_layout().slot(mp->out_shape(), i)] = 1.0;
+      n->round_mask.push_back(std::move(m));
+    }
     return n;
   }
   if (auto* at = dynamic_cast<Attention*>(l)) {
@@ -552,11 +558,12 @@ AttnLevels attention_levels(Sim& s, const Node& n, uint32_t z) {
   return L;
 }
 
-// MaxPool2d forward from input level x: every round compares (inputs two
-// levels above the bottom) and selects with the fresh comparison bit; the
-// masked bits sit one level below it.
+// MaxPool2d forward from input level x: the gather, then every round
+// compares (inputs two levels above the bottom) and selects with the fresh
+// comparison bit; the masked bits sit one level below it.
 uint32_t sim_maxpool_forward(Sim& s, const Node& n, uint32_t x) {
   const uint32_t c = FHEContext::compare_depth();
+  x = s.see(x + 1);
   if (n.pool->rounds()) s.see(c + 1);
   for (uint32_t r = 0; r < n.pool->rounds(); ++r) {
     s.see(x + 2);
@@ -658,6 +665,7 @@ uint32_t sim_backward(Sim& s, const std::vector<std::unique_ptr<Node>>& nodes, c
         break;
       case Node::kMax:
         for (uint32_t r = 0; r < n.pool->rounds(); ++r) g = s.see(std::max(g, FHEContext::compare_depth() + 1) + 1);
+        g = s.see(g + 1);  // scatter
         break;
       case Node::kBoot: g = std::min(g, 0u); break;
       case Node::kResidual: g = std::max(sim_backward(s, n.body, tr.body[k], g), g); break;
@@ -695,11 +703,14 @@ void collect_rotations(const std::vector<std::unique_ptr<Node>>& nodes, uint32_t
     if (n->kind == Node::kResidual || n->kind == Node::kAttn) collect_rotations(n->body, slots, r, allsum);
     if (n->kind == Node::kNorm)
       for (int32_t k : n->norm->rotation_indices()) add(k);
-    if (n->kind == Node::kMax)
-      for (int32_t k : n->pool->offsets()) {
-        add(k);
-        add(-static_cast<int64_t>(k));
+    if (n->kind == Node::kMax) {
+      for (int32_t k : n->pool->gather().rotation_indices()) add(k);
+      for (int32_t k : n->pool->scatter().rotation_indices()) add(k);
+      for (uint32_t h = n->pool->blocks() / 2; h >= 1; h /= 2) {
+        add(static_cast<int64_t>(h) * n->pool->block());
+        add(-static_cast<int64_t>(h) * n->pool->block());
       }
+    }
     if (n->kind == Node::kAttn) {
       const Attention& at = *n->att;
       const int64_t nd = static_cast<int64_t>(at.tokens()) * at.stride();
@@ -1015,66 +1026,47 @@ Ctxt maxpool_forward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt x) {
   if (!ctx.scheme_switching())
     throw std::logic_error("maxpool2d needs a context with ContextOptions::scheme_switching");
   const CC& cc = ctx.cc();
-  rf.fit(x, 1);  // compare() needs two levels left, the selection product one
-  std::vector<Ctxt> vals = ctx.rotate_many(x, n.pool->offsets());
-  n.round_sizes.clear();
+  const MaxPool2d& mp = *n.pool;
+  rf.fit(x, 1);
+  Ctxt a = mp.gather().eval(ctx, x);
   n.pick_b.clear();
   n.pick_a.clear();
-  while (vals.size() > 1) {
-    const size_t pairs = vals.size() / 2;
-    std::vector<Ctxt> next((vals.size() + 1) / 2), pb(pairs), pa(pairs);
-    rf.fit_all(vals, 1);
-    for (size_t i = 0; i < pairs; ++i) {
-      const Ctxt& a = vals[2 * i];
-      const Ctxt& b = vals[2 * i + 1];
-      Ctxt sel = ctx.compare(a, b, n.pool->range());  // [a < b]
-      next[i] = cc->EvalAdd(a, cc->EvalMult(sel, cc->EvalSub(b, a)));
-      // Masked to the output slots: a gradient in any other slot (an output
-      // layer's g = y - t there) must not leak into the inputs.
-      pb[i] = mul_plain(ctx, sel, n.out_mask);
-      pa[i] = add_plain(ctx, cc->EvalNegate(pb[i]), n.out_mask);
-    }
-    if (vals.size() % 2) next.back() = vals.back();
-    n.round_sizes.push_back(vals.size());
-    n.pick_b.push_back(std::move(pb));
-    n.pick_a.push_back(std::move(pa));
-    vals.swap(next);
+  size_t r = 0;
+  for (uint32_t h = mp.blocks() / 2; h >= 1; h /= 2, ++r) {
+    const size_t m = static_cast<size_t>(h) * mp.block();
+    rf.fit(a, 1);  // compare() needs two levels left, the selection product one
+    Ctxt b = ctx.rotate(a, static_cast<int32_t>(m));
+    Ctxt sel = ctx.compare(a, b, mp.range(), m);  // [a < b]
+    a = cc->EvalAdd(a, cc->EvalMult(sel, cc->EvalSub(b, a)));
+    // Masked to the slots this round writes: a gradient in any other slot
+    // (an output layer's g = y - t there) must not leak into the inputs.
+    n.pick_b.push_back(mul_plain(ctx, sel, n.round_mask[r]));
+    n.pick_a.push_back(add_plain(ctx, cc->EvalNegate(n.pick_b.back()), n.round_mask[r]));
   }
-  return vals[0];
+  return a;
 }
 
-// Routes g down the tournament (d max / da = 1 - [a < b], d max / db = [a < b])
-// to the window taps, then rotates each tap's gradient back to its input slot.
-// Overlapping windows (stride < k) add up.
+// Routes g down the tournament (d max / da = 1 - [a < b], d max / db = [a < b],
+// b being a rotated by the round's half) to the tap blocks, then scatters the
+// taps' gradients back to their input slots (overlapping windows add up).
 Ctxt maxpool_backward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt g, bool need) {
   const CC& cc = ctx.cc();
-  std::vector<Ctxt> gs;
+  const MaxPool2d& mp = *n.pool;
   if (need) {
-    gs.push_back(g);
-    for (size_t r = n.round_sizes.size(); r-- > 0;) {
-      const size_t m = n.round_sizes[r];
-      rf.fit_all(gs, 1);
-      rf.fit_all(n.pick_a[r], 1);
-      rf.fit_all(n.pick_b[r], 1);
-      std::vector<Ctxt> prev(m);
-#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
-      for (size_t i = 0; i < m / 2; ++i) {
-        prev[2 * i] = cc->EvalMult(gs[i], n.pick_a[r][i]);
-        prev[2 * i + 1] = cc->EvalMult(gs[i], n.pick_b[r][i]);
-      }
-      if (m % 2) prev.back() = gs.back();
-      gs.swap(prev);
+    uint32_t h = 1;
+    for (size_t r = n.pick_b.size(); r-- > 0; h *= 2) {
+      rf.fit(g, 1);
+      rf.fit(n.pick_a[r], 1);
+      rf.fit(n.pick_b[r], 1);
+      Ctxt gb = ctx.rotate(cc->EvalMult(g, n.pick_b[r]), -static_cast<int32_t>(static_cast<size_t>(h) * mp.block()));
+      g = cc->EvalAdd(cc->EvalMult(g, n.pick_a[r]), gb);
     }
+    rf.fit(g, 1);
+    g = mp.scatter().eval(ctx, g);
   }
-  n.round_sizes.clear();
   n.pick_b.clear();
   n.pick_a.clear();
-  if (!need) return nullptr;
-  const std::vector<int32_t> offs = n.pool->offsets();
-  std::vector<Ctxt> terms(offs.size());
-#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
-  for (size_t j = 0; j < offs.size(); ++j) terms[j] = ctx.rotate(gs[j], -offs[j]);
-  return sum(ctx, std::move(terms));
+  return need ? g : nullptr;
 }
 
 Ctxt forward_nodes(const FHEContext& ctx, Refresh& rf, std::vector<std::unique_ptr<Node>>& nodes, Ctxt x) {
@@ -1405,7 +1397,8 @@ std::vector<double> plain_attention_backward(Attention* at, bool train, const st
 }
 
 // The gradient goes to the winner of the same tournament the encrypted layer
-// runs (a tie keeps the first tap, like [a < b] = 0).
+// runs (tap blocks padded with tap 0; a tie keeps the lower block, like
+// [a < b] = 0), times the layer's gain.
 std::vector<double> plain_maxpool_backward(const MaxPool2d* mp, const std::vector<double>& x,
                                            const std::vector<double>& g) {
   const Shape& in = mp->in_shape();
@@ -1416,17 +1409,14 @@ std::vector<double> plain_maxpool_backward(const MaxPool2d* mp, const std::vecto
     for (int oy = 0; oy < out.h; ++oy)
       for (int ox = 0; ox < out.w; ++ox) {
         std::vector<size_t> vals;
-        for (int dy = 0; dy < k; ++dy)
-          for (int dx = 0; dx < k; ++dx)
-            vals.push_back((static_cast<size_t>(c) * in.h + oy * st + dy) * in.w + ox * st + dx);
-        while (vals.size() > 1) {
-          std::vector<size_t> next((vals.size() + 1) / 2);
-          for (size_t i = 0; i + 1 < vals.size(); i += 2)
-            next[i / 2] = x[vals[i]] < x[vals[i + 1]] ? vals[i + 1] : vals[i];
-          if (vals.size() % 2) next.back() = vals.back();
-          vals.swap(next);
+        for (uint32_t j = 0; j < mp->blocks(); ++j) {
+          const int tap = j < static_cast<uint32_t>(k * k) ? static_cast<int>(j) : 0;
+          vals.push_back((static_cast<size_t>(c) * in.h + oy * st + tap / k) * in.w + ox * st + tap % k);
         }
-        gx[vals[0]] += g[(static_cast<size_t>(c) * out.h + oy) * out.w + ox];
+        for (size_t h = vals.size() / 2; h >= 1; h /= 2)
+          for (size_t i = 0; i < h; ++i)
+            if (x[vals[i]] < x[vals[i + h]]) vals[i] = vals[i + h];
+        gx[vals[0]] += mp->gain() * g[(static_cast<size_t>(c) * out.h + oy) * out.w + ox];
       }
   return gx;
 }

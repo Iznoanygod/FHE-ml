@@ -29,6 +29,13 @@ struct ContextOptions {
   bool secure = true;
   bool bootstrapping = false;
   std::vector<uint32_t> level_budget = {3, 3};
+  // 2 = OpenFHE's iterative bootstrapping: the residual error of a first
+  // bootstrap is bootstrapped again, which roughly doubles the bits of
+  // precision (about 10 -> 20 at 50-bit scaling) for twice the time and one
+  // more level (counted in bootstrap_depth()). bootstrap_precision is the
+  // precision in bits of a single bootstrap; 0 measures it in keygen().
+  uint32_t bootstrap_iterations = 1;
+  uint32_t bootstrap_precision = 0;
   // Rotation keys. 0: keygen() makes one key per rotation index it is given.
   // w > 0: keygen() also makes a ladder of keys for +-j * 2^(w*i), 1 <= j <=
   // 2^(w-1), and rotate() composes every other rotation from them, so the key
@@ -95,6 +102,23 @@ class FHEContext {
   std::vector<double> decrypt(const Ctxt& c, size_t n) const;
 
   Ctxt bootstrap(const Ctxt& c) const;
+  // Bootstraps values bounded by |x| <= bound (any bound): they are divided
+  // by a power of two s >= bound first, which costs one level, and
+  // multiplied back by s afterwards with additions, which costs none. So c
+  // needs two levels left; the result sits at a bootstrap's output level.
+  // A non-empty mask (per slot) is applied in the same product, clearing
+  // slots whose values are not bounded.
+  Ctxt refresh(const Ctxt& c, double bound, const std::vector<double>& mask = {}) const;
+  // Levels c has consumed (after its pending rescale) and has left.
+  static uint32_t level(const Ctxt& c);
+  uint32_t levels_left(const Ctxt& c) const;
+  // Levels between bootstraps: a bootstrap's output can consume
+  // stretch_budget() levels and still be bootstrapped (OpenFHE needs one
+  // level left at the input). stretch_level(c) counts c's levels from a
+  // bootstrap's output level. Layers that bootstrap internally (LayerNorm,
+  // softmax attention) plan with these.
+  uint32_t stretch_budget() const { return opts_.bootstrapping ? opts_.mult_depth - 1 : 0; }
+  uint32_t stretch_level(const Ctxt& c) const;
 
   // Encrypted comparison through FHEW (needs ContextOptions::scheme_switching):
   // slot i of the result is 1 where a_i < b_i and 0 otherwise, for values
@@ -102,8 +126,10 @@ class FHEContext {
   // plaintext space and compare wrongly). Switches a - b to FHEW, evaluates
   // the sign there with one FHEW bootstrap per slot and switches back. The
   // result is a fresh CKKS ciphertext at level compare_depth() whatever the
-  // inputs' levels, which only need two levels left.
-  Ctxt compare(const Ctxt& a, const Ctxt& b, double range = 1.0) const;
+  // inputs' levels, which only need two levels left. count > 0 compares
+  // only the first `count` slots, rounded up to a power of two (one FHEW
+  // bootstrap each; the other slots of the result are 0).
+  Ctxt compare(const Ctxt& a, const Ctxt& b, double range = 1.0, size_t count = 0) const;
   // Sign test [x > 0] per slot for |x| <= range: compare(0, x) with the
   // FHEW scaling set for a difference of at most range (not 2 range), so
   // small values are resolved twice as finely as by compare().
@@ -159,6 +185,7 @@ class FHEContext {
   uint32_t compare_plaintext_mod_ = 0;
   uint32_t total_depth_ = 0;
   uint32_t boot_depth_ = 0;
+  uint32_t boot_precision_ = 0;  // bits of one bootstrap (iterative bootstrapping)
   struct PlanCache {
     std::mutex mu;
     std::map<std::vector<int32_t>, std::shared_ptr<const RotationPlan>> plans;

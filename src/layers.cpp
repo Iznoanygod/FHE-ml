@@ -432,7 +432,9 @@ MaxPool2d::MaxPool2d(int k, int stride, double range) : k_(k), stride_(stride), 
 
 std::string MaxPool2d::describe() const {
   std::ostringstream os;
-  os << type() << " " << k_ << "x" << k_ << " stride " << stride_ << " range " << range_ << " (" << (k_ * k_ - 1)
+  os << type() << " " << k_ << "x" << k_ << " stride " << stride_ << " range " << range_;
+  if (gain_ != 1.0) os << " gain " << gain_;
+  os << " (" << (k_ * k_ - 1)
      << " comparisons, " << rounds() << " rounds)";
   return os.str();
 }
@@ -443,21 +445,12 @@ Shape MaxPool2d::configure(const Shape& in) {
   return out_;
 }
 
-// Always gapped: output (c, y, x) lives in the slot of input (c, y*s, x*s).
-// With multiplexed packing the next linear layer re-packs the gaps.
+// The output is compact (block 0 of the tournament).
 Layout MaxPool2d::configure_layout(const Layout& in, Packing packing) {
   (void)packing;
   in_layout_ = in;
-  out_layout_ = in.strided(static_cast<size_t>(stride_));
+  out_layout_ = Layout::compact(out_);
   return out_layout_;
-}
-
-std::vector<int32_t> MaxPool2d::offsets() const {
-  std::vector<int32_t> offs;
-  for (int dy = 0; dy < k_; ++dy)
-    for (int dx = 0; dx < k_; ++dx)
-      offs.push_back(static_cast<int32_t>(dy * in_layout_.ys + dx * in_layout_.xs));
-  return offs;
 }
 
 uint32_t MaxPool2d::rounds() const {
@@ -466,13 +459,46 @@ uint32_t MaxPool2d::rounds() const {
   return r;
 }
 
+uint32_t MaxPool2d::blocks() const { return 1u << rounds(); }
+
+uint32_t MaxPool2d::block() const {
+  uint32_t b = 1;
+  while (b < out_.size()) b *= 2;
+  return b;
+}
+
+size_t MaxPool2d::min_slots() const {
+  return std::max(in_layout_.span(in_), static_cast<size_t>(blocks()) * block());
+}
+
 // +1: the last round's comparison needs its inputs two levels above the bottom.
-uint32_t MaxPool2d::depth() const { return FHEContext::compare_depth() + rounds() + 1; }
+uint32_t MaxPool2d::depth() const {
+  return bootstrapped_ ? 1 + rounds() : FHEContext::compare_depth() + rounds() + 1;
+}
+
+void MaxPool2d::compile(uint32_t slots) {
+  const uint32_t nb = blocks(), m = block();
+  SparseMatrix g(static_cast<size_t>(nb) * m, slots), t(slots, static_cast<size_t>(nb) * m);
+  for (uint32_t j = 0; j < nb; ++j) {
+    const int tap = j < static_cast<uint32_t>(k_ * k_) ? static_cast<int>(j) : 0;
+    const int dy = tap / k_, dx = tap % k_;
+    for (int c = 0; c < out_.c; ++c)
+      for (int y = 0; y < out_.h; ++y)
+        for (int x = 0; x < out_.w; ++x) {
+          const size_t r = static_cast<size_t>(j) * m + (static_cast<size_t>(c) * out_.h + y) * out_.w + x;
+          const size_t col = in_layout_.slot(c, y * stride_ + dy, x * stride_ + dx);
+          g.add(r, col, gain_);
+          t.add(col, r, gain_);
+        }
+  }
+  gather_ = LinearTransform(g, slots);
+  scatter_ = LinearTransform(t, slots);
+}
 
 std::vector<int32_t> MaxPool2d::rotation_indices() const {
-  std::vector<int32_t> offs = offsets();
-  offs.erase(std::remove(offs.begin(), offs.end(), 0), offs.end());
-  return offs;
+  std::vector<int32_t> r = gather_.rotation_indices();
+  for (uint32_t h = blocks() / 2; h >= 1; h /= 2) r.push_back(static_cast<int32_t>(h * block()));
+  return r;
 }
 
 std::vector<double> MaxPool2d::forward_plain(const std::vector<double>& x) const {
@@ -484,38 +510,34 @@ std::vector<double> MaxPool2d::forward_plain(const std::vector<double>& x) const
         for (int dy = 0; dy < k_; ++dy)
           for (int dx = 0; dx < k_; ++dx)
             m = std::max(m, x[(static_cast<size_t>(c) * in_.h + oy * stride_ + dy) * in_.w + ox * stride_ + dx]);
-        y[(static_cast<size_t>(c) * out_.h + oy) * out_.w + ox] = m;
+        y[(static_cast<size_t>(c) * out_.h + oy) * out_.w + ox] = gain_ * m;
       }
   return y;
 }
 
-// Tournament over the window taps. Every tap is first rotated onto the
-// slot of its window's top-left input, so each round compares whole
-// ciphertexts: one scheme switch per pair, all windows at once. The pairs
-// run one after the other: OpenFHE's scheme switching keeps state in the
-// context and parallelises the FHEW bootstraps itself.
+// Tournament over the gathered tap blocks: each round compares the lower
+// half of the blocks with the upper half rotated onto it, as one comparison
+// of exactly the slots that hold windows. OpenFHE's scheme switching keeps
+// state in the context and parallelises the FHEW bootstraps itself.
 Ctxt MaxPool2d::forward(const FHEContext& ctx, const Ctxt& x) const {
   if (!ctx.scheme_switching())
     throw std::logic_error("maxpool2d needs a context with ContextOptions::scheme_switching");
+  if (gather_.slots() != ctx.slots()) throw std::invalid_argument("maxpool2d: slot count mismatch with context");
   const CC& cc = ctx.cc();
-  std::vector<Ctxt> vals = ctx.rotate_many(x, offsets());
-  while (vals.size() > 1) {
-    std::vector<Ctxt> next((vals.size() + 1) / 2);
-    const size_t pairs = vals.size() / 2;
-    for (size_t i = 0; i < pairs; ++i) {
-      const Ctxt& a = vals[2 * i];
-      const Ctxt& b = vals[2 * i + 1];
-      Ctxt sel = ctx.compare(a, b, range_);  // [a < b]
-      next[i] = cc->EvalAdd(a, cc->EvalMult(sel, cc->EvalSub(b, a)));
-    }
-    if (vals.size() % 2) next.back() = vals.back();
-    vals.swap(next);
+  Ctxt a = gather_.eval(ctx, x);
+  for (uint32_t h = blocks() / 2; h >= 1; h /= 2) {
+    const size_t n = static_cast<size_t>(h) * block();
+    Ctxt b = ctx.rotate(a, static_cast<int32_t>(n));
+    Ctxt sel = ctx.compare(a, b, range_, n);  // [a < b]
+    a = cc->EvalAdd(a, cc->EvalMult(sel, cc->EvalSub(b, a)));
   }
-  return vals[0];
+  return a;
 }
 
 void MaxPool2d::save(std::ostream& os) const {
-  os << "maxpool2d " << k_ << " " << stride_ << " " << range_ << "\n";
+  os << "maxpool2d " << k_ << " " << stride_ << " " << range_;
+  if (gain_ != 1.0) os << " gain " << gain_;
+  os << "\n";
 }
 
 // --------------------------------------------------------------- ChannelAffine

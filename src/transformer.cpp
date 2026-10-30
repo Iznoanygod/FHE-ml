@@ -6,6 +6,7 @@
 #include <limits>
 #include <ostream>
 #include <set>
+#include <string>
 #include <sstream>
 #include <stdexcept>
 
@@ -150,7 +151,7 @@ LayerNorm::LayerNorm(int n, int d, std::vector<double> gamma, std::vector<double
 std::string LayerNorm::describe() const {
   std::ostringstream os;
   os << type() << " " << n_ << "x" << d_ << " eps " << eps_ << " var [" << var_min_ << ", " << var_max_
-     << "] degree " << degree_ << " newton " << newton_;
+     << "] degree " << degree_ << " newton " << newton_ << (self_ ? " (self-bootstrapping)" : "");
   return os.str();
 }
 
@@ -177,9 +178,11 @@ void LayerNorm::compile(uint32_t slots) {
   // for [var_min, var_max] can be astronomically wrong (and then spoils the
   // decryption of every slot), so they get a variance inside the interval.
   pad_var_.assign(slots, 0.5 * (var_min_ + var_max_));
+  token_mask_.assign(slots, 0.0);
   for (int t = 0; t < n_; ++t) {
     mask_[t * stride_] = 1.0 / d_;
     for (int j = 0; j < d_; ++j) pad_var_[t * stride_ + j] = 0.0;
+    for (int j = 0; j < d_; ++j) token_mask_[t * stride_ + j] = 1.0;
     for (int j = 0; j < d_; ++j) {
       gamma_slots_[t * stride_ + j] = gamma_[static_cast<size_t>(j)];
       beta_slots_[t * stride_ + j] = beta_[static_cast<size_t>(j)];
@@ -249,8 +252,128 @@ void LayerNorm::normalize(const FHEContext& ctx, const Ctxt& x, Ctxt& centred, C
   centred = cc->EvalSub(x, mean);
 }
 
+// Self-bootstrapping plan, in stretch levels (see Layer::level_after). The
+// plain evaluation when it fits; otherwise: the input refreshed first when
+// the variance would arrive too deep (t at d + 3: x^2, the 1/d mask, the map
+// onto [-1, 1]); t bootstrapped; the series from level 0; each Newton step
+// two levels above max(r, v) (v comes from t with one scalar product), r
+// refreshed (its scale is folded into the series, the Newton constants and
+// gamma, so no level) before a step or the final product that would
+// overflow; output at max(centred * gamma, r) + 1.
+LayerNorm::Plan LayerNorm::plan(uint32_t d, uint32_t budget) const {
+  Plan p;
+  const uint32_t plain = d + depth();
+  if (!self_ || plain <= budget) {
+    p.fits = plain <= budget;
+    p.out = p.peak = plain;
+    return p;
+  }
+  p.plain = false;
+  const uint32_t pd = poly_depth(degree_);
+  const bool can_refresh_r = var_min_ + eps_ > 0.0;
+  uint32_t dx = d;
+  if (dx + 3 > budget) {
+    if (dx + 1 > budget || 3 > budget || !(x_bound_ > 0.0)) return p;
+    p.refresh_x = true;
+    p.peak = dx + 1;
+    dx = 0;
+    ++p.boots;
+  }
+  p.peak = std::max(p.peak, dx + 3);
+  ++p.boots;  // t
+  if (pd > budget) return p;
+  uint32_t dr = pd;
+  p.peak = std::max(p.peak, dr);
+  p.refresh_r.assign(newton_ + 1, 0);
+  auto refresh_r = [&](size_t at) {
+    if (!can_refresh_r || dr > budget) return false;
+    p.refresh_r[at] = 1;
+    dr = 0;
+    ++p.boots;
+    return true;
+  };
+  for (uint32_t i = 0; i < newton_; ++i) {
+    if (std::max(dr, 1u) + 2 > budget && !refresh_r(i)) return p;
+    dr = std::max(dr, 1u) + 2;
+    if (dr > budget) return p;
+    p.peak = std::max(p.peak, dr);
+  }
+  if (std::max(dx + 2, dr) + 1 > budget && !refresh_r(newton_)) return p;
+  p.out = std::max(dx + 2, dr) + 1;
+  if (p.out > budget) return p;
+  p.peak = std::max(p.peak, p.out);
+  p.fits = true;
+  return p;
+}
+
+uint32_t LayerNorm::level_after(uint32_t d, uint32_t budget) const {
+  Plan p = plan(d, budget);
+  return p.fits ? p.out : kNoFit;
+}
+
+uint32_t LayerNorm::level_peak(uint32_t d, uint32_t budget) const {
+  Plan p = plan(d, budget);
+  return p.fits ? p.peak : kNoFit;
+}
+
+uint32_t LayerNorm::internal_bootstraps(uint32_t d, uint32_t budget) const {
+  Plan p = plan(d, budget);
+  return p.fits && !p.plain ? p.boots : 0;
+}
+
+void LayerNorm::calibrate(const std::vector<std::vector<double>>& inputs, double headroom) {
+  double m = 0.0;
+  for (const auto& x : inputs)
+    for (double v : x) m = std::max(m, std::fabs(v));
+  x_bound_ = headroom * m;
+}
+
+// The series overshoots 1/sqrt(v + eps) by a little near the ends of the
+// interval; Newton steps only bring it down.
+double LayerNorm::inv_sqrt_bound() const { return 1.1 / std::sqrt(var_min_ + eps_); }
+
 Ctxt LayerNorm::forward(const FHEContext& ctx, const Ctxt& x) const {
   const CC& cc = ctx.cc();
+  const Plan p = self_ && ctx.stretch_budget() ? plan(ctx.stretch_level(x), ctx.stretch_budget()) : Plan{};
+  if (self_ && ctx.stretch_budget() && !p.fits)
+    throw std::logic_error("layernorm: does not fit a stretch of " + std::to_string(ctx.stretch_budget()) +
+                           " levels from level " + std::to_string(ctx.stretch_level(x)));
+  if (!p.plain) {
+    const Ctxt xi = p.refresh_x ? ctx.refresh(x, x_bound_, token_mask_) : x;
+    Ctxt mean = block_mean(ctx, xi);
+    Ctxt var = cc->EvalSub(block_mean(ctx, cc->EvalMult(xi, xi)), cc->EvalMult(mean, mean));
+    Ptxt pad = ctx.encode(pad_var_, var->GetLevel(), var->GetNoiseScaleDeg());
+    cc->EvalAddInPlace(var, pad);
+    // t = (2 var - var_min - var_max) / (var_max - var_min), in [-1, 1].
+    const double w = var_max_ - var_min_;
+    Ctxt t = cc->EvalAdd(cc->EvalMult(var, 2.0 / w), -(var_min_ + var_max_) / w);
+    t = ctx.bootstrap(t);
+    // u = k r / S stays within [0, 1] for every k <= k0 (S = k0 * the
+    // largest 1/sqrt), so it can be bootstrapped as it is.
+    double k = std::pow(1.5, static_cast<double>(newton_));
+    const double big = k * inv_sqrt_bound();
+    std::vector<double> c = coeffs_;
+    for (double& ci : c) ci *= k / big;
+    Ctxt r = cc->EvalChebyshevSeries(t, c, -1.0, 1.0);
+    for (uint32_t i = 0; i < newton_; ++i) {
+      if (p.refresh_r[i]) r = ctx.bootstrap(r);
+      // u <- u - (c S^2) (v + eps) u^3, c (v + eps) = c (w/2 t + (var_min +
+      // var_max)/2 + eps), see normalize().
+      const double ci = 0.5 / (1.5 * k * k) * big * big;
+      Ctxt vc = cc->EvalAdd(cc->EvalMult(t, ci * w / 2), ci * (0.5 * (var_min_ + var_max_) + eps_));
+      Ctxt q = cc->EvalMult(cc->EvalMult(vc, r), cc->EvalMult(r, r));
+      r = cc->EvalSub(r, q);
+      k /= 1.5;
+    }
+    if (p.refresh_r[newton_]) r = ctx.bootstrap(r);
+    Ctxt centred = cc->EvalSub(xi, mean);
+    std::vector<double> gs(gamma_slots_);
+    for (double& g : gs) g *= big;
+    Ptxt gamma = ctx.encode(gs, FHEContext::level(centred));
+    Ctxt y = cc->EvalMult(cc->EvalMult(centred, gamma), r);
+    Ptxt beta = ctx.encode(beta_slots_, y->GetLevel(), y->GetNoiseScaleDeg());
+    return cc->EvalAdd(y, beta);
+  }
   Ctxt centred, r;
   normalize(ctx, x, centred, r);
   const uint32_t lvl = centred->GetLevel() + (centred->GetNoiseScaleDeg() > 1 ? 1 : 0);
@@ -319,7 +442,9 @@ void LayerNorm::scale_output(double f) {
 
 void LayerNorm::save(std::ostream& os) const {
   os << std::setprecision(std::numeric_limits<double>::max_digits10) << "layernorm " << n_ << " " << d_ << " " << eps_
-     << " " << var_min_ << " " << var_max_ << " " << degree_ << " " << newton_ << "\n";
+     << " " << var_min_ << " " << var_max_ << " " << degree_ << " " << newton_;
+  if (self_) os << " selfboot " << x_bound_;
+  os << "\n";
   write_vec(os, gamma_);
   write_vec(os, beta_);
 }
@@ -401,6 +526,54 @@ void Residual::encrypt_weights(const FHEContext& ctx, bool drop_plaintext) {
   for (auto& l : body_) l->encrypt_weights(ctx, drop_plaintext);
 }
 
+uint32_t Residual::level_after(uint32_t d, uint32_t budget) const {
+  uint32_t b = d;
+  for (const auto& l : body_) {
+    b = l->is_bootstrap() ? 0 : l->level_after(b, budget);
+    if (b == kNoFit) return kNoFit;
+  }
+  return std::max(d, b);
+}
+
+uint32_t Residual::level_peak(uint32_t d, uint32_t budget) const {
+  uint32_t b = d, peak = d;
+  for (const auto& l : body_) {
+    if (l->is_bootstrap()) {
+      b = 0;
+      continue;
+    }
+    const uint32_t p = l->level_peak(b, budget);
+    b = l->level_after(b, budget);
+    if (b == kNoFit || p == kNoFit) return kNoFit;
+    peak = std::max(peak, p);
+  }
+  return std::max(peak, std::max(d, b));
+}
+
+void Residual::set_bootstrapped(bool on) {
+  for (auto& l : body_) l->set_bootstrapped(on);
+}
+
+bool Residual::self_bootstrapping() const {
+  return std::any_of(body_.begin(), body_.end(),
+                     [](const std::shared_ptr<Layer>& l) { return l->is_bootstrap() || l->self_bootstrapping(); });
+}
+
+uint32_t Residual::internal_bootstraps(uint32_t d, uint32_t budget) const {
+  uint32_t b = d, n = 0;
+  for (const auto& l : body_) {
+    if (l->is_bootstrap()) {
+      ++n;
+      b = 0;
+      continue;
+    }
+    n += l->internal_bootstraps(b, budget);
+    b = l->level_after(b, budget);
+    if (b == kNoFit) return n;
+  }
+  return n;
+}
+
 void Residual::save(std::ostream& os) const {
   os << "residual " << body_.size() << "\n";
   for (const auto& l : body_) l->save(os);
@@ -438,7 +611,7 @@ std::string Attention::describe() const {
   if (softmax_) {
     os << " softmax exp[" << exp_lo() << ", " << exp_hi() << "] deg " << sm_.exp_degree << " 1/x[" << sum_lo() << ", "
        << sum_hi() << "] deg " << sm_.inv_degree << " newton " << sm_.newton
-       << (sm_.subtract_max ? " max subtracted (scheme switching)" : "");
+       << (sm_.subtract_max ? " max subtracted (scheme switching)" : "") << (self_ ? " (self-bootstrapping)" : "");
     return os.str();
   }
   for (int h = 0; h < heads_; ++h) {
@@ -487,6 +660,9 @@ void Attention::compile(uint32_t slots) {
       mask_c1_[t * stride_ + h * dh_] = score_[3 * h + 1];
       mask_c2_[t * stride_ + h * dh_] = score_[3 * h + 2];
     }
+  token_mask_.assign(slots, 0.0);
+  for (int t = 0; t < n_; ++t)
+    for (int c = 0; c < d_; ++c) token_mask_[t * stride_ + c] = 1.0;
   if (softmax_) {
     mask_head_.assign(slots, 0.0);
     // Slots outside the head sub-blocks hold a row sum of 0, where the 1/x
@@ -502,6 +678,153 @@ void Attention::compile(uint32_t slots) {
     inv_coeffs_ = lbcrypto::EvalChebyshevCoefficients([](double x) { return 1.0 / x; }, sum_lo(), sum_hi(),
                                                       sm_.inv_degree);
   }
+}
+
+void Attention::set_self_bootstrapping(bool on) {
+  if (on && !can_self_bootstrap())
+    throw std::logic_error("attention: only softmax attention without subtract_max can bootstrap internally");
+  self_ = on;
+}
+
+double Attention::exp_div() const { return std::max(1.0, 1.1 * sum_alpha() * std::exp(exp_hi())); }
+
+int32_t Attention::pack_shift(int s) const {
+  const int r = s % (2 * dh_);
+  return r < dh_ ? r : n_ * stride_ + (r - dh_);
+}
+
+// See the comment above the class and LayerNorm::plan. Levels: t_s at
+// d + 3 (projections, q.k, the mask product), exp from the bootstrapped
+// pack, a_s one level above exp (unpacking mask), o = sum a_s v_s one above
+// max(a, v), the 1/x series on the row sums, Newton steps two levels above
+// max(y, a), then o * y and W_o. y is within [0, 1] and refreshes without a
+// scale level.
+Attention::Plan Attention::plan_with(uint32_t d, uint32_t budget, bool refresh_e, bool refresh_sum) const {
+  Plan p;
+  p.plain = false;
+  p.refresh_e = refresh_e;
+  const uint32_t pe = poly_depth(sm_.exp_degree), pi = poly_depth(sm_.inv_degree);
+  const uint32_t groups = static_cast<uint32_t>(packed_groups());
+  uint32_t dx = d;
+  if (dx + 3 > budget) {
+    if (dx + 1 > budget || 3 > budget || !(x_bound_ > 0.0)) return p;
+    p.refresh_x = true;
+    p.peak = dx + 1;
+    dx = 0;
+    ++p.boots;
+  }
+  p.peak = std::max(p.peak, dx + 3);
+  p.boots += groups;
+  if (pe > budget) return p;
+  p.peak = std::max(p.peak, pe);
+  uint32_t de = pe;
+  if (refresh_e) {
+    p.boots += groups;
+    de = 0;
+  }
+  const uint32_t da = de + 1;
+  const uint32_t dv = dx + 1;
+  uint32_t dout = std::max(da, dv) + 1;
+  if (dout > budget) return p;
+  uint32_t dsum = da;
+  p.peak = std::max(p.peak, dout);
+  if (refresh_sum || dsum + pi > budget) {
+    p.refresh_sum = true;
+    dsum = 0;
+    ++p.boots;
+  }
+  uint32_t dy = dsum + pi;
+  if (dy > budget) return p;
+  p.peak = std::max(p.peak, dy);
+  p.refresh_y.assign(sm_.newton + 1, 0);
+  auto refresh_y = [&](size_t at) {
+    p.refresh_y[at] = 1;
+    dy = 0;
+    ++p.boots;
+    return true;
+  };
+  for (uint32_t i = 0; i < sm_.newton; ++i) {
+    if (std::max(dy, da) + 2 > budget) refresh_y(i);
+    dy = std::max(dy, da) + 2;
+    if (dy > budget) return p;
+    p.peak = std::max(p.peak, dy);
+  }
+  if (dy + 2 > budget) refresh_y(sm_.newton);
+  if (dout + 2 > budget) {
+    if (dout + 1 > budget || !(o_bound_ > 0.0)) return p;
+    p.peak = std::max(p.peak, dout + 1);
+    p.refresh_o = true;
+    dout = 0;
+    ++p.boots;
+  }
+  p.out = std::max(dout, dy) + 2;
+  if (p.out > budget) return p;
+  p.peak = std::max(p.peak, p.out);
+  p.fits = true;
+  return p;
+}
+
+Attention::Plan Attention::plan(uint32_t d, uint32_t budget) const {
+  const uint32_t plain = d + depth();
+  if (!self_ || plain <= budget) {
+    Plan p;
+    p.fits = plain <= budget;
+    p.out = p.peak = plain;
+    return p;
+  }
+  // Refreshing exp or the row sums early can save later refreshes: try all.
+  Plan best;
+  for (int e = 0; e < 2; ++e)
+    for (int r = 0; r < 2; ++r) {
+      Plan p = plan_with(d, budget, e != 0, r != 0);
+      if (p.fits && (!best.fits || p.boots < best.boots || (p.boots == best.boots && p.out < best.out))) best = p;
+    }
+  if (!best.fits) best.plain = false;
+  return best;
+}
+
+uint32_t Attention::level_after(uint32_t d, uint32_t budget) const {
+  Plan p = plan(d, budget);
+  return p.fits ? p.out : kNoFit;
+}
+
+uint32_t Attention::level_peak(uint32_t d, uint32_t budget) const {
+  Plan p = plan(d, budget);
+  return p.fits ? p.peak : kNoFit;
+}
+
+uint32_t Attention::internal_bootstraps(uint32_t d, uint32_t budget) const {
+  Plan p = plan(d, budget);
+  return p.fits && !p.plain ? p.boots : 0;
+}
+
+void Attention::calibrate(const std::vector<std::vector<double>>& inputs, double headroom) {
+  double mx = 0.0, mo = 0.0;
+  for (const auto& x : inputs) {
+    for (double v : x) mx = std::max(mx, std::fabs(v));
+    if (!softmax_) continue;
+    // The unnormalised output sum_j a_j v_j, as forward_plain computes it.
+    std::vector<double> q = proj_[0]->forward_plain(x), k = proj_[1]->forward_plain(x),
+                        v = proj_[2]->forward_plain(x);
+    for (int h = 0; h < heads_; ++h)
+      for (int i = 0; i < n_; ++i) {
+        std::vector<double> sc(n_);
+        for (int j = 0; j < n_; ++j) {
+          double acc = 0.0;
+          for (int c = h * dh_; c < (h + 1) * dh_; ++c) acc += q[i * d_ + c] * k[j * d_ + c];
+          sc[j] = acc;
+        }
+        std::vector<double> a = lbcrypto::EvalChebyshevFunctionPtxt([](double t) { return std::exp(t); }, sc, exp_lo(),
+                                                                   exp_hi(), sm_.exp_degree);
+        for (int c = h * dh_; c < (h + 1) * dh_; ++c) {
+          double o = 0.0;
+          for (int j = 0; j < n_; ++j) o += a[j] * v[j * d_ + c];
+          mo = std::max(mo, std::fabs(o));
+        }
+      }
+  }
+  x_bound_ = headroom * mx;
+  o_bound_ = headroom * mo * (softmax_ ? 1.1 / sum_lo() : 1.0);
 }
 
 void Attention::set_softmax(const SoftmaxOptions& o) {
@@ -580,9 +903,119 @@ std::vector<double> Attention::forward_plain(const std::vector<double>& x) const
   return proj_[3]->forward_plain(out);
 }
 
+// The self-bootstrapping softmax (see the comment above the class).
+Ctxt Attention::forward_self(const FHEContext& ctx, const Ctxt& x, const Plan& pl) const {
+  const CC& cc = ctx.cc();
+  const int32_t nd = n_ * stride_;
+  auto rot = [&](const Ctxt& c, int32_t r) {
+    const int32_t k = normalize_rotation(r, slots_);
+    return k ? cc->EvalRotate(c, k) : c;
+  };
+  auto encode_at = [&](const std::vector<double>& v, const Ctxt& c) {
+    return ctx.encode(v, c->GetLevel(), c->GetNoiseScaleDeg());
+  };
+  auto scaled = [](const std::vector<double>& v, double f) {
+    std::vector<double> o(v);
+    for (double& e : o) e *= f;
+    return o;
+  };
+  const Ctxt xi = pl.refresh_x ? ctx.refresh(x, x_bound_, token_mask_) : x;
+  Ctxt q = proj_[0]->forward(ctx, xi);
+  Ctxt k = proj_[1]->forward(ctx, xi);
+  Ctxt v = proj_[2]->forward(ctx, xi);
+  cc->EvalAddInPlace(k, rot(k, -nd));
+  cc->EvalAddInPlace(v, rot(v, -nd));
+  std::vector<int32_t> offs(n_);
+  for (int s = 0; s < n_; ++s) offs[s] = s * stride_;
+  const std::vector<Ctxt> kr = backend::rotate_hoisted(cc, k, offs, ctx.parallel());
+  const std::vector<Ctxt> vr = backend::rotate_hoisted(cc, v, offs, ctx.parallel());
+
+  // Scores, mapped onto t in [-1, 1] at the head slots (0 elsewhere).
+  const double alpha = 2.0 / (exp_hi() - exp_lo()), beta = -(exp_hi() + exp_lo()) / (exp_hi() - exp_lo());
+  const std::vector<double> mask_t = scaled(mask_head_, alpha), add_t = scaled(mask_head_, beta);
+  std::vector<Ctxt> t(n_);
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+  for (int s = 0; s < n_; ++s) {
+    Ctxt p = cc->EvalMult(q, kr[s]);
+    for (int w = 1; w < dh_; w *= 2) cc->EvalAddInPlace(p, rot(p, w));
+    Ptxt m = ctx.encode(mask_t, FHEContext::level(p));
+    t[s] = cc->EvalMult(p, m);
+    Ptxt a = encode_at(add_t, t[s]);
+    cc->EvalAddInPlace(t[s], a);
+  }
+  // Pack, bootstrap, exp (scaled for the row sums), optionally refresh.
+  const int groups = packed_groups();
+  std::vector<Ctxt> e(groups);
+  std::vector<double> ce = scaled(exp_coeffs_, sum_alpha() / exp_div());
+  for (int g = 0; g < groups; ++g) {
+    Ctxt packed;
+    for (int s = g * 2 * dh_; s < std::min(n_, (g + 1) * 2 * dh_); ++s) {
+      Ctxt r = rot(t[s], -pack_shift(s));
+      packed = packed ? cc->EvalAdd(packed, r) : r;
+    }
+    std::vector<double> c = ce;
+    e[g] = cc->EvalChebyshevSeries(ctx.bootstrap(packed), c, -1.0, 1.0);
+    if (pl.refresh_e) e[g] = ctx.bootstrap(e[g]);
+  }
+  // Unpack a_s twice from the same rotation: times alpha (row sums for the
+  // 1/x series' t) and times kappa = 1.1 / sum_lo (row sums for Newton and
+  // the output, so that y ~ 1 / (kappa D) stays within [0, 1]); broadcast;
+  // weight v_s.
+  const double kappa = 1.1 / sum_lo();
+  const std::vector<double> mask_a = scaled(mask_head_, exp_div()), mask_k = scaled(mask_head_, exp_div() * kappa / sum_alpha());
+  std::vector<Ctxt> partial(n_), weights(n_), weights_k(n_);
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+  for (int s = 0; s < n_; ++s) {
+    Ctxt u = rot(e[s / (2 * dh_)], pack_shift(s));
+    Ptxt m = ctx.encode(mask_a, FHEContext::level(u));
+    Ptxt mk = ctx.encode(mask_k, FHEContext::level(u));
+    Ctxt a = cc->EvalMult(u, m), ak = cc->EvalMult(u, mk);
+    for (int w = 1; w < dh_; w *= 2) {
+      cc->EvalAddInPlace(a, rot(a, -w));
+      cc->EvalAddInPlace(ak, rot(ak, -w));
+    }
+    partial[s] = cc->EvalMult(ak, vr[s]);
+    weights[s] = a;
+    weights_k[s] = ak;
+  }
+  Ctxt o = partial[0], sum = weights[0], sum_k = weights_k[0];
+  for (int s = 1; s < n_; ++s) {
+    cc->EvalAddInPlace(o, partial[s]);
+    cc->EvalAddInPlace(sum, weights[s]);
+    cc->EvalAddInPlace(sum_k, weights_k[s]);
+  }
+  // t_D = alpha D + beta on the features, 0 elsewhere; kappa D gets the
+  // midpoint off the features so Newton converges there too.
+  const std::vector<double> add_d = scaled(token_mask_, sum_beta());
+  Ptxt pb = encode_at(add_d, sum);
+  Ctxt td = cc->EvalAdd(sum, pb);
+  if (pl.refresh_sum) td = ctx.bootstrap(td);
+  std::vector<double> pad_k(token_mask_.size());
+  for (size_t i = 0; i < pad_k.size(); ++i) pad_k[i] = token_mask_[i] ? 0.0 : kappa * 0.5 * (sum_lo() + sum_hi());
+  Ptxt pk = encode_at(pad_k, sum_k);
+  const Ctxt dk = cc->EvalAdd(sum_k, pk);
+  std::vector<double> ci = scaled(inv_coeffs_, 1.0 / kappa);
+  Ctxt y = cc->EvalChebyshevSeries(td, ci, -1.0, 1.0);
+  for (uint32_t i = 0; i < sm_.newton; ++i) {
+    if (pl.refresh_y[i]) y = ctx.bootstrap(y);
+    Ctxt tt = cc->EvalSub(2.0, cc->EvalMult(dk, y));
+    y = cc->EvalMult(y, tt);
+  }
+  if (pl.refresh_y[sm_.newton]) y = ctx.bootstrap(y);
+  if (pl.refresh_o) o = ctx.refresh(o, o_bound_, token_mask_);
+  return proj_[3]->forward(ctx, cc->EvalMult(o, y));
+}
+
 Ctxt Attention::forward(const FHEContext& ctx, const Ctxt& x) const {
   const CC& cc = ctx.cc();
   if (ctx.slots() != slots_) throw std::invalid_argument("attention: slot count mismatch with context");
+  if (self_ && ctx.stretch_budget()) {
+    const Plan p = plan(ctx.stretch_level(x), ctx.stretch_budget());
+    if (!p.fits)
+      throw std::logic_error("attention: does not fit a stretch of " + std::to_string(ctx.stretch_budget()) +
+                             " levels from level " + std::to_string(ctx.stretch_level(x)));
+    if (!p.plain) return forward_self(ctx, x, p);
+  }
   const int32_t nd = n_ * stride_;
   auto rot = [&](const Ctxt& c, int32_t r) { return ctx.rotate(c, r); };
   Ctxt q = proj_[0]->forward(ctx, x);
@@ -704,6 +1137,12 @@ std::vector<int32_t> Attention::rotation_indices() const {
     r.insert(t);
     r.insert(-t);
   }
+  if (self_)
+    for (int s = 1; s < n_; ++s) {
+      r.insert(pack_shift(s));
+      r.insert(-pack_shift(s));
+    }
+  r.erase(0);
   return std::vector<int32_t>(r.begin(), r.end());
 }
 
@@ -719,6 +1158,7 @@ void Attention::save(std::ostream& os) const {
     os << std::setprecision(std::numeric_limits<double>::max_digits10) << " softmax " << sm_.lo << " " << sm_.hi << " "
        << sm_.exp_degree << " " << sm_.inv_degree << " " << sm_.newton << " " << (sm_.subtract_max ? 1 : 0) << " "
        << sm_.sum_lo << " " << sm_.sum_hi;
+  if (self_) os << " selfboot " << x_bound_ << " " << o_bound_;
   os << "\n";
   for (int i = 0; i < 4; ++i) write_vec(os, w_[i]);
   if (has_bias)

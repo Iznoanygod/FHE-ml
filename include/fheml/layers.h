@@ -117,9 +117,48 @@ class Layer {
     (void)drop_plaintext;
   }
   virtual bool is_linear() const { return false; }
+  // All rotations go through FHEContext::rotate / rotate_many, so a
+  // rotation-key ladder can compose them (Network::rotation_indices(true)).
+  virtual bool composes_rotations() const { return is_linear(); }
   virtual bool is_bootstrap() const { return false; }
   // Needs ContextOptions::scheme_switching (FHEContext::compare()).
   virtual bool uses_scheme_switching() const { return false; }
+
+  // Bootstrapped networks (see Network::place_bootstraps). Levels are
+  // counted from the output level of a bootstrap; a stretch between
+  // bootstraps may consume `budget` levels (FHEContext::stretch_budget()).
+  // level_after(d, budget) is the level of this layer's output for an input
+  // at level d, or kNoFit when the layer cannot run from there (a bootstrap
+  // must go before it); level_peak() the highest level any of its
+  // ciphertexts reaches.
+  static constexpr uint32_t kNoFit = 0xffffffffu;
+  virtual uint32_t level_after(uint32_t d, uint32_t budget) const {
+    return d + depth() <= budget ? d + depth() : kNoFit;
+  }
+  virtual uint32_t level_peak(uint32_t d, uint32_t budget) const { return level_after(d, budget); }
+  // Set by the network: on = every input of this layer sits at or below a
+  // bootstrap's output level (which lets max pooling count fewer levels).
+  virtual void set_bootstrapped(bool on) { (void)on; }
+  // Layers too deep for one stretch (layer norm, softmax attention) can
+  // bootstrap internally: they then refresh their intermediate values
+  // whenever the context's stretch budget runs out (see their comments).
+  virtual bool can_self_bootstrap() const { return false; }
+  virtual void set_self_bootstrapping(bool on) {
+    if (on) throw std::logic_error(type() + ": cannot bootstrap internally");
+  }
+  virtual bool self_bootstrapping() const { return false; }
+  // Bootstraps one forward() runs for an input at level d (0 for most layers).
+  virtual uint32_t internal_bootstraps(uint32_t d, uint32_t budget) const {
+    (void)d;
+    (void)budget;
+    return 0;
+  }
+  // Measures, from plaintext inputs, the value ranges a self-bootstrapping
+  // layer scales its refreshed ciphertexts by (times headroom).
+  virtual void calibrate(const std::vector<std::vector<double>>& inputs, double headroom) {
+    (void)inputs;
+    (void)headroom;
+  }
 
   // One-line header followed by the parameters (see network.h for the format).
   virtual void save(std::ostream& os) const = 0;
@@ -267,28 +306,38 @@ class AvgPool2d : public LinearLayer {
 
 // Max pooling, exact: the k x k window maxima are computed with encrypted
 // comparisons through CKKS -> FHEW -> CKKS scheme switching
-// (FHEContext::compare). Values are compared pairwise in a tournament:
-// max(a, b) = a + [a < b] (b - a), where [a < b] comes back from FHEW as a
-// fresh ciphertext at FHEContext::compare_depth() levels, so the output is
-// compare_depth() + ceil(log2(k^2)) levels deep; the layer reserves one
-// level more because a comparison needs its inputs two levels above the
-// bottom of the chain. It runs k^2 - 1 comparisons, each one FHEW bootstrap
-// per slot (about 2 s per comparison at TOY parameters with 16 slots, 8-10
-// minutes at STD128 with 256 slots on 4 cores).
+// (FHEContext::compare), one FHEW bootstrap per compared slot, so the layer
+// first packs what it compares: a linear gather (one level) writes tap j of
+// every window into block j of M slots (M = the output count rounded up to
+// a power of two; k^2 rounded up to a power of two blocks, padded with
+// copies of tap 0). Each round then compares the first half of the blocks
+// with the second half rotated onto it, max(a, b) = a + [a < b] (b - a), in
+// one comparison of half as many slots: (k^2 - 1) M FHEW bootstraps in all
+// instead of (k^2 - 1) times the input's slot span (4x fewer for 2x2 stride
+// 2). The output is compact in block 0.
+//
+// [a < b] comes back from FHEW as a fresh ciphertext at
+// FHEContext::compare_depth() levels whatever the input level, so the
+// output is compare_depth() + ceil(log2(k^2)) levels deep; the layer
+// reserves one level more because a comparison needs its inputs two levels
+// above the bottom of the chain. In a bootstrapped network the inputs sit at
+// or past a bootstrap's output level (18-20), already deeper than the
+// comparison results' 12, so only the gather and the rounds count:
+// 1 + ceil(log2(k^2)) levels.
+//
+// About 2 s per comparison at TOY parameters with 16 slots, 8-10 minutes at
+// STD128 with 256 slots on 4 cores.
 //
 // `range` bounds the inputs: |x| <= range (the comparison wraps around
 // otherwise and picks the wrong value). Differences smaller than about
 // 4 range / 2^(fhew_log_q - 1) are resolved either way, which changes the
-// maximum by at most that much.
-//
-// The output stays gapped at the input positions (like a strided conv): the
-// maximum of a window lands in the slot of its top-left input. Slots between
-// outputs hold maxima of other windows (bounded by range); the next linear
-// layer ignores them.
+// maximum by at most that much. The other blocks of the output hold partial
+// maxima (bounded by range); the next linear layer ignores them.
 //
 // Trainer backpropagates through it with the forward's comparison bits: the
 // gradient of max(a, b) = a + [a < b] (b - a) is (1 - [a < b], [a < b]), so
-// the backward pass needs no further comparisons.
+// the backward pass needs no further comparisons; the gather's transpose
+// (scatter()) takes the taps' gradients back to the input slots.
 class MaxPool2d : public Layer {
  public:
   MaxPool2d(int k, int stride, double range = 1.0);
@@ -301,19 +350,42 @@ class MaxPool2d : public Layer {
   uint32_t depth() const override;
   std::vector<int32_t> rotation_indices() const override;
   bool uses_scheme_switching() const override { return true; }
+  bool composes_rotations() const override { return true; }
+  void set_bootstrapped(bool on) override { bootstrapped_ = on; }
+  void compile(uint32_t slots) override;
+  size_t min_slots() const override;
   void save(std::ostream& os) const override;
   int k() const { return k_; }
   int stride() const { return stride_; }
   double range() const { return range_; }
+  double gain() const { return gain_; }
+  // The output is gain * max: the gather takes the factor for free (range is
+  // that of the gathered, scaled taps).
+  void set_gain(double g) {
+    if (!(g > 0.0)) throw std::invalid_argument("maxpool2d: gain must be positive");
+    gain_ = g;
+  }
+  // Inputs arriving multiplied by c > 0 (Network::place_bootstraps).
+  void set_range(double r) {
+    if (!(r > 0.0)) throw std::invalid_argument("maxpool2d: range must be positive");
+    range_ = r;
+  }
   // Comparison rounds of the tournament: ceil(log2(k^2)).
   uint32_t rounds() const;
-  // Slot offsets of the window taps relative to the top-left input, in
-  // tournament order (row-major over the window).
-  std::vector<int32_t> offsets() const;
+  // Blocks (taps rounded up to a power of two) and slots per block.
+  uint32_t blocks() const;
+  uint32_t block() const;
+  // The compiled gather (input slots -> tap blocks, times gain) and its
+  // transpose (Trainer's backward pass).
+  const LinearTransform& gather() const { return gather_; }
+  const LinearTransform& scatter() const { return scatter_; }
 
  private:
   int k_, stride_;
   double range_;
+  double gain_ = 1.0;  // multiplies the gathered taps (absorbs a scale for free)
+  bool bootstrapped_ = false;
+  LinearTransform gather_, scatter_;
 };
 
 // Per-channel affine map (inference-time batch norm): y = scale[c] * x + shift[c].
@@ -486,6 +558,8 @@ class ExactReLU : public Layer {
   bool uses_scheme_switching() const override { return true; }
   // Inputs are at least compare_depth() + 1 levels deep (checked in forward).
   void set_after_bootstrap(bool on) { after_bootstrap_ = on; }
+  // Network::configure() and place_bootstraps() set it for bootstrapped networks.
+  void set_bootstrapped(bool on) override { after_bootstrap_ = on; }
   bool after_bootstrap() const { return after_bootstrap_; }
   void save(std::ostream& os) const override;
   // Afterwards the layer computes out * relu(in * x) (in > 0).

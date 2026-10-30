@@ -88,6 +88,16 @@ class TokenMean : public LinearLayer {
 // must be calibrated like a Chebyshev activation interval: outside it the
 // series diverges. forward_plain() evaluates the same approximation.
 // Depth: 2 (E[x^2]) + poly_depth(degree) + 1 + 2 newton + 1.
+//
+// Self-bootstrapping (set_self_bootstrapping, enabled by
+// Network::place_bootstraps when the layer does not fit a stretch): the
+// variance is mapped onto t in [-1, 1] (the series' own interval map, done
+// by hand) and bootstrapped, so the series costs poly_depth(degree) from a
+// fresh ciphertext; 1/sqrt is refreshed again before a Newton step or the
+// final product when the budget runs out (Newton then also removes the
+// bootstrapping error), and the input itself when it arrives too deep. The
+// centred input is never bootstrapped: it waits at its level for the final
+// product. 1-3 bootstraps; the input bound comes from calibrate().
 class LayerNorm : public Layer {
  public:
   LayerNorm(int n, int d, std::vector<double> gamma, std::vector<double> beta, double eps, double var_min,
@@ -122,6 +132,17 @@ class LayerNorm : public Layer {
   std::vector<double> params() const override;
   void set_params(const std::vector<double>& p) override;
   bool trainable() const override { return true; }
+  // Self-bootstrapping (see the top of the class).
+  uint32_t level_after(uint32_t d, uint32_t budget) const override;
+  uint32_t level_peak(uint32_t d, uint32_t budget) const override;
+  bool can_self_bootstrap() const override { return true; }
+  void set_self_bootstrapping(bool on) override { self_ = on; }
+  bool self_bootstrapping() const override { return self_; }
+  uint32_t internal_bootstraps(uint32_t d, uint32_t budget) const override;
+  void calibrate(const std::vector<std::vector<double>>& inputs, double headroom) override;
+  // Bound on |x| used when the input itself has to be refreshed (0 = unknown).
+  double input_bound() const { return x_bound_; }
+  void set_input_bound(double b) { x_bound_ = b; }
   int tokens() const { return n_; }
   int dim() const { return d_; }
   size_t stride() const { return stride_; }
@@ -141,6 +162,17 @@ class LayerNorm : public Layer {
   std::vector<double> coeffs_;  // Chebyshev series on [var_min, var_max]
   size_t stride_ = 0;           // token stride B
   std::vector<double> mask_, gamma_slots_, beta_slots_, pad_var_;  // per slot
+  std::vector<double> token_mask_;  // 1 on the tokens' d features
+  bool self_ = false;
+  double x_bound_ = 0.0;
+  struct Plan {
+    bool fits = false, plain = true, refresh_x = false;
+    std::vector<char> refresh_r;  // before Newton step i; [newton]: before the final product
+    uint32_t out = 0, peak = 0, boots = 0;
+  };
+  Plan plan(uint32_t d, uint32_t budget) const;
+  // Upper bound of the (scaled) series output, for refreshing it.
+  double inv_sqrt_bound() const;
 };
 
 // y = body(x) + x.
@@ -159,6 +191,14 @@ class Residual : public Layer {
   size_t min_slots() const override;
   void encrypt_weights(const FHEContext& ctx, bool drop_plaintext) override;
   void save(std::ostream& os) const override;
+  // Bootstrapped networks: the body is walked from the block's input level
+  // (Bootstrap layers in it restart the count); the sum sits at the higher
+  // of the two levels.
+  uint32_t level_after(uint32_t d, uint32_t budget) const override;
+  uint32_t level_peak(uint32_t d, uint32_t budget) const override;
+  void set_bootstrapped(bool on) override;
+  bool self_bootstrapping() const override;
+  uint32_t internal_bootstraps(uint32_t d, uint32_t budget) const override;
   const std::vector<std::shared_ptr<Layer>>& body() const { return body_; }
 
  private:
@@ -194,6 +234,21 @@ struct SoftmaxOptions {
 // Self-attention with a quadratic score function (see top) or softmax (see
 // SoftmaxOptions); `heads` heads of width d / heads, as sub-blocks of each
 // token.
+//
+// Self-bootstrapping softmax (set_self_bootstrapping, enabled by
+// Network::place_bootstraps when the block does not fit a stretch; not with
+// subtract_max): the n score ciphertexts are mapped onto [-1, 1] by the
+// head mask product (exp's interval map, done by hand), then packed 2*dh to
+// a ciphertext (offset s moves to slot t*B + h*dh + s, or into the free
+// upper half [n*B, 2n*B)) and bootstrapped together: ceil(n / (2 dh))
+// bootstraps instead of n. exp runs once per packed ciphertext, scaled so
+// that the row sums land in 1/x's interval directly, and is refreshed
+// (values within [-1, 1], no scale level) when the budget requires it;
+// unpacking is a rotation plus the head mask product that was needed
+// anyway. The row sums are bootstrapped before the 1/x series when it would
+// not fit, 1/x before a Newton step or the final product, and the input and
+// the unnormalised output when they arrive too deep (bounds from
+// calibrate()). Typically 3-5 bootstraps per block.
 class Attention : public Layer {
  public:
   // w*: [d][d] as [out][in] (head h reads/writes rows [h*dh, (h+1)*dh) of
@@ -252,6 +307,21 @@ class Attention : public Layer {
   double score_coeff(int h, int k) const { return score_[static_cast<size_t>(3 * h + k)]; }
   // 1 / x as the softmax approximates it (series plus Newton steps).
   double inv_plain(double x) const;
+  // Self-bootstrapping (see the top of the class).
+  uint32_t level_after(uint32_t d, uint32_t budget) const override;
+  uint32_t level_peak(uint32_t d, uint32_t budget) const override;
+  bool can_self_bootstrap() const override { return softmax_ && !sm_.subtract_max; }
+  void set_self_bootstrapping(bool on) override;
+  bool self_bootstrapping() const override { return self_; }
+  uint32_t internal_bootstraps(uint32_t d, uint32_t budget) const override;
+  void calibrate(const std::vector<std::vector<double>>& inputs, double headroom) override;
+  // Bounds on |x| and on the unnormalised output sum_s a_s v_s (0 = unknown).
+  double input_bound() const { return x_bound_; }
+  double output_bound() const { return o_bound_; }
+  void set_bounds(double x, double o) {
+    x_bound_ = x;
+    o_bound_ = o;
+  }
 
  private:
   int n_, d_, heads_, dh_;
@@ -266,6 +336,27 @@ class Attention : public Layer {
   SoftmaxOptions sm_;
   std::vector<double> exp_coeffs_, inv_coeffs_;
   std::vector<double> mask_head_, pad_sum_;  // 1 at head slots; sum midpoint off the sub-blocks
+  // Self-bootstrapping.
+  bool self_ = false;
+  double x_bound_ = 0.0, o_bound_ = 0.0;
+  std::vector<double> token_mask_;  // 1 on the tokens' d features
+  struct Plan {
+    bool fits = false, plain = true, refresh_x = false, refresh_e = false, refresh_sum = false, refresh_o = false;
+    std::vector<char> refresh_y;  // before Newton step i; [newton]: before the final product
+    uint32_t out = 0, peak = 0, boots = 0;
+  };
+  Plan plan(uint32_t d, uint32_t budget) const;
+  Plan plan_with(uint32_t d, uint32_t budget, bool refresh_e, bool refresh_sum) const;
+  int packed_groups() const { return (n_ + 2 * dh_ - 1) / (2 * dh_); }
+  // Slot shift of offset s inside its packed ciphertext.
+  int32_t pack_shift(int s) const;
+  // Scaling of the self-bootstrapping softmax: the row sums times alpha
+  // land in [-1 - beta, 1 - beta]; exp is divided by exp_div so it can be
+  // bootstrapped without a scale level.
+  double sum_alpha() const { return 2.0 / (sum_hi() - sum_lo()); }
+  double sum_beta() const { return -(sum_hi() + sum_lo()) / (sum_hi() - sum_lo()); }
+  double exp_div() const;
+  Ctxt forward_self(const FHEContext& ctx, const Ctxt& x, const Plan& p) const;
 };
 
 }  // namespace fheml

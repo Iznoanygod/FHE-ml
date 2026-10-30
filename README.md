@@ -260,11 +260,10 @@ rejected with a message naming the replacement (`hnn.LayerNorm`,
 `hnn.Attention(softmax=...)`). `nn.ReLU` is rejected too unless
 `from_torch(..., exact_relu=RANGE)` is given: it then becomes the exact
 scheme-switching `ExactReLU` (see below; `hnn.Chebyshev("relu", ...)` modules
-too); otherwise use `hnn.Chebyshev`. A plain `nn.MaxPool2d` is
-rejected too because the encrypted comparison needs an input bound:
-`hnn.MaxPool2d(k, stride, range=R)` is the same torch layer with that bound
-and exports to the exact `MaxPool2d` (see below), at 15+ levels and a FHEW
-bootstrap per slot and comparison. `hnn.Chebyshev`, `hnn.LayerNorm` and the
+too); otherwise use `hnn.Chebyshev`. Max pooling is exact (`maxpool2d`, see
+below) but needs the range its inputs stay in: `hnn.MaxPool2d(k, stride,
+range=R)` is torch's layer with that bound, or a plain `nn.MaxPool2d`
+exports with `from_torch(..., maxpool_range=R)`. `hnn.Chebyshev`, `hnn.LayerNorm` and the
 softmax of `hnn.Attention` evaluate the same polynomial approximations in
 torch that run encrypted, so training sees what inference computes (and
 pushes the model to keep its variances and scores inside the intervals). For token inputs the exporter pads
@@ -287,11 +286,16 @@ PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch vit 
 
 Max pooling is exact, not approximated: `MaxPool2d(k, stride, range)` compares
 window entries through OpenFHE's CKKS ↔ FHEW scheme switching
-(`cc->Enable(SCHEMESWITCH)`, `EvalCompareSchemeSwitching`). Each tap of the
-window is rotated onto the window's top-left slot, then the taps are reduced
-in a tournament: `max(a, b) = a + [a < b] (b - a)`, where `[a < b]` is
-computed by switching `a - b` to FHEW, evaluating the sign there with one
-FHEW bootstrap per slot and switching back. The layer needs a context built
+(`cc->Enable(SCHEMESWITCH)`, `EvalCompareSchemeSwitching`). A gather
+transform puts tap j of every window into block j of `M` slots (`M` = the
+output size rounded up to a power of two, the k² taps padded to a power of
+two), then the blocks are reduced in a tournament: each round compares the
+lower half of the blocks with the upper half rotated onto it,
+`max(a, b) = a + [a < b] (b - a)`, where `[a < b]` is computed by switching
+`a - b` to FHEW, evaluating the sign there with one FHEW bootstrap per slot
+and switching back. Only slots that hold a window go through FHEW
+(2·M + M for a 2×2 pool, 4× fewer than comparing the whole input span) and
+the output is compact. The layer needs a context built
 with `ContextOptions::scheme_switching` (`Network::context_options()` sets it
 when the network contains one); `keygen()` then also generates the FHEW
 context, its bootstrapping keys and the switching keys. `fheml.MaxPool2d`
@@ -305,34 +309,34 @@ FHEContext ctx(net.context_options(/*secure=*/true));
 ctx.keygen(net.rotation_indices());
 ```
 
-What it costs (measured, OpenFHE 1.4.2, 4 cores):
+What one comparison costs (measured, OpenFHE 1.4.2, 4 cores; the count
+of compared slots is rounded up to a power of two):
 
 | | TOY FHEW, ring 2048, 16 slots | STD128 FHEW, ring 2^16, 256 slots |
 |---|---|---|
 | key generation | 2 s | 99 s |
-| one comparison (all slots) | 1.8 s | 470–600 s |
+| one comparison | 1.8 s | 470–600 s |
 | peak memory | < 1 GB | 11.4 GB |
 | error of the max | ~1e-6 | ~2e-3 |
 
-A `k × k` pool runs `k² − 1` comparisons. Each comparison result is a fresh
-CKKS ciphertext at `FHEContext::compare_depth()` = 12 levels whatever the
-inputs' levels, so the pool output sits at `12 + ceil(log2 k²)` levels and the
-layer reserves one more (a comparison needs its inputs two levels above the
-bottom of the chain): a 2×2 pool is a 15-level layer, a 3×3 pool 17. With
-bootstrapping budgets of 20–26 levels at ring 2^16 it takes about one
-bootstrap per pool, which is why the example models do not use it.
-`hnn.MaxPool2d` exports it from PyTorch, and `Trainer` backpropagates through
-it with the forward's comparison bits (see [Encrypted training](#encrypted-training)). The comparison resolves differences down to about
-`4·range / 2^(fhew_log_q − 1)`; a smaller difference is decided either way,
-which moves the maximum by at most that much. Values outside `[-range, range]`
-wrap around in the FHEW plaintext space and compare wrongly, so calibrate
-`range` like a Chebyshev interval.
+A `k × k` pool runs `ceil(log2 k²)` rounds. Each comparison result is a
+fresh CKKS ciphertext at `FHEContext::compare_depth()` = 12 levels whatever
+the inputs' levels, so the pool output sits at `12 + ceil(log2 k²)` levels
+and the layer reserves one more (a comparison needs its inputs two levels
+above the bottom of the chain; the gather's level hides below the 12): a 2×2 pool is a
+15-level layer, a 3×3 pool 17. In a bootstrapped network the comparison
+results are fresher than a bootstrap's output, so the pool costs only
+`1 + ceil(log2 k²)` levels of the stretch it sits in, and its gather takes
+the bootstrap's range scale for free. The comparison resolves differences
+down to about `4·range / 2^(fhew_log_q − 1)`; a smaller difference is
+decided either way, which moves the maximum by at most that much. Values
+outside `[-range, range]` wrap around in the FHEW plaintext space and
+compare wrongly, so calibrate `range` like a Chebyshev interval.
 
-The output stays gapped at the input positions like a strided convolution;
-the slots between outputs hold maxima of other windows (bounded by `range`),
-which the next linear layer ignores. `place_bootstraps` cannot fold a scale
-through the layer yet and inserts a `scale` layer when it has to; the FIDESlib
-(GPU) backend does not support scheme switching.
+`hnn.MaxPool2d` exports it from PyTorch, and `Trainer` backpropagates
+through it with the forward's comparison bits and the gather's transpose
+(see [Encrypted training](#encrypted-training)). The FIDESlib (GPU) backend
+does not support scheme switching.
 
 ## Exact ReLU via scheme switching
 
@@ -409,8 +413,7 @@ strided conv into a dense mess of diagonals (15858 for `16->32 s=2`).
 `Packing::kMultiplexed` interleaves `m²` channels into the gaps of a stride-`m`
 output, as in Lee et al.'s multiplexed parallel convolutions: same slots as
 compact, offsets still constant per (channel pair, tap). Any linear layer can
-write any layout, so the BSGS plans need nothing new, and a conv after max
-pooling re-packs the pool's gapped output for free. Each strided layer takes
+write any layout, so the BSGS plans need nothing new. Each strided layer takes
 the cheapest collision-free layout (multiplexed, gapped or compact), weighting
 the BSGS cost by the slots it needs. Details in `docs/DESIGN.md`.
 
@@ -467,8 +470,91 @@ exponentials are bounded by 1 and the sums lie in `[1, n]` with nothing to
 calibrate; it costs n − 1 comparisons (each a FHEW bootstrap per slot) and
 about 12 + log2(n) extra levels, which is beyond one bootstrapping budget at
 ring 2^16. Both train under encryption (see below) and export from
-`fheml.nn.LayerNorm` / `fheml.nn.Attention(softmax=...)`; the example models
-do not use them yet.
+`fheml.nn.LayerNorm` / `fheml.nn.Attention(softmax=...)`.
+
+### Bootstrapping inside LayerNorm and softmax
+
+At ring 2^16 one bootstrapping stretch holds 3 to 5 levels, while a LayerNorm
+needs about 12 and softmax attention more than 20. With bootstrapping on,
+`place_bootstraps` plans refreshes *inside* these layers: each layer gets
+the stretch level it starts at and the budget, and puts a bare bootstrap
+wherever its next step would overrun (the input, the variance, the scores,
+the row sums and the reciprocal). The scales that bring each refreshed value
+into [-1, 1] are folded into the series coefficients and Newton constants,
+so the refreshes cost no extra levels. Model files record the plan
+(`selfboot` per layer and a `budget` line). See
+`docs/DESIGN.md#bootstrapping-inside-layernorm-and-softmax-attention`.
+
+Two more things make deep transformers fit:
+
+* **Range loss.** `fheml.nn.range_loss(model)` penalises LayerNorm
+  variances, attention scores and softmax row sums that leave their
+  intervals. Add it to the training loss so the calibrated intervals stay
+  narrow. A narrow interval matters because bootstrap error is absolute
+  (see below), and a wide `1/x` interval magnifies it.
+* **Iterative bootstrapping.** With `bootstrap_iterations=2`, OpenFHE
+  bootstraps the error of the first bootstrap again, at the cost of one more
+  level. At ring 4096 this cuts the error of a bootstrap from 1.2e-3 to
+  4e-6 (`tests/test_fheml.cpp`). The precision of one bootstrap is measured
+  at key generation, or set with `bootstrap_precision`.
+
+## Example models
+
+`examples/python/train_torch_mnist.py` trains these models in PyTorch,
+exports them, checks the plaintext fheml model on 2000 test images, and
+runs `--n` images encrypted (`--profile` times each layer, `--json` appends
+a result record). Inputs are 14x14 MNIST.
+
+**poolcnn: max pooling.** This model is conv 1->4 3x3 stride 2, then exact
+MaxPool2d 2x2 by scheme switching, x², dense 36->32, x², dense 32->10. It
+has 22 levels and no bootstrapping.
+
+```sh
+PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch poolcnn --window 1 --digits 2 --profile --n 1
+```
+
+**lnvit: LayerNorm, softmax, multi-head attention.** This is a vision
+transformer with 4 tokens of 7x7 patches and d = 16. It has one pre-norm
+block with 2-head softmax attention and one pre-norm MLP block, followed by
+a mean-pool head. It is 47 levels deep with every refresh planned:
+
+```sh
+PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch lnvit --bootstrap --level-budget 3 --digits 4 --boot-iterations 2 --insecure --n 5
+```
+
+Measured on 4 cores:
+
+| | poolcnn, 128-bit | poolcnn-s1, toy | lnvit, toy |
+| --- | --- | --- | --- |
+| Accuracy (torch, 10k test images) | 89.6% | 97.4% | 95.6% |
+| fheml plaintext (first 2000) | 87.0% (torch on the same images: 87.0%) | 96.6% | 94.0% (torch: 93.9%) |
+| Ring, slots | 2^16, 256 | 2048, 1024 | 4096, 512 |
+| Depth | 22, no bootstraps | 22 | 47: 3 bootstraps between layers, 12 inside LayerNorm and attention |
+| Setup | 104 s, 60 rotation keys (3.8 GB) | 3 s | 3 s |
+| Time per image | 362 s (MaxPool 347 s, conv 12 s) | 36 s | 22 s |
+| Peak memory | 12.9 GB | 1.9 GB | 2.0 GB |
+| Encrypted vs torch logits | 1.3e-3, same class | 4e-5, 2/2 same class | 3e-2 to 1.2e-1, 5/5 same class |
+
+`poolcnn-s1` is the same model with a stride-1 convolution (4x14x14 into
+the pool, 1024 slots). Toy columns use insecure parameters. They show
+correctness and the operation count, not 128-bit timings.
+
+poolcnn at 128-bit needs `--digits 2` and 256 slots: compare keys plus a
+512-slot comparison go over the container's 14 GB. Almost all of its time
+is the 3 comparison rounds: one FHEW bootstrap per compared slot.
+
+lnvit at 128-bit security (ring 2^16, level budget {3,3},
+`key_switch_digits=4`, two bootstrap iterations) fits in memory: 63 rotation
+keys (8.3 GB), 61 s setup, 13.4 GB peak. Its logits fail to decode, though.
+At these parameters one bootstrap is accurate to only about 1e-2 (see
+[Deep networks](#deep-networks)). Iterative bootstrapping adds just 4 bits,
+because the first bootstrap's error must stay inside the second one's input
+range. Fifteen refreshes, some feeding a `1/x` over [0.5, 100], amplify that
+error past what CKKS can decode. Running lnvit securely needs ring 2^17
+(55-bit scaling), which is more memory than this container has. The toy
+column at ring 4096 works because one bootstrap there is accurate to
+1.2e-3, ten times better. So the remaining gap at 128 bits is bootstrap
+precision, not depth or the planner.
 
 ## Encrypted training
 

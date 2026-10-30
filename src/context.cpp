@@ -1,6 +1,7 @@
 #include "fheml/context.h"
 
 #include <algorithm>
+#include <cmath>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -16,8 +17,14 @@ bool is_pow2(uint32_t x) { return x && !(x & (x - 1)); }
 FHEContext::FHEContext(const ContextOptions& opts) : opts_(opts) {
   if (!is_pow2(opts_.slots)) throw std::invalid_argument("slots must be a power of two");
 
-  boot_depth_ =
-      opts_.bootstrapping ? lbcrypto::FHECKKSRNS::GetBootstrapDepth(opts_.level_budget, lbcrypto::UNIFORM_TERNARY) : 0;
+  if (opts_.bootstrap_iterations < 1 || opts_.bootstrap_iterations > 2)
+    throw std::invalid_argument("bootstrap_iterations must be 1 or 2");
+  // An iterative bootstrap rescales its first result once more.
+  boot_depth_ = opts_.bootstrapping ? lbcrypto::FHECKKSRNS::GetBootstrapDepth(opts_.level_budget,
+                                                                               lbcrypto::UNIFORM_TERNARY) +
+                                          (opts_.bootstrap_iterations - 1)
+                                    : 0;
+  boot_precision_ = opts_.bootstrap_precision;
   total_depth_ = opts_.mult_depth + boot_depth_;
 
   fhe::CCParams<fhe::CryptoContextCKKSRNS> params;
@@ -110,6 +117,20 @@ void FHEContext::keygen(const std::vector<int32_t>& rotations) {
   for (int32_t r : uniq) has_key_[static_cast<size_t>(r)] = 1;
   if (!uniq.empty()) cc_->EvalRotateKeyGen(keys_.secretKey, std::vector<int32_t>(uniq.begin(), uniq.end()));
   if (opts_.bootstrapping) cc_->EvalBootstrapKeyGen(keys_.secretKey, opts_.slots);
+#ifndef FHEML_WITH_FIDESLIB
+  if (opts_.bootstrapping && opts_.bootstrap_iterations > 1 && !boot_precision_) {
+    // Precision of one bootstrap on values in [-1, 1], with two bits of
+    // margin: the second iteration scales the first one's error up by
+    // 2^precision and must keep it inside the bootstrap's input range.
+    std::vector<double> v(opts_.slots);
+    for (size_t i = 0; i < v.size(); ++i) v[i] = std::sin(0.7 * static_cast<double>(i) + 0.3);
+    const Ctxt b = cc_->EvalBootstrap(encrypt(v, total_depth_ - 1));
+    double err = 1e-12;
+    const std::vector<double> got = decrypt(b, v.size());
+    for (size_t i = 0; i < v.size(); ++i) err = std::max(err, std::fabs(got[i] - v[i]));
+    boot_precision_ = static_cast<uint32_t>(std::max(1.0, std::floor(-std::log2(err)) - 2.0));
+  }
+#endif
 #ifndef FHEML_WITH_FIDESLIB
   if (opts_.scheme_switching) {
     // One FHEW context per CKKS context; its secret key is a function of
@@ -383,7 +404,8 @@ std::vector<double> FHEContext::decrypt(const Ctxt& c, size_t n) const {
 uint32_t FHEContext::ring_dim_for(const ContextOptions& opts) {
   ContextOptions o = opts;
   if (o.bootstrapping) {
-    o.mult_depth += lbcrypto::FHECKKSRNS::GetBootstrapDepth(o.level_budget, lbcrypto::UNIFORM_TERNARY);
+    o.mult_depth += lbcrypto::FHECKKSRNS::GetBootstrapDepth(o.level_budget, lbcrypto::UNIFORM_TERNARY) +
+                    (o.bootstrap_iterations - 1);
     o.bootstrapping = false;
     if (!o.ring_dim) o.slots = std::max(o.slots, 2048u);  // the constructor's 4096 floor
   }
@@ -392,15 +414,51 @@ uint32_t FHEContext::ring_dim_for(const ContextOptions& opts) {
 
 Ctxt FHEContext::bootstrap(const Ctxt& c) const {
   if (!opts_.bootstrapping) throw std::logic_error("bootstrapping is not enabled in this context");
+#ifndef FHEML_WITH_FIDESLIB
+  if (opts_.bootstrap_iterations > 1) return cc_->EvalBootstrap(c, opts_.bootstrap_iterations, boot_precision_);
+#else
+  if (opts_.bootstrap_iterations > 1) throw std::logic_error("iterative bootstrapping is not available on FIDESlib");
+#endif
   return cc_->EvalBootstrap(c);
 }
 
-Ctxt FHEContext::compare(const Ctxt& a, const Ctxt& b, double range) const {
+uint32_t FHEContext::level(const Ctxt& c) { return c->GetLevel() + (c->GetNoiseScaleDeg() > 1 ? 1 : 0); }
+
+uint32_t FHEContext::levels_left(const Ctxt& c) const {
+  const uint32_t l = level(c);
+  return l < total_depth_ ? total_depth_ - l : 0;
+}
+
+uint32_t FHEContext::stretch_level(const Ctxt& c) const {
+  const uint32_t l = level(c);
+  return l > boot_depth_ ? l - boot_depth_ : 0;
+}
+
+Ctxt FHEContext::refresh(const Ctxt& c, double bound, const std::vector<double>& mask) const {
+  if (!(bound > 0.0)) throw std::invalid_argument("refresh: bound must be positive");
+  int k = 0;
+  while (std::ldexp(1.0, k) < bound) ++k;
+  Ctxt scaled;
+  if (mask.empty()) {
+    scaled = cc_->EvalMult(c, std::ldexp(1.0, -k));
+  } else {
+    std::vector<double> m(mask);
+    for (double& v : m) v = std::ldexp(v, -k);
+    Ptxt p = encode(m, level(c));
+    scaled = cc_->EvalMult(c, p);
+  }
+  Ctxt r = bootstrap(scaled);
+  for (int i = 0; i < k; ++i) r = cc_->EvalAdd(r, r);
+  return r;
+}
+
+Ctxt FHEContext::compare(const Ctxt& a, const Ctxt& b, double range, size_t count) const {
   if (!opts_.scheme_switching) throw std::logic_error("scheme switching is not enabled in this context");
   if (!(range > 0.0)) throw std::invalid_argument("compare: range must be positive");
 #ifdef FHEML_WITH_FIDESLIB
   (void)a;
   (void)b;
+  (void)count;
   throw std::logic_error("scheme switching is not available on the FIDESlib backend");
 #else
   // a - b is scaled so that the full range (-2 range, 2 range) maps into the
@@ -419,7 +477,11 @@ Ctxt FHEContext::compare(const Ctxt& a, const Ctxt& b, double range) const {
       throw std::logic_error("compare: input has " + std::to_string(total_depth_ - std::min(used, total_depth_)) +
                              " levels left, needs 2");
   }
-  return cc_->EvalCompareSchemeSwitching(a, b, opts_.slots, opts_.slots);
+  // OpenFHE's slots-to-coefficients matrix needs a power-of-two count.
+  uint32_t n = 1;
+  while (n < count && n < opts_.slots) n *= 2;
+  if (!count) n = opts_.slots;
+  return cc_->EvalCompareSchemeSwitching(a, b, n, opts_.slots);
 #endif
 }
 
@@ -434,6 +496,8 @@ std::string FHEContext::describe() const {
      << " depth=" << total_depth_ << " (network " << opts_.mult_depth << ", bootstrap " << boot_depth_ << ")"
      << " scale_bits=" << opts_.scale_mod_bits << " security=" << (opts_.secure ? "128-bit" : "NOT SET (insecure)")
      << " device=" << (on_gpu_ ? "gpu" : "cpu");
+  if (opts_.bootstrap_iterations > 1)
+    os << " bootstrap_iterations=" << opts_.bootstrap_iterations << " (precision " << boot_precision_ << " bits)";
   if (opts_.rotation_window) os << " rotation_window=" << opts_.rotation_window;
   if (opts_.scheme_switching) os << " scheme_switching=fhew(logq " << opts_.fhew_log_q << ")";
   if (keys_.secretKey)

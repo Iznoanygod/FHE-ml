@@ -219,10 +219,42 @@ with 3H score coefficients; single-head files are unchanged.
   folds through it. Padding slots get a variance inside the interval for the
   same reason as above.
 
-### Next steps
+### Bootstrapping inside LayerNorm and softmax attention
 
-- An example model that uses them (both train under encryption and export
-  from `fheml.nn.LayerNorm` / `fheml.nn.Attention(softmax=...)`).
+A softmax attention block costs 17–23 levels and LayerNorm 10–12, far more
+than the 3–7 levels a ring-2^16 bootstrapping context leaves per stretch.
+So both layers bootstrap internally (`can_self_bootstrap()`), switched on by
+`place_bootstraps` when the layer does not fit the budget B:
+
+- **Plan.** `LayerNorm::plan(d, B)` / `Attention::plan(d, B)` walk the
+  layer's steps from input stretch level d and put a refresh before each
+  step that would leave the stretch; `level_after`, `level_peak` and
+  `internal_bootstraps` report the result to the planner. The attention
+  plan tries refreshing the exponentials and the row sum or not (four
+  combinations) and keeps the cheapest that fits.
+- **No scale levels.** A refresh is a bare `EvalBootstrap`, which needs
+  its input in [-1, 1]. Instead of a scaling product (one level) before
+  each one, the scales are folded into what precedes it: the Chebyshev
+  coefficients of exp and 1/√v / 1/x are divided by a bound, the Newton
+  constants absorb the square of it, gamma and the output masks undo it.
+  `FHEContext::refresh(c, bound)` (one power-of-two product, bootstrap,
+  doubling back) is used only where a calibrated value bound is needed: the
+  layer input x and the attention output o, bounded by `calibrate()` with
+  the planner's headroom.
+- **Attention scores.** The n score ciphertexts are packed two head-dims
+  per ciphertext (the upper half of the token block holds the second one),
+  bootstrapped together and unpacked with two masks, so a refresh of the
+  scores costs ⌈n / 2d_h⌉ bootstraps instead of n.
+- **Residual blocks.** `place_bootstraps` plans a residual body that does
+  not fit recursively from its input level (`ChainPlan`), so bootstraps go
+  inside the block when that is cheaper than in front of it.
+
+`max subtract` softmax cannot bootstrap itself (its comparisons need the
+whole block in one stretch). The model file records `selfboot` with the
+calibrated bounds and the planner's `budget`, so a saved model keeps its
+plan. Measured in `tests/test_fheml.cpp`: a two-block transformer
+(LayerNorm, 2-head softmax attention, LayerNorm, MLP) at B = 5 runs with 12
+bootstraps inside layers and decrypts to within 1e-4 of the plaintext.
 
 ## Encrypted weights
 
@@ -456,9 +488,12 @@ depends on `budget + bootstrap depth` only, not on the network's depth.
   layers at no cost: weights and biases of a linear layer, `poly`
   coefficients, the evaluation interval of a `chebyshev` layer, through
   `square` (as a square root) and through bias-free linear layers (pooling,
-  token mean). Where no layer can take it (a residual block, attention, the
-  network output) a fixed `scale` layer is inserted, which costs one level
-  that the planner budgets; the planner moves a bootstrap earlier when that
+  token mean, max pooling's gather), attention (W_q, W_k, W_v take an
+  input scale, W_o an output scale) and residual blocks whose body starts
+  and ends with such a layer (skip and body scale alike). Where no layer
+  can take it (the network output, a scale carried into a residual block) a
+  fixed `scale` layer is inserted, which costs one level that the planner
+  budgets; the planner moves a bootstrap earlier when that
   level does not fit, and reports a budget that cannot hold a layer and its
   scale layers instead of overflowing.
 - **Interval folding.** `Network::fold_activation_intervals()` moves the
@@ -468,6 +503,21 @@ depends on `budget + bootstrap depth` only, not on the network's depth.
   bootstraps. `chebyshev` layers therefore carry an evaluation interval
   (`map EA EB OUT` in the model file) separate from the approximation
   interval.
+- **Inside layers.** Layers that cannot fit a stretch bootstrap themselves
+  (see "Bootstrapping inside LayerNorm and softmax attention"), and residual
+  bodies are planned recursively. Max pooling absorbs a scale in its gather.
+- **Last layer.** No bootstrap follows the network's last layer, so it may
+  end one level past the budget: the spare level `EvalBootstrap` needs at
+  its input is free there.
+- **Precision.** A bootstrap's error is absolute: about 1e-3 at 50-bit
+  scaling and first modulus 57 (toy ring 4096, {3,3}), 5e-3 at ring 2^14.
+  Layers that bootstrap internally divide values by their interval bounds
+  first, so a wide interval multiplies that error. Two remedies:
+  `ContextOptions::bootstrap_iterations = 2` (OpenFHE's iterative
+  bootstrapping: the residual error of a first bootstrap is bootstrapped
+  again, 1.2e-3 -> 4e-6 measured at ring 4096, for twice the time and one
+  more level), and narrow intervals, which `fheml.nn.range_loss()` lets a
+  model learn to stay inside while training.
 - **Budget.** `Network::max_bootstrap_budget(options, max_ring)` gives the
   largest stretch that keeps the bootstrapping context at `max_ring`. With
   uniform ternary secrets the bootstrap itself costs 20 levels (level budget

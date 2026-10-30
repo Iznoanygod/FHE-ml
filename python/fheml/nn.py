@@ -24,7 +24,7 @@ import torch
 from torch import nn
 
 __all__ = ["Poly", "Square", "Chebyshev", "Attention", "LayerNorm", "MaxPool2d", "Residual", "TokenMean",
-           "PosEmbedding", "Bootstrap", "chebyshev_coefficients"]
+           "PosEmbedding", "Bootstrap", "chebyshev_coefficients", "range_loss"]
 
 
 class Poly(nn.Module):
@@ -82,6 +82,21 @@ def _chebyshev_eval(c, a, b, x):
     return t * b1 - b2 + c[0]
 
 
+def _excess(x, lo, hi):
+    """Mean squared distance of x outside [lo, hi] (0 inside)."""
+    return (torch.relu(x - hi) + torch.relu(lo - x)).pow(2).mean()
+
+
+def range_loss(model):
+    """Sum of how far the last training forward pushed LayerNorm variances and
+    softmax scores / row sums outside the intervals their encrypted series
+    cover (mean squared excess). Add ``weight * range_loss(model)`` to the
+    training loss so the model learns to stay inside them: the series
+    diverge outside, and encrypted inference cannot clamp."""
+    terms = [m._excess for m in model.modules() if getattr(m, "_excess", None) is not None]
+    return sum(terms) if terms else torch.zeros(())
+
+
 def _series_buffer(fn, a, b, degree):
     return torch.as_tensor(chebyshev_coefficients(fn, a, b, degree), dtype=torch.get_default_dtype())
 
@@ -137,8 +152,13 @@ class LayerNorm(nn.Module):
         self.register_buffer("c", _series_buffer(lambda v: 1.0 / np.sqrt(v + self.eps), var_min, var_max, degree))
 
     def inv_sqrt(self, var):
-        """1/sqrt(var + eps) as the layer approximates it."""
-        r = _chebyshev_eval(self.c, self.var_min, self.var_max, var)
+        """1/sqrt(var + eps) as the layer approximates it. While training, the
+        series sees the variance clamped to its interval (a stray value would
+        otherwise blow it up); check the ranges on data before encrypting."""
+        if self.training:
+            self._excess = _excess(var, self.var_min, self.var_max)
+        v = var.clamp(self.var_min, self.var_max) if self.training else var
+        r = _chebyshev_eval(self.c, self.var_min, self.var_max, v)
         for _ in range(self.newton):
             r = 1.5 * r - 0.5 * (var + self.eps) * r * r * r
         return r
@@ -239,9 +259,18 @@ class Attention(nn.Module):
         else:
             if self.softmax["subtract_max"]:
                 s = s - s.max(-1, keepdim=True).values
+            # While training the series see their arguments clamped to their
+            # intervals (outside them they diverge); check the ranges on data
+            # before encrypting (fheml.Network.forward_plain does not clamp).
+            if self.training:
+                excess = _excess(s, self.exp_lo, self.exp_hi)
+                s = s.clamp(self.exp_lo, self.exp_hi)
             e = _chebyshev_eval(self.exp_c, self.exp_lo, self.exp_hi, s)
             total = e.sum(-1, keepdim=True)
-            y = _chebyshev_eval(self.inv_c, self.sum_lo, self.sum_hi, total)
+            if self.training:
+                self._excess = excess + _excess(total, self.sum_lo, self.sum_hi)
+            t = total.clamp(self.sum_lo, self.sum_hi) if self.training else total
+            y = _chebyshev_eval(self.inv_c, self.sum_lo, self.sum_hi, t)
             for _ in range(self.softmax["newton"]):
                 y = y * (2 - total * y)
             a = e * y
@@ -289,8 +318,9 @@ class MaxPool2d(nn.MaxPool2d):
     Computes ``torch.nn.MaxPool2d`` (square windows, no padding); ``range``
     bounds the inputs, ``|x| <= range``, as the encrypted comparison wraps
     around outside it: calibrate it like a Chebyshev interval. A k x k pool
-    costs k^2 - 1 comparisons (one FHEW bootstrap per slot each) and
-    12 + ceil(log2 k^2) + 1 levels. ``fheml.Trainer`` trains through it,
+    costs ceil(log2 k^2) comparison rounds (one FHEW bootstrap per window
+    and pair) and 12 + ceil(log2 k^2) + 1 levels. Plain ``nn.MaxPool2d``
+    exports too with ``from_torch(..., maxpool_range=R)``. ``fheml.Trainer`` trains through it,
     routing each window's gradient to the tap that won, like torch.
     """
 

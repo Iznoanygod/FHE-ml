@@ -46,6 +46,8 @@ PYBIND11_MODULE(_fheml, m) {
       .def_readwrite("rotation_window", &ContextOptions::rotation_window)
       .def_readwrite("scheme_switching", &ContextOptions::scheme_switching)
       .def_readwrite("fhew_log_q", &ContextOptions::fhew_log_q)
+      .def_readwrite("bootstrap_iterations", &ContextOptions::bootstrap_iterations)
+      .def_readwrite("bootstrap_precision", &ContextOptions::bootstrap_precision)
       .def_readwrite("key_switch_digits", &ContextOptions::key_switch_digits)
       .def_readwrite("use_gpu", &ContextOptions::use_gpu)
       .def_readwrite("gpu_devices", &ContextOptions::gpu_devices);
@@ -184,6 +186,8 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("depth_between_bootstraps", &Network::depth_between_bootstraps)
       .def_property_readonly("uses_bootstrapping", &Network::uses_bootstrapping)
       .def_property_readonly("uses_scheme_switching", &Network::uses_scheme_switching)
+      .def_property_readonly("internal_bootstraps", &Network::internal_bootstraps,
+                             "Bootstraps run inside self-bootstrapping layers per inference.")
       .def("compile", &Network::compile, py::arg("slots") = 0, py::call_guard<py::gil_scoped_release>())
       .def("set_gapped_layouts", &Network::set_gapped_layouts)
       .def_property(
