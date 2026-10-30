@@ -10,9 +10,9 @@
 // by a trainable quadratic score function, A[i][j] = f(q_i . k_j) with
 // f(s) = c0 + c1 s + c2 s^2 (normalisation by n and 1/sqrt(d) are folded into
 // the coefficients / W_q at training time), in the spirit of polynomial
-// attention (Zimerman et al. ICML 2024; Rho et al. ICLR 2025). LayerNorm is
-// left out: the toy models train fine without it, and an encrypted inverse
-// square root would cost ~10 levels.
+// attention (Zimerman et al. ICML 2024; Rho et al. ICLR 2025). LayerNorm
+// exists (see LayerNorm below, about 10 levels for the inverse square root)
+// but the example models do without it.
 //
 // Encrypted QK^T and AV use the diagonal method over token offsets s:
 // for each s, K and V are rotated by s*d (a copy appended at [n*d, 2n*d)
@@ -75,6 +75,57 @@ class TokenMean : public LinearLayer {
 
  private:
   int n_, d_;
+};
+
+// Per-token layer normalisation: y = gamma * (x - mean) / sqrt(var + eps) +
+// beta over the d features of each token (shape {n, 1, d}, d a power of
+// two). Mean and E[x^2] are token-block sums (log2(d) rotations, one masked
+// product, log2(d) rotations to broadcast); the inverse square root of the
+// variance is a Chebyshev series of 1 / sqrt(v + eps) on [var_min, var_max]
+// refined by `newton` Newton steps r <- r (3 - v r^2) / 2 (two levels each,
+// the error squares). Degree 15 with one step is exact to ~1e-9 when
+// var_max / var_min <= 10; a 100x range wants degree 31. The variance range
+// must be calibrated like a Chebyshev activation interval: outside it the
+// series diverges. forward_plain() evaluates the same approximation.
+// Depth: 2 (E[x^2]) + poly_depth(degree) + 1 + 2 newton + 1.
+class LayerNorm : public Layer {
+ public:
+  LayerNorm(int n, int d, std::vector<double> gamma, std::vector<double> beta, double eps, double var_min,
+            double var_max, uint32_t degree = 15, uint32_t newton = 1);
+  std::string type() const override { return "layernorm"; }
+  std::string describe() const override;
+  Shape configure(const Shape& in) override;
+  Layout configure_layout(const Layout& in, bool gapped) override;
+  void compile(uint32_t slots) override;
+  std::vector<double> forward_plain(const std::vector<double>& x) const override;
+  Ctxt forward(const FHEContext& ctx, const Ctxt& x) const override;
+  uint32_t depth() const override;
+  std::vector<int32_t> rotation_indices() const override;
+  void save(std::ostream& os) const override;
+  // Scale folding for Network::place_bootstraps(): the input arriving
+  // multiplied by c leaves the output unchanged once eps and the variance
+  // range are multiplied by c^2; the output is scaled by f through gamma
+  // and beta.
+  void absorb_input_scale(double c);
+  void scale_output(double f);
+  // 1 / sqrt(v + eps) as the layer approximates it.
+  double inv_sqrt(double v) const;
+  double eps() const { return eps_; }
+  double var_min() const { return var_min_; }
+  double var_max() const { return var_max_; }
+  uint32_t degree() const { return degree_; }
+  uint32_t newton() const { return newton_; }
+  const std::vector<double>& gamma() const { return gamma_; }
+  const std::vector<double>& beta() const { return beta_; }
+
+ private:
+  int n_, d_;
+  std::vector<double> gamma_, beta_;
+  double eps_, var_min_, var_max_;
+  uint32_t degree_, newton_;
+  std::vector<double> coeffs_;  // Chebyshev series on [var_min, var_max]
+  size_t stride_ = 0;           // token stride B
+  std::vector<double> mask_, gamma_slots_, beta_slots_, pad_var_;  // per slot
 };
 
 // y = body(x) + x.

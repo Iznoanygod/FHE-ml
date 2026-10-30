@@ -357,6 +357,37 @@ void transformer_tests() {
     check_err("transformer save/load round trip", max_err(net.forward_plain(x), back.forward_plain(x), 3), 1e-12);
   }
   {
+    // LayerNorm in the clear against the exact formula, save/load, and the
+    // scale folds place_bootstraps relies on.
+    const int n = 3, d = 8;
+    auto gamma = rand_vec(d, 0.5, 1.5), beta = rand_vec(d, -0.2, 0.2);
+    Network net(Shape{n, 1, d});
+    net.emplace<LayerNorm>(n, d, gamma, beta, 1e-5, 0.05, 1.2, 31, 1);
+    auto x = rand_vec(n * d);
+    auto y = net.forward_plain(x);
+    std::vector<double> ref(x.size());
+    for (int t = 0; t < n; ++t) {
+      double mean = 0, var = 0;
+      for (int j = 0; j < d; ++j) mean += x[t * d + j] / d;
+      for (int j = 0; j < d; ++j) var += (x[t * d + j] - mean) * (x[t * d + j] - mean) / d;
+      for (int j = 0; j < d; ++j) ref[t * d + j] = gamma[j] * (x[t * d + j] - mean) / std::sqrt(var + 1e-5) + beta[j];
+    }
+    check_err("layernorm plain vs exact", max_err(ref, y, ref.size()), 1e-6);
+    const char* path = "test_layernorm.fheml";
+    net.save(path);
+    Network back = Network::load(path);
+    std::remove(path);
+    check_err("layernorm save/load round trip", max_err(y, back.forward_plain(x), y.size()), 1e-12);
+    auto* ln = dynamic_cast<LayerNorm*>(net.layers()[0].get());
+    ln->absorb_input_scale(0.25);
+    std::vector<double> xs(x);
+    for (double& v : xs) v *= 0.25;
+    check_err("layernorm absorbs an input scale", max_err(y, net.forward_plain(xs), y.size()), 1e-9);
+    ln->scale_output(3.0);
+    for (double& v : y) v *= 3.0;
+    check_err("layernorm scales its output", max_err(y, net.forward_plain(xs), y.size()), 1e-9);
+  }
+  {
     // Attention alone; n = 5 is not a power of two on purpose.
     const int n = 5, d = 8;
     Network net(Shape{n, 1, d});
@@ -434,6 +465,43 @@ void transformer_tests() {
     net3.compile();
     check(net3.layers()[1]->in_layout().cs == 16, "transformer keeps the padded token stride");
     check_encrypted("tiny transformer, strided tokens", net3, 1e-3);
+  }
+  {
+    // The variance interval is calibrated like a Chebyshev interval: here
+    // from the per-token variance of d uniform(-1, 1) values (about 1/3).
+    const int n = 3, d = 8;
+    Network a(Shape{n, 1, d});
+    a.emplace<LayerNorm>(n, d, rand_vec(d, 0.5, 1.5), rand_vec(d, -0.2, 0.2), 1e-5, 0.05, 1.2, 31, 1);
+    check_encrypted("layernorm", a, 1e-3);
+    // Padded token stride: tokendense keeps the 16-slot stride, the norm
+    // must not read the padding. The tokendense outputs have a smaller,
+    // input-dependent variance; the test checks what it will be.
+    Network b(Shape{n, 1, 16});
+    b.emplace<TokenDense>(n, 16, d, rand_vec(16 * d, -0.3, 0.3), rand_vec(d, -0.1, 0.1));
+    {
+      double lo = 1e9, hi = 0;
+      for (int probe = 0; probe < 20; ++probe) {
+        auto h = b.forward_plain(rand_vec(n * 16));
+        for (int t = 0; t < n; ++t) {
+          double mean = 0, var = 0;
+          for (int j = 0; j < d; ++j) mean += h[t * d + j] / d;
+          for (int j = 0; j < d; ++j) var += (h[t * d + j] - mean) * (h[t * d + j] - mean) / d;
+          lo = std::min(lo, var);
+          hi = std::max(hi, var);
+        }
+      }
+      b.emplace<LayerNorm>(n, d, rand_vec(d, 0.5, 1.5), rand_vec(d, -0.2, 0.2), 1e-5, 0.25 * lo, 4.0 * hi, 31, 1);
+    }
+    check_encrypted("layernorm, strided tokens", b, 1e-3);
+    // Pre-norm residual MLP block.
+    std::vector<std::shared_ptr<Layer>> body = {
+        std::make_shared<LayerNorm>(n, d, rand_vec(d, 0.5, 1.5), rand_vec(d, -0.2, 0.2), 1e-5, 0.05, 1.2, 31, 1),
+        std::make_shared<TokenDense>(n, d, 2 * d, rand_vec(2 * d * d, -0.3, 0.3), rand_vec(2 * d, -0.1, 0.1)),
+        std::make_shared<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25}),
+        std::make_shared<TokenDense>(n, 2 * d, d, rand_vec(2 * d * d, -0.3, 0.3), rand_vec(d, -0.1, 0.1))};
+    Network c(Shape{n, 1, d});
+    c.add(std::make_shared<Residual>(body));
+    check_encrypted("pre-norm residual block", c, 1e-3);
   }
 }
 

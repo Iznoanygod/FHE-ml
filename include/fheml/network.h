@@ -17,6 +17,7 @@
 //   bootstrap
 //   tokendense N IN OUT NB                        followed by weights [OUT][IN], NB bias values (0, OUT or N*OUT)
 //   tokenmean N D
+//   layernorm N D EPS VAR_MIN VAR_MAX DEGREE NEWTON   followed by D gammas, D betas
 //   attention N D HAS_BIAS [heads H]              followed by Wq Wk Wv Wo [, bq bk bv bo], 3 score coefficients
 //                                                 (3 per head with "heads H")
 //   residual K                                    followed by K layers (y = body(x) + x)

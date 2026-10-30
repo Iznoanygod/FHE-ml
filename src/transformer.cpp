@@ -1,11 +1,14 @@
 #include "fheml/transformer.h"
 
+#include <cmath>
 #include <iomanip>
 #include <limits>
 #include <ostream>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+
+#include "math/chebyshev.h"
 
 namespace fheml {
 
@@ -126,6 +129,165 @@ SparseMatrix TokenMean::matrix() const {
 }
 
 void TokenMean::save(std::ostream& os) const { os << "tokenmean " << n_ << " " << d_ << "\n"; }
+
+// -------------------------------------------------------------------- LayerNorm
+
+LayerNorm::LayerNorm(int n, int d, std::vector<double> gamma, std::vector<double> beta, double eps, double var_min,
+                     double var_max, uint32_t degree, uint32_t newton)
+    : n_(n), d_(d), gamma_(std::move(gamma)), beta_(std::move(beta)), eps_(eps), var_min_(var_min),
+      var_max_(var_max), degree_(degree), newton_(newton) {
+  if (n < 1 || d < 2 || (d & (d - 1))) throw std::invalid_argument("layernorm: d must be a power of two, at least 2");
+  if (gamma_.size() != static_cast<size_t>(d) || beta_.size() != static_cast<size_t>(d))
+    throw std::invalid_argument("layernorm: gamma and beta must have d entries");
+  if (!(eps >= 0.0) || !(var_min >= 0.0) || !(var_min < var_max))
+    throw std::invalid_argument("layernorm: need 0 <= var_min < var_max and eps >= 0");
+  if (degree < 1) throw std::invalid_argument("layernorm: degree must be at least 1");
+  coeffs_ = lbcrypto::EvalChebyshevCoefficients([this](double v) { return 1.0 / std::sqrt(v + eps_); }, var_min_,
+                                                var_max_, degree_);
+}
+
+std::string LayerNorm::describe() const {
+  std::ostringstream os;
+  os << type() << " " << n_ << "x" << d_ << " eps " << eps_ << " var [" << var_min_ << ", " << var_max_
+     << "] degree " << degree_ << " newton " << newton_;
+  return os.str();
+}
+
+Shape LayerNorm::configure(const Shape& in) {
+  if (in.size() != static_cast<size_t>(n_) * d_) throw std::invalid_argument("layernorm: input size mismatch");
+  in_ = out_ = Shape{n_, 1, d_};
+  return out_;
+}
+
+Layout LayerNorm::configure_layout(const Layout& in, bool gapped) {
+  (void)gapped;
+  if (in.xs != 1 || in.ys != static_cast<size_t>(d_) && n_ > 1)
+    throw std::invalid_argument("layernorm: tokens must be contiguous in the slots");
+  in_layout_ = out_layout_ = in;
+  stride_ = n_ > 1 ? in.cs : static_cast<size_t>(d_);
+  return out_layout_;
+}
+
+void LayerNorm::compile(uint32_t slots) {
+  mask_.assign(slots, 0.0);
+  gamma_slots_.assign(slots, 0.0);
+  beta_slots_.assign(slots, 0.0);
+  // Slots outside the tokens see a variance of 0, where a Chebyshev series
+  // for [var_min, var_max] can be astronomically wrong (and then spoils the
+  // decryption of every slot), so they get a variance inside the interval.
+  pad_var_.assign(slots, 0.5 * (var_min_ + var_max_));
+  for (int t = 0; t < n_; ++t) {
+    mask_[t * stride_] = 1.0 / d_;
+    for (int j = 0; j < d_; ++j) pad_var_[t * stride_ + j] = 0.0;
+    for (int j = 0; j < d_; ++j) {
+      gamma_slots_[t * stride_ + j] = gamma_[static_cast<size_t>(j)];
+      beta_slots_[t * stride_ + j] = beta_[static_cast<size_t>(j)];
+    }
+  }
+}
+
+double LayerNorm::inv_sqrt(double v) const {
+  double r = lbcrypto::EvalChebyshevFunctionPtxt([this](double u) { return 1.0 / std::sqrt(u + eps_); }, {v},
+                                                 var_min_, var_max_, degree_)[0];
+  for (uint32_t i = 0; i < newton_; ++i) r = 1.5 * r - 0.5 * (v + eps_) * r * r * r;
+  return r;
+}
+
+std::vector<double> LayerNorm::forward_plain(const std::vector<double>& x) const {
+  std::vector<double> y(x.size());
+  for (int t = 0; t < n_; ++t) {
+    const double* xt = &x[static_cast<size_t>(t) * d_];
+    double mean = 0.0, ex2 = 0.0;
+    for (int j = 0; j < d_; ++j) {
+      mean += xt[j];
+      ex2 += xt[j] * xt[j];
+    }
+    mean /= d_;
+    ex2 /= d_;
+    const double r = inv_sqrt(ex2 - mean * mean);
+    for (int j = 0; j < d_; ++j)
+      y[static_cast<size_t>(t) * d_ + j] = gamma_[static_cast<size_t>(j)] * (xt[j] - mean) * r + beta_[static_cast<size_t>(j)];
+  }
+  return y;
+}
+
+// Token block sums: after the forward rotations slot t*B holds the sum of
+// the token's d features (slots t*B+d .. t*B+B-1 are zero, so nothing of the
+// next token leaks in); the masked product scales by 1/d and clears every
+// other slot; the backward rotations spread it over the token's d slots.
+Ctxt LayerNorm::forward(const FHEContext& ctx, const Ctxt& x) const {
+  const CC& cc = ctx.cc();
+  if (mask_.size() != ctx.slots()) throw std::invalid_argument("layernorm: slot count mismatch with context");
+  auto block_mean = [&](const Ctxt& in) {
+    // (EvalAddInPlace on a copy of the handle would modify the caller's
+    // ciphertext.)
+    Ctxt s = cc->EvalAdd(in, ctx.rotate(in, 1));
+    for (int t = 2; t < d_; t *= 2) cc->EvalAddInPlace(s, ctx.rotate(s, t));
+    const uint32_t lvl = s->GetLevel() + (s->GetNoiseScaleDeg() > 1 ? 1 : 0);
+    Ctxt m = cc->EvalMult(s, ctx.encode(mask_, lvl));
+    for (int t = 1; t < d_; t *= 2) cc->EvalAddInPlace(m, ctx.rotate(m, -t));
+    return m;
+  };
+  Ctxt mean = block_mean(x);
+  Ctxt var = cc->EvalSub(block_mean(cc->EvalMult(x, x)), cc->EvalMult(mean, mean));
+  Ptxt pad = ctx.encode(pad_var_, var->GetLevel(), var->GetNoiseScaleDeg());
+  cc->EvalAddInPlace(var, pad);
+  // Newton steps r <- 1.5 r - 0.5 v r^3 without scalar products on r (each
+  // would cost a level): the series is scaled to s = k r with k = 1.5^newton,
+  // and s <- s - (c v) s^3 with c = 0.5 / (1.5 k^2) divides k by 1.5 per step
+  // (the constant rides on v, which has levels to spare), ending at k = 1.
+  double k = std::pow(1.5, static_cast<double>(newton_));
+  std::vector<double> c = coeffs_;  // FIDESlib takes the coefficients by mutable reference
+  for (double& ci : c) ci *= k;
+  Ctxt r = cc->EvalChebyshevSeries(var, c, var_min_, var_max_);
+  if (newton_) {
+    Ctxt v = eps_ != 0.0 ? cc->EvalAdd(var, eps_) : var;
+    for (uint32_t i = 0; i < newton_; ++i) {
+      Ctxt vc = cc->EvalMult(v, 0.5 / (1.5 * k * k));
+      Ctxt p = cc->EvalMult(cc->EvalMult(vc, r), cc->EvalMult(r, r));
+      r = cc->EvalSub(r, p);
+      k /= 1.5;
+    }
+  }
+  Ctxt centred = cc->EvalSub(x, mean);
+  const uint32_t lvl = centred->GetLevel() + (centred->GetNoiseScaleDeg() > 1 ? 1 : 0);
+  Ctxt y = cc->EvalMult(cc->EvalMult(centred, ctx.encode(gamma_slots_, lvl)), r);
+  Ptxt beta = ctx.encode(beta_slots_, y->GetLevel(), y->GetNoiseScaleDeg());
+  return cc->EvalAdd(y, beta);
+}
+
+uint32_t LayerNorm::depth() const { return 2 + poly_depth(degree_) + 1 + 2 * newton_ + 1; }
+
+std::vector<int32_t> LayerNorm::rotation_indices() const {
+  std::vector<int32_t> r;
+  for (int t = 1; t < d_; t *= 2) {
+    r.push_back(t);
+    r.push_back(-t);
+  }
+  return r;
+}
+
+void LayerNorm::absorb_input_scale(double c) {
+  if (c == 0.0) throw std::invalid_argument("layernorm: zero input scale");
+  eps_ *= c * c;
+  var_min_ *= c * c;
+  var_max_ *= c * c;
+  coeffs_ = lbcrypto::EvalChebyshevCoefficients([this](double v) { return 1.0 / std::sqrt(v + eps_); }, var_min_,
+                                                var_max_, degree_);
+}
+
+void LayerNorm::scale_output(double f) {
+  for (double& g : gamma_) g *= f;
+  for (double& b : beta_) b *= f;
+  if (!mask_.empty()) compile(static_cast<uint32_t>(mask_.size()));
+}
+
+void LayerNorm::save(std::ostream& os) const {
+  os << std::setprecision(std::numeric_limits<double>::max_digits10) << "layernorm " << n_ << " " << d_ << " " << eps_
+     << " " << var_min_ << " " << var_max_ << " " << degree_ << " " << newton_ << "\n";
+  write_vec(os, gamma_);
+  write_vec(os, beta_);
+}
 
 // -------------------------------------------------------------------- Residual
 

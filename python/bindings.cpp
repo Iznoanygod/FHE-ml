@@ -115,6 +115,13 @@ PYBIND11_MODULE(_fheml, m) {
   py::class_<Bootstrap, Layer, std::shared_ptr<Bootstrap>>(m, "Bootstrap").def(py::init<>());
   py::class_<Residual, Layer, std::shared_ptr<Residual>>(m, "Residual")
       .def(py::init<std::vector<LayerPtr>>(), py::arg("body"));
+  py::class_<LayerNorm, Layer, std::shared_ptr<LayerNorm>>(m, "LayerNorm")
+      .def(py::init<int, int, Vec, Vec, double, double, double, uint32_t, uint32_t>(), py::arg("tokens"),
+           py::arg("dim"), py::arg("gamma"), py::arg("beta"), py::arg("eps") = 1e-5, py::arg("var_min") = 0.1,
+           py::arg("var_max") = 1.0, py::arg("degree") = 15, py::arg("newton") = 1,
+           "Per-token layer norm; 1/sqrt(var + eps) is a degree-`degree` Chebyshev series on "
+           "[var_min, var_max] refined by `newton` Newton steps.")
+      .def("inv_sqrt", &LayerNorm::inv_sqrt, py::arg("var"));
   py::class_<Attention, Layer, std::shared_ptr<Attention>>(m, "Attention")
       .def(py::init<int, int, Vec, Vec, Vec, Vec, Vec, Vec, Vec, Vec, Vec, int>(), py::arg("tokens"), py::arg("dim"),
            py::arg("wq"), py::arg("wk"), py::arg("wv"), py::arg("wo"), py::arg("bq") = Vec{}, py::arg("bk") = Vec{},
