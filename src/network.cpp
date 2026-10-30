@@ -47,6 +47,11 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
     int k, s;
     is >> k >> s;
     layer = std::make_shared<AvgPool2d>(k, s);
+  } else if (tok == "maxpool2d") {
+    int k, s;
+    double range;
+    is >> k >> s >> range;
+    layer = std::make_shared<MaxPool2d>(k, s, range);
   } else if (tok == "affine") {
     size_t c;
     is >> c;
@@ -530,6 +535,17 @@ uint32_t Network::input_level(const FHEContext& ctx) const {
   return ctx.total_depth() > need ? ctx.total_depth() - need : 0;
 }
 
+bool Network::uses_scheme_switching() const {
+  std::function<bool(const std::vector<std::shared_ptr<Layer>>&)> any = [&](const auto& layers) {
+    for (const auto& l : layers) {
+      if (l->uses_scheme_switching()) return true;
+      if (auto* r = dynamic_cast<const Residual*>(l.get()); r && any(r->body())) return true;
+    }
+    return false;
+  };
+  return any(layers_);
+}
+
 bool Network::uses_bootstrapping() const {
   return std::any_of(layers_.begin(), layers_.end(), [](const std::shared_ptr<Layer>& l) { return l->is_bootstrap(); });
 }
@@ -562,6 +578,7 @@ ContextOptions Network::context_options(bool secure) const {
   o.slots = slots_;
   o.secure = secure;
   o.bootstrapping = uses_bootstrapping();
+  o.scheme_switching = uses_scheme_switching();
   // +1: EvalBootstrap needs one level left when its input arrives.
   o.mult_depth = o.bootstrapping ? depth_between_bootstraps() + 1 : depth();
   if (o.bootstrapping) {

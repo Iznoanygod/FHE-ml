@@ -335,6 +335,8 @@ bit-identical to the CPU ones.
 All of the following are tested under encryption:
 - Convolutions with stride, padding and multiple channels.
 - Dense layers, average pooling and channel affine layers.
+- Exact max pooling through CKKS ↔ FHEW scheme switching (TOY FHEW
+  parameters in the tests; the STD128 numbers are in the README).
 - Fused linear layers.
 - The square, polynomial and Chebyshev activations.
 - Bootstrapping in the middle of a network, placed by hand or by

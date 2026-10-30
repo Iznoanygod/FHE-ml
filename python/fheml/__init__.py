@@ -52,6 +52,7 @@ def _accepting_numpy(cls):
 
 Attention = _accepting_numpy(_fheml.Attention)
 AvgPool2d = _fheml.AvgPool2d
+MaxPool2d = _fheml.MaxPool2d
 ChannelAffine = _accepting_numpy(_fheml.ChannelAffine)
 Chebyshev = _fheml.Chebyshev
 Conv2d = _accepting_numpy(_fheml.Conv2d)

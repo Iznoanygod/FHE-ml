@@ -72,6 +72,8 @@ class Layer {
   }
   virtual bool is_linear() const { return false; }
   virtual bool is_bootstrap() const { return false; }
+  // Needs ContextOptions::scheme_switching (FHEContext::compare()).
+  virtual bool uses_scheme_switching() const { return false; }
 
   // One-line header followed by the parameters (see network.h for the format).
   virtual void save(std::ostream& os) const = 0;
@@ -209,6 +211,52 @@ class AvgPool2d : public LinearLayer {
 
  private:
   int k_, stride_;
+};
+
+// Max pooling, exact: the k x k window maxima are computed with encrypted
+// comparisons through CKKS -> FHEW -> CKKS scheme switching
+// (FHEContext::compare). Values are compared pairwise in a tournament:
+// max(a, b) = a + [a < b] (b - a), where [a < b] comes back from FHEW as a
+// fresh ciphertext at FHEContext::compare_depth() levels, so the output is
+// compare_depth() + ceil(log2(k^2)) levels deep; the layer reserves one
+// level more because a comparison needs its inputs two levels above the
+// bottom of the chain. It runs k^2 - 1 comparisons, each one FHEW bootstrap
+// per slot (about 2 s per comparison at TOY parameters with 16 slots, 8-10
+// minutes at STD128 with 256 slots on 4 cores).
+//
+// `range` bounds the inputs: |x| <= range (the comparison wraps around
+// otherwise and picks the wrong value). Differences smaller than about
+// 4 range / 2^(fhew_log_q - 1) are resolved either way, which changes the
+// maximum by at most that much.
+//
+// The output stays gapped at the input positions (like a strided conv): the
+// maximum of a window lands in the slot of its top-left input. Slots between
+// outputs hold maxima of other windows (bounded by range); the next linear
+// layer ignores them.
+class MaxPool2d : public Layer {
+ public:
+  MaxPool2d(int k, int stride, double range = 1.0);
+  std::string type() const override { return "maxpool2d"; }
+  std::string describe() const override;
+  Shape configure(const Shape& in) override;
+  Layout configure_layout(const Layout& in, bool gapped) override;
+  std::vector<double> forward_plain(const std::vector<double>& x) const override;
+  Ctxt forward(const FHEContext& ctx, const Ctxt& x) const override;
+  uint32_t depth() const override;
+  std::vector<int32_t> rotation_indices() const override;
+  bool uses_scheme_switching() const override { return true; }
+  void save(std::ostream& os) const override;
+  int k() const { return k_; }
+  int stride() const { return stride_; }
+  double range() const { return range_; }
+  // Comparison rounds of the tournament: ceil(log2(k^2)).
+  uint32_t rounds() const;
+
+ private:
+  // Slot offsets of the window taps relative to the top-left input.
+  std::vector<int32_t> offsets() const;
+  int k_, stride_;
+  double range_;
 };
 
 // Per-channel affine map (inference-time batch norm): y = scale[c] * x + shift[c].

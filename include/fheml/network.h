@@ -8,6 +8,7 @@
 //   conv2d IN_C OUT_C KH KW STRIDE PAD HAS_BIAS   followed by weights [, bias]
 //   dense IN OUT HAS_BIAS                         followed by weights [, bias]
 //   avgpool2d K STRIDE
+//   maxpool2d K STRIDE RANGE                     exact max via scheme switching, inputs in [-RANGE, RANGE]
 //   affine C                                      followed by C scales, C shifts
 //   square
 //   poly N                                        followed by N coefficients c0..c{N-1}
@@ -102,6 +103,9 @@ class Network {
   uint32_t depth() const;
   uint32_t depth_between_bootstraps() const;
   bool uses_bootstrapping() const;
+  // True when a layer compares through CKKS <-> FHEW scheme switching
+  // (MaxPool2d); context_options() then enables it.
+  bool uses_scheme_switching() const;
   // Rotation keys to generate. ladder = true (the context has a rotation-key
   // ladder, ContextOptions::rotation_window): only the rotations of layers
   // that cannot compose them (attention); linear layers compose theirs.

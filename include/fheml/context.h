@@ -41,6 +41,16 @@ struct ContextOptions {
   bool use_gpu = true;
   // CUDA devices to use (several = FIDESlib multi-GPU, needs NCCL).
   std::vector<int> gpu_devices = {0};
+  // CKKS <-> FHEW scheme switching (OpenFHE SCHEMESWITCH), used by
+  // FHEContext::compare() and the MaxPool2d layer. keygen() then also builds
+  // the FHEW context, its bootstrapping keys and the switching keys. The FHEW
+  // parameter set is STD128 when secure, TOY otherwise. Not available on the
+  // FIDESlib (GPU) backend.
+  bool scheme_switching = false;
+  // log2 of the FHEW ciphertext modulus for the comparison (OpenFHE's
+  // "large precision" switching). Also sets the comparison resolution: a
+  // difference of two values is resolved to about 2^(2 - logq) of the range.
+  uint32_t fhew_log_q = 25;
 };
 
 class FHEContext {
@@ -62,6 +72,19 @@ class FHEContext {
   std::vector<double> decrypt(const Ctxt& c, size_t n) const;
 
   Ctxt bootstrap(const Ctxt& c) const;
+
+  // Encrypted comparison through FHEW (needs ContextOptions::scheme_switching):
+  // slot i of the result is 1 where a_i < b_i and 0 otherwise, for values
+  // with |a_i|, |b_i| <= range (larger values wrap around modulo the FHEW
+  // plaintext space and compare wrongly). Switches a - b to FHEW, evaluates
+  // the sign there with one FHEW bootstrap per slot and switches back. The
+  // result is a fresh CKKS ciphertext at level compare_depth() whatever the
+  // inputs' levels, which only need two levels left.
+  Ctxt compare(const Ctxt& a, const Ctxt& b, double range = 1.0) const;
+  // Levels of a compare() result, i.e. what OpenFHE's FHEW-to-CKKS decoding
+  // consumes (constant for the parameter sets used here).
+  static uint32_t compare_depth() { return 12; }
+  bool scheme_switching() const { return opts_.scheme_switching; }
 
   // Rotates by k slots (any k): with the key for k directly, otherwise
   // composed from the ladder keys (see ContextOptions::rotation_window).
@@ -99,6 +122,10 @@ class FHEContext {
   fhe::KeyPair<fhe::DCRTPoly> keys_;
   std::vector<char> has_key_;  // per normalised rotation index
   bool on_gpu_ = false;
+  // Comparison scaling last precomputed by compare(); the switching matrix
+  // plaintexts depend on the range.
+  mutable double compare_range_ = 0.0;
+  uint32_t compare_plaintext_mod_ = 0;
   uint32_t total_depth_ = 0;
   uint32_t boot_depth_ = 0;
 };

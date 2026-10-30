@@ -1,5 +1,6 @@
 #include "fheml/layers.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <limits>
@@ -336,6 +337,101 @@ SparseMatrix AvgPool2d::matrix() const {
 }
 
 void AvgPool2d::save(std::ostream& os) const { os << "avgpool2d " << k_ << " " << stride_ << "\n"; }
+
+// ------------------------------------------------------------------- MaxPool2d
+
+MaxPool2d::MaxPool2d(int k, int stride, double range) : k_(k), stride_(stride), range_(range) {
+  if (k < 1 || stride < 1) throw std::invalid_argument("maxpool2d: bad parameters");
+  if (!(range > 0.0)) throw std::invalid_argument("maxpool2d: range must be positive");
+}
+
+std::string MaxPool2d::describe() const {
+  std::ostringstream os;
+  os << type() << " " << k_ << "x" << k_ << " stride " << stride_ << " range " << range_ << " (" << (k_ * k_ - 1)
+     << " comparisons, " << rounds() << " rounds)";
+  return os.str();
+}
+
+Shape MaxPool2d::configure(const Shape& in) {
+  in_ = in;
+  out_ = Shape{in.c, (in.h - k_) / stride_ + 1, (in.w - k_) / stride_ + 1};
+  return out_;
+}
+
+// Always gapped: output (c, y, x) lives in the slot of input (c, y*s, x*s).
+Layout MaxPool2d::configure_layout(const Layout& in, bool gapped) {
+  (void)gapped;
+  in_layout_ = in;
+  const size_t s = static_cast<size_t>(stride_);
+  out_layout_ = Layout{in.cs, in.ys * s, in.xs * s};
+  return out_layout_;
+}
+
+std::vector<int32_t> MaxPool2d::offsets() const {
+  std::vector<int32_t> offs;
+  for (int dy = 0; dy < k_; ++dy)
+    for (int dx = 0; dx < k_; ++dx)
+      offs.push_back(static_cast<int32_t>(dy * in_layout_.ys + dx * in_layout_.xs));
+  return offs;
+}
+
+uint32_t MaxPool2d::rounds() const {
+  uint32_t r = 0;
+  for (uint32_t n = static_cast<uint32_t>(k_ * k_); n > 1; n = (n + 1) / 2) ++r;
+  return r;
+}
+
+// +1: the last round's comparison needs its inputs two levels above the bottom.
+uint32_t MaxPool2d::depth() const { return FHEContext::compare_depth() + rounds() + 1; }
+
+std::vector<int32_t> MaxPool2d::rotation_indices() const {
+  std::vector<int32_t> offs = offsets();
+  offs.erase(std::remove(offs.begin(), offs.end(), 0), offs.end());
+  return offs;
+}
+
+std::vector<double> MaxPool2d::forward_plain(const std::vector<double>& x) const {
+  std::vector<double> y(out_.size());
+  for (int c = 0; c < out_.c; ++c)
+    for (int oy = 0; oy < out_.h; ++oy)
+      for (int ox = 0; ox < out_.w; ++ox) {
+        double m = -std::numeric_limits<double>::infinity();
+        for (int dy = 0; dy < k_; ++dy)
+          for (int dx = 0; dx < k_; ++dx)
+            m = std::max(m, x[(static_cast<size_t>(c) * in_.h + oy * stride_ + dy) * in_.w + ox * stride_ + dx]);
+        y[(static_cast<size_t>(c) * out_.h + oy) * out_.w + ox] = m;
+      }
+  return y;
+}
+
+// Tournament over the window taps. Every tap is first rotated onto the
+// slot of its window's top-left input, so each round compares whole
+// ciphertexts: one scheme switch per pair, all windows at once. The pairs
+// run one after the other: OpenFHE's scheme switching keeps state in the
+// context and parallelises the FHEW bootstraps itself.
+Ctxt MaxPool2d::forward(const FHEContext& ctx, const Ctxt& x) const {
+  if (!ctx.scheme_switching())
+    throw std::logic_error("maxpool2d needs a context with ContextOptions::scheme_switching");
+  const CC& cc = ctx.cc();
+  std::vector<Ctxt> vals = ctx.rotate_many(x, offsets());
+  while (vals.size() > 1) {
+    std::vector<Ctxt> next((vals.size() + 1) / 2);
+    const size_t pairs = vals.size() / 2;
+    for (size_t i = 0; i < pairs; ++i) {
+      const Ctxt& a = vals[2 * i];
+      const Ctxt& b = vals[2 * i + 1];
+      Ctxt sel = ctx.compare(a, b, range_);  // [a < b]
+      next[i] = cc->EvalAdd(a, cc->EvalMult(sel, cc->EvalSub(b, a)));
+    }
+    if (vals.size() % 2) next.back() = vals.back();
+    vals.swap(next);
+  }
+  return vals[0];
+}
+
+void MaxPool2d::save(std::ostream& os) const {
+  os << "maxpool2d " << k_ << " " << stride_ << " " << range_ << "\n";
+}
 
 // --------------------------------------------------------------- ChannelAffine
 
