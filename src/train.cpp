@@ -1423,10 +1423,13 @@ ContextOptions Trainer::context_options(bool secure, bool bootstrapping, uint32_
       top = std::max({top, s.max, s.new_w});
       w = s.new_w;
     }
-    // One more forward pass to use the trained weights.
+    // One more forward pass to use the trained weights. s.max, not just the
+    // output level: a max pool's comparisons need two levels below their
+    // inputs.
     Sim s{w};
     SimTrace tr;
-    top = std::max(top, sim_forward(s, nodes_, prefix, tr));
+    sim_forward(s, nodes_, prefix, tr);
+    top = std::max(top, s.max);
     o.mult_depth = top;
   }
   return o;
