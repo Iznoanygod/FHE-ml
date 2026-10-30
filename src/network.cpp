@@ -52,7 +52,18 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
     int k, s;
     double range;
     is >> k >> s >> range;
-    layer = std::make_shared<MaxPool2d>(k, s, range);
+    auto mp = std::make_shared<MaxPool2d>(k, s, range);
+    std::string next;
+    auto pos = is.tellg();
+    if (is >> next && next == "gain") {
+      double g;
+      is >> g;
+      mp->set_gain(g);
+    } else {
+      is.clear();
+      is.seekg(pos);
+    }
+    layer = mp;
   } else if (tok == "affine") {
     size_t c;
     is >> c;
@@ -296,10 +307,10 @@ enum class Fold {
 Fold fold_kind(const Layer& l) {
   if (dynamic_cast<const Square*>(&l)) return Fold::kSquare;
   if (dynamic_cast<const PolyActivation*>(&l) || dynamic_cast<const ChebyshevActivation*>(&l) ||
-      dynamic_cast<const Scale*>(&l) || dynamic_cast<const FusedLinear*>(&l) || dynamic_cast<const LayerNorm*>(&l))
-    return Fold::kAbsorb;
-  // max(c x) = c max(x) for c > 0: the scale passes, the range follows it.
-  if (l.is_bootstrap() || dynamic_cast<const MaxPool2d*>(&l)) return Fold::kPass;
+      dynamic_cast<const Scale*>(&l) || dynamic_cast<const FusedLinear*>(&l) || dynamic_cast<const LayerNorm*>(&l) ||
+      dynamic_cast<const MaxPool2d*>(&l))
+    return Fold::kAbsorb;  // MaxPool2d: max(c x) = c max(x), c > 0, taken by its gather
+  if (l.is_bootstrap()) return Fold::kPass;
   if (auto* lin = dynamic_cast<const LinearLayer*>(&l)) {
     if (lin->trainable()) return Fold::kAbsorb;
     return lin->bias().empty() ? Fold::kPass : Fold::kBlock;
@@ -331,6 +342,10 @@ void scale_output(std::shared_ptr<Layer>& l, double f) {
   if (auto* sc = dynamic_cast<Scale*>(l.get())) return sc->multiply(f);
   if (auto* fu = dynamic_cast<FusedLinear*>(l.get())) return fu->scale(f, f);
   if (auto* ln = dynamic_cast<LayerNorm*>(l.get())) return ln->scale_output(f);
+  if (auto* mp = dynamic_cast<MaxPool2d*>(l.get())) {
+    mp->set_gain(mp->gain() * f);
+    return mp->set_range(mp->range() * f);
+  }
   auto* lin = dynamic_cast<LinearLayer*>(l.get());
   if (!lin || !lin->trainable()) throw std::logic_error("place_bootstraps: cannot scale " + l->type());
   std::vector<double> p = lin->params();
@@ -345,7 +360,6 @@ void scale_output_chain(std::vector<std::shared_ptr<Layer>>& layers, double f) {
       case Fold::kSquare: f = std::sqrt(f); continue;
       case Fold::kPass:
         if (layers[k]->is_bootstrap()) throw std::logic_error("place_bootstraps: fold reached a bootstrap");
-        if (auto* mp = dynamic_cast<MaxPool2d*>(layers[k].get())) mp->set_range(mp->range() * f);
         continue;
       case Fold::kBlock: throw std::logic_error("place_bootstraps: fold blocked by " + layers[k]->type());
     }
@@ -361,6 +375,7 @@ void absorb_input(std::shared_ptr<Layer>& l, double c) {
   if (auto* sc = dynamic_cast<Scale*>(l.get())) return sc->multiply(1.0 / c);
   if (auto* fu = dynamic_cast<FusedLinear*>(l.get())) return fu->scale(1.0 / c, 1.0);
   if (auto* ln = dynamic_cast<LayerNorm*>(l.get())) return ln->absorb_input_scale(c);
+  if (auto* mp = dynamic_cast<MaxPool2d*>(l.get())) return mp->set_gain(mp->gain() / c);
   auto* lin = dynamic_cast<LinearLayer*>(l.get());
   if (!lin || !lin->trainable()) throw std::logic_error("place_bootstraps: cannot rescale " + l->type());
   std::vector<double> p = lin->params();
@@ -519,9 +534,7 @@ size_t apply_chain(std::vector<std::shared_ptr<Layer>>& layers, const Shape& inp
           carry = 1.0;
           break;
         case Fold::kSquare: carry *= carry; break;
-        case Fold::kPass:
-          if (auto* mp = dynamic_cast<MaxPool2d*>(l.get())) mp->set_range(mp->range() * carry);
-          break;
+        case Fold::kPass: break;
         case Fold::kBlock:
           out.push_back(make_scale(shape, 1.0 / carry));
           carry = 1.0;
@@ -783,7 +796,7 @@ void collect_rotations(const std::vector<std::shared_ptr<Layer>>& layers, bool l
       collect_rotations(r->body(), ladder, s);
       continue;
     }
-    if (ladder && l->is_linear()) continue;
+    if (ladder && l->composes_rotations()) continue;
     for (int32_t k : l->rotation_indices()) s.insert(k);
   }
 }

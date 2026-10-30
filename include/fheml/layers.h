@@ -72,6 +72,9 @@ class Layer {
     (void)drop_plaintext;
   }
   virtual bool is_linear() const { return false; }
+  // All rotations go through FHEContext::rotate / rotate_many, so a
+  // rotation-key ladder can compose them (Network::rotation_indices(true)).
+  virtual bool composes_rotations() const { return is_linear(); }
   virtual bool is_bootstrap() const { return false; }
   // Needs ContextOptions::scheme_switching (FHEContext::compare()).
   virtual bool uses_scheme_switching() const { return false; }
@@ -258,27 +261,33 @@ class AvgPool2d : public LinearLayer {
 
 // Max pooling, exact: the k x k window maxima are computed with encrypted
 // comparisons through CKKS -> FHEW -> CKKS scheme switching
-// (FHEContext::compare). Values are compared pairwise in a tournament:
-// max(a, b) = a + [a < b] (b - a), where [a < b] comes back from FHEW as a
-// fresh ciphertext at FHEContext::compare_depth() levels, so the output is
-// compare_depth() + ceil(log2(k^2)) levels deep; the layer reserves one
-// level more because a comparison needs its inputs two levels above the
-// bottom of the chain. In a bootstrapped network the inputs sit at or below
-// a bootstrap's output level (18-20), already below the comparison results'
-// 12, so each round costs one level: the depth is ceil(log2(k^2)) there. It runs k^2 - 1 comparisons, each one FHEW bootstrap
-// per slot (about 2 s per comparison at TOY parameters with 16 slots, 8-10
-// minutes at STD128 with 256 slots on 4 cores). Only the slots up to the
-// last input are compared.
+// (FHEContext::compare), one FHEW bootstrap per compared slot, so the layer
+// first packs what it compares: a linear gather (one level) writes tap j of
+// every window into block j of M slots (M = the output count rounded up to
+// a power of two; k^2 rounded up to a power of two blocks, padded with
+// copies of tap 0). Each round then compares the first half of the blocks
+// with the second half rotated onto it, max(a, b) = a + [a < b] (b - a), in
+// one comparison of half as many slots: (k^2 - 1) M FHEW bootstraps in all
+// instead of (k^2 - 1) times the input's slot span (4x fewer for 2x2 stride
+// 2). The output is compact in block 0.
+//
+// [a < b] comes back from FHEW as a fresh ciphertext at
+// FHEContext::compare_depth() levels whatever the input level, so the
+// output is compare_depth() + ceil(log2(k^2)) levels deep; the layer
+// reserves one level more because a comparison needs its inputs two levels
+// above the bottom of the chain. In a bootstrapped network the inputs sit at
+// or past a bootstrap's output level (18-20), already deeper than the
+// comparison results' 12, so only the gather and the rounds count:
+// 1 + ceil(log2(k^2)) levels.
+//
+// About 2 s per comparison at TOY parameters with 16 slots, 8-10 minutes at
+// STD128 with 256 slots on 4 cores.
 //
 // `range` bounds the inputs: |x| <= range (the comparison wraps around
 // otherwise and picks the wrong value). Differences smaller than about
 // 4 range / 2^(fhew_log_q - 1) are resolved either way, which changes the
-// maximum by at most that much.
-//
-// The output stays gapped at the input positions (like a strided conv): the
-// maximum of a window lands in the slot of its top-left input. Slots between
-// outputs hold maxima of other windows (bounded by range); the next linear
-// layer ignores them.
+// maximum by at most that much. The other blocks of the output hold partial
+// maxima (bounded by range); the next linear layer ignores them.
 class MaxPool2d : public Layer {
  public:
   MaxPool2d(int k, int stride, double range = 1.0);
@@ -291,11 +300,21 @@ class MaxPool2d : public Layer {
   uint32_t depth() const override;
   std::vector<int32_t> rotation_indices() const override;
   bool uses_scheme_switching() const override { return true; }
+  bool composes_rotations() const override { return true; }
   void set_bootstrapped(bool on) override { bootstrapped_ = on; }
+  void compile(uint32_t slots) override;
+  size_t min_slots() const override;
   void save(std::ostream& os) const override;
   int k() const { return k_; }
   int stride() const { return stride_; }
   double range() const { return range_; }
+  double gain() const { return gain_; }
+  // The output is gain * max: the gather takes the factor for free (range is
+  // that of the gathered, scaled taps).
+  void set_gain(double g) {
+    if (!(g > 0.0)) throw std::invalid_argument("maxpool2d: gain must be positive");
+    gain_ = g;
+  }
   // Inputs arriving multiplied by c > 0 (Network::place_bootstraps).
   void set_range(double r) {
     if (!(r > 0.0)) throw std::invalid_argument("maxpool2d: range must be positive");
@@ -305,11 +324,14 @@ class MaxPool2d : public Layer {
   uint32_t rounds() const;
 
  private:
-  // Slot offsets of the window taps relative to the top-left input.
-  std::vector<int32_t> offsets() const;
+  // Blocks (taps rounded up to a power of two) and slots per block.
+  uint32_t blocks() const;
+  uint32_t block() const;
   int k_, stride_;
   double range_;
+  double gain_ = 1.0;  // multiplies the gathered taps (absorbs a scale for free)
   bool bootstrapped_ = false;
+  LinearTransform gather_;
 };
 
 // Per-channel affine map (inference-time batch norm): y = scale[c] * x + shift[c].

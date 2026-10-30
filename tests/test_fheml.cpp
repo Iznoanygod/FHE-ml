@@ -907,8 +907,9 @@ void self_bootstrap_tests(bool quick) {
   }
   if (gpu_backend_built()) return;
   {
-    // conv -> square -> maxpool -> dense at budget 3: the pool costs its two
-    // rounds after a bootstrap (15 levels without one).
+    // conv -> square -> maxpool -> dense at budget 3: the pool costs its gather
+    // and two rounds after a bootstrap (16 levels without one), so the dense
+    // layer needs another; the pool's gather takes the bootstrap's scale.
     const auto wc = rand_vec(18, -0.5, 0.5), bc = rand_vec(2, -0.1, 0.1), wd = rand_vec(3 * 32, -0.4, 0.4);
     auto make_cnn = [&] {
       Network m(Shape{1, 8, 8});
@@ -922,7 +923,7 @@ void self_bootstrap_tests(bool quick) {
     mref.compile();
     m.place_bootstraps(3, cal);
     m.compile();
-    check(m.layers().size() == 5 && m.depth_between_bootstraps() <= 3, "maxpool counts its rounds after a bootstrap",
+    check(m.layers().size() == 6 && m.depth_between_bootstraps() <= 3, "maxpool counts its rounds after a bootstrap",
           "(" + m.summary() + ")");
     if (quick) return;
     auto opts = m.context_options(false);
