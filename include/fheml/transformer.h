@@ -150,8 +150,35 @@ class Residual : public Layer {
   std::vector<std::shared_ptr<Layer>> body_;
 };
 
-// Self-attention with a quadratic score function (see top); `heads` heads of
-// width d / heads, as sub-blocks of each token.
+// Softmax attention scores instead of the quadratic score function (see
+// Attention::set_softmax). exp(s) is a Chebyshev series of degree
+// `exp_degree` on the score interval; the row sums are inverted with a
+// Chebyshev series of 1/x of degree `inv_degree` on the sum interval,
+// refined by `newton` steps y <- y (2 - D y) (two levels each).
+//
+// subtract_max: the maximum score of each row is found with the
+// scheme-switching comparison (FHEContext::compare, a tournament over the n
+// score ciphertexts, n - 1 comparisons) and subtracted first, the usual
+// numerically stable softmax. The exponentials then live on
+// [lo - hi, 0] and the row sums on [1, n], so no calibration of the sum is
+// needed and nothing can overflow; the price is the comparisons (minutes
+// each at 128-bit security) and about 12 + log2(n) extra levels, which puts
+// the block beyond one bootstrapping budget at ring 2^16.
+// Without it the scores must lie in [lo, hi] and the sums in
+// [sum_lo, sum_hi] (0, 0 = n e^lo .. n e^hi; calibrate for a tighter range,
+// 1/x is hard to approximate over a wide one).
+struct SoftmaxOptions {
+  double lo = -4.0, hi = 4.0;
+  uint32_t exp_degree = 15;
+  uint32_t inv_degree = 15;
+  uint32_t newton = 1;
+  bool subtract_max = false;
+  double sum_lo = 0.0, sum_hi = 0.0;
+};
+
+// Self-attention with a quadratic score function (see top) or softmax (see
+// SoftmaxOptions); `heads` heads of width d / heads, as sub-blocks of each
+// token.
 class Attention : public Layer {
  public:
   // w*: [d][d] as [out][in] (head h reads/writes rows [h*dh, (h+1)*dh) of
@@ -168,13 +195,27 @@ class Attention : public Layer {
   void compile(uint32_t slots) override;
   std::vector<double> forward_plain(const std::vector<double>& x) const override;
   Ctxt forward(const FHEContext& ctx, const Ctxt& x) const override;
-  uint32_t depth() const override { return 6; }
+  uint32_t depth() const override;
   std::vector<int32_t> rotation_indices() const override;
+  bool uses_scheme_switching() const override { return softmax_ && sm_.subtract_max; }
   void encrypt_weights(const FHEContext& ctx, bool drop_plaintext) override;
   void save(std::ostream& os) const override;
   // The cyclic copy of K and V needs 2*n*d slots.
   size_t min_slots() const override;
   int heads() const { return heads_; }
+  // Projection i (0 q, 1 k, 2 v, 3 o): weights [d][d] and bias (may be empty).
+  const std::vector<double>& weights(int i) const { return w_[i]; }
+  const std::vector<double>& bias(int i) const { return b_[i]; }
+  // Switches the scores to softmax (compile() again afterwards).
+  void set_softmax(const SoftmaxOptions& o);
+  bool softmax() const { return softmax_; }
+  const SoftmaxOptions& softmax_options() const { return sm_; }
+  // Intervals the softmax approximations use: exp on [exp_lo, exp_hi], 1/x
+  // on [sum_lo, sum_hi].
+  double exp_lo() const { return softmax_ && sm_.subtract_max ? sm_.lo - sm_.hi : sm_.lo; }
+  double exp_hi() const { return softmax_ && sm_.subtract_max ? 0.0 : sm_.hi; }
+  double sum_lo() const;
+  double sum_hi() const;
 
  private:
   int n_, d_, heads_, dh_;
@@ -184,6 +225,12 @@ class Attention : public Layer {
   std::shared_ptr<TokenDense> proj_[4];
   uint32_t slots_ = 0;
   std::vector<double> mask_c2_, mask_c1_, mask_c0_;
+  // Softmax mode.
+  bool softmax_ = false;
+  SoftmaxOptions sm_;
+  std::vector<double> exp_coeffs_, inv_coeffs_;
+  std::vector<double> mask_head_, pad_sum_;  // 1 at head slots; sum midpoint off the sub-blocks
+  double inv_plain(double x) const;
 };
 
 }  // namespace fheml

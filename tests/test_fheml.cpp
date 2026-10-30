@@ -338,6 +338,83 @@ void scheme_switching_tests(bool quick) {
   }
 }
 
+// Softmax attention: the polynomial exp / 1/x approximation against exact
+// softmax in the clear, then encrypted, with and without the
+// scheme-switching maximum subtraction.
+std::shared_ptr<Attention> softmax_attention(int n, int d, const SoftmaxOptions& o) {
+  // Small projections keep the scores q.k inside [lo, hi].
+  auto att = std::make_shared<Attention>(n, d, rand_vec(d * d, -0.25, 0.25), rand_vec(d * d, -0.25, 0.25),
+                                         rand_vec(d * d, -0.3, 0.3), rand_vec(d * d, -0.3, 0.3), rand_vec(d, -0.1, 0.1),
+                                         rand_vec(d, -0.1, 0.1), rand_vec(d, -0.1, 0.1), rand_vec(d, -0.1, 0.1),
+                                         std::vector<double>{0.0, 0.0, 1.0}, 2);
+  att->set_softmax(o);
+  return att;
+}
+
+// Exact softmax attention from the layer's own projections.
+std::vector<double> exact_softmax_attention(const Attention& att, const std::vector<double>& x, int n, int d,
+                                            double* max_score) {
+  auto proj = [&](int i, const std::vector<double>& in) {
+    Network pn(Shape{n, 1, d});
+    pn.emplace<TokenDense>(n, d, d, att.weights(i), att.bias(i));
+    return pn.forward_plain(in);
+  };
+  std::vector<double> q = proj(0, x), k = proj(1, x), v = proj(2, x);
+  const int heads = att.heads(), dh = d / heads;
+  std::vector<double> out(n * d, 0.0);
+  *max_score = 0.0;
+  for (int h = 0; h < heads; ++h)
+    for (int i = 0; i < n; ++i) {
+      std::vector<double> sc(n);
+      double m = -1e300;
+      for (int j = 0; j < n; ++j) {
+        sc[j] = 0;
+        for (int c = h * dh; c < (h + 1) * dh; ++c) sc[j] += q[i * d + c] * k[j * d + c];
+        m = std::max(m, sc[j]);
+        *max_score = std::max(*max_score, std::fabs(sc[j]));
+      }
+      double sum = 0;
+      for (double& z : sc) {
+        z = std::exp(z - m);
+        sum += z;
+      }
+      for (int j = 0; j < n; ++j)
+        for (int c = h * dh; c < (h + 1) * dh; ++c) out[i * d + c] += sc[j] / sum * v[j * d + c];
+    }
+  return proj(3, out);
+}
+
+void softmax_tests(bool quick) {
+  const int n = 4, d = 8;
+  for (int subtract_max = 0; subtract_max < 2; ++subtract_max) {
+    SoftmaxOptions o;
+    o.lo = -1.5;
+    o.hi = 1.5;
+    o.exp_degree = 15;
+    o.inv_degree = 31;
+    o.newton = subtract_max ? 1 : 2;
+    o.subtract_max = subtract_max != 0;
+    const std::string what = subtract_max ? "softmax attention, max subtracted" : "softmax attention";
+    Network net(Shape{n, 1, d});
+    auto att = softmax_attention(n, d, o);
+    net.add(att);
+    auto x = rand_vec(n * d);
+    double max_score = 0;
+    auto ref = exact_softmax_attention(*att, x, n, d, &max_score);
+    check(max_score <= 1.5, what + " scores in range", "(max |q.k| " + std::to_string(max_score) + ")");
+    check_err(what + " plain vs exact softmax", max_err(ref, net.forward_plain(x), ref.size()), 1e-4);
+    const char* path = "test_softmax_rt.fheml";
+    net.save(path);
+    Network back = Network::load(path);
+    std::remove(path);
+    check_err(what + " save/load round trip", max_err(net.forward_plain(x), back.forward_plain(x), ref.size()),
+              1e-12);
+    if (quick && subtract_max) continue;
+    if (subtract_max && gpu_backend_built()) continue;
+    check_encrypted(what, net, 1e-3);
+  }
+}
+
 void transformer_tests() {
   {
     Network n(Shape{5, 1, 6});
@@ -762,6 +839,7 @@ int main(int argc, char** argv) {
   encrypted_tests(quick);
   scheme_switching_tests(quick);
   transformer_tests();
+  softmax_tests(quick);
   std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");
   return g_failures ? 1 : 0;
 }

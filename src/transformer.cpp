@@ -1,5 +1,6 @@
 #include "fheml/transformer.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <limits>
@@ -400,6 +401,12 @@ std::string Attention::describe() const {
   std::ostringstream os;
   os << "attention n=" << n_ << " d=" << d_;
   if (heads_ > 1) os << " heads=" << heads_;
+  if (softmax_) {
+    os << " softmax exp[" << exp_lo() << ", " << exp_hi() << "] deg " << sm_.exp_degree << " 1/x[" << sum_lo() << ", "
+       << sum_hi() << "] deg " << sm_.inv_degree << " newton " << sm_.newton
+       << (sm_.subtract_max ? " max subtracted (scheme switching)" : "");
+    return os.str();
+  }
   for (int h = 0; h < heads_; ++h) {
     os << (h == 0 ? " score " : "; ") << score_[3 * h] << " + " << score_[3 * h + 1] << " s + " << score_[3 * h + 2]
        << " s^2";
@@ -446,19 +453,96 @@ void Attention::compile(uint32_t slots) {
       mask_c1_[t * stride_ + h * dh_] = score_[3 * h + 1];
       mask_c2_[t * stride_ + h * dh_] = score_[3 * h + 2];
     }
+  if (softmax_) {
+    mask_head_.assign(slots, 0.0);
+    // Slots outside the head sub-blocks hold a row sum of 0, where the 1/x
+    // series would blow up (and spoil every slot's decryption).
+    pad_sum_.assign(slots, 0.5 * (sum_lo() + sum_hi()));
+    for (int t = 0; t < n_; ++t)
+      for (int h = 0; h < heads_; ++h) {
+        mask_head_[t * stride_ + h * dh_] = 1.0;
+        for (int c = 0; c < dh_; ++c) pad_sum_[t * stride_ + h * dh_ + c] = 0.0;
+      }
+    exp_coeffs_ = lbcrypto::EvalChebyshevCoefficients([](double x) { return std::exp(x); }, exp_lo(), exp_hi(),
+                                                      sm_.exp_degree);
+    inv_coeffs_ = lbcrypto::EvalChebyshevCoefficients([](double x) { return 1.0 / x; }, sum_lo(), sum_hi(),
+                                                      sm_.inv_degree);
+  }
+}
+
+void Attention::set_softmax(const SoftmaxOptions& o) {
+  if (!(o.lo < o.hi)) throw std::invalid_argument("attention softmax: need lo < hi");
+  if (o.exp_degree < 1 || o.inv_degree < 1) throw std::invalid_argument("attention softmax: degrees must be >= 1");
+  if ((o.sum_lo != 0.0 || o.sum_hi != 0.0) && !(0.0 < o.sum_lo && o.sum_lo < o.sum_hi))
+    throw std::invalid_argument("attention softmax: need 0 < sum_lo < sum_hi");
+  softmax_ = true;
+  sm_ = o;
+}
+
+double Attention::sum_lo() const {
+  if (sm_.sum_lo != 0.0) return sm_.sum_lo;
+  return sm_.subtract_max ? 1.0 : n_ * std::exp(sm_.lo);
+}
+
+double Attention::sum_hi() const {
+  if (sm_.sum_hi != 0.0) return sm_.sum_hi;
+  return sm_.subtract_max ? static_cast<double>(n_) : n_ * std::exp(sm_.hi);
+}
+
+double Attention::inv_plain(double x) const {
+  double y = lbcrypto::EvalChebyshevFunctionPtxt([](double u) { return 1.0 / u; }, {x}, sum_lo(), sum_hi(),
+                                                 sm_.inv_degree)[0];
+  for (uint32_t i = 0; i < sm_.newton; ++i) y = y * (2.0 - x * y);
+  return y;
+}
+
+// Polynomial score: 6 levels. Softmax: projections and q.k (2), exp series
+// (+1 for its interval), the head mask, a.v, the 1/x series (+1) and its
+// Newton steps, o / sum, W_o. With the maximum subtracted, the subtraction
+// happens at the level of the comparison results (compare_depth() plus one
+// per tournament round), whatever the input level.
+uint32_t Attention::depth() const {
+  if (!softmax_) return 6;
+  uint32_t start = 2;
+  if (sm_.subtract_max) {
+    uint32_t rounds = 0;
+    for (int m = n_; m > 1; m = (m + 1) / 2) ++rounds;
+    start = std::max(start, FHEContext::compare_depth() + rounds);
+  }
+  return start + poly_depth(sm_.exp_degree) + 1 + 1 + 1 + poly_depth(sm_.inv_degree) + 1 + 2 * sm_.newton + 1 + 1;
 }
 
 std::vector<double> Attention::forward_plain(const std::vector<double>& x) const {
   std::vector<double> q = proj_[0]->forward_plain(x), k = proj_[1]->forward_plain(x), v = proj_[2]->forward_plain(x);
   std::vector<double> out(static_cast<size_t>(n_) * d_, 0.0);
   for (int h = 0; h < heads_; ++h)
-    for (int i = 0; i < n_; ++i)
+    for (int i = 0; i < n_; ++i) {
+      std::vector<double> sc(n_);
       for (int j = 0; j < n_; ++j) {
         double s = 0.0;
         for (int c = h * dh_; c < (h + 1) * dh_; ++c) s += q[i * d_ + c] * k[j * d_ + c];
-        double a = score_[3 * h] + score_[3 * h + 1] * s + score_[3 * h + 2] * s * s;
-        for (int c = h * dh_; c < (h + 1) * dh_; ++c) out[i * d_ + c] += a * v[j * d_ + c];
+        sc[j] = s;
       }
+      std::vector<double> a(n_);
+      double inv = 1.0;
+      if (softmax_) {
+        // The same approximations the encrypted path evaluates.
+        if (sm_.subtract_max) {
+          double m = *std::max_element(sc.begin(), sc.end());
+          for (double& x : sc) x -= m;
+        }
+        a = lbcrypto::EvalChebyshevFunctionPtxt([](double x) { return std::exp(x); }, sc, exp_lo(), exp_hi(),
+                                                sm_.exp_degree);
+        double sum = 0.0;
+        for (double e : a) sum += e;
+        inv = inv_plain(sum);
+      } else {
+        for (int j = 0; j < n_; ++j)
+          a[j] = score_[3 * h] + score_[3 * h + 1] * sc[j] + score_[3 * h + 2] * sc[j] * sc[j];
+      }
+      for (int j = 0; j < n_; ++j)
+        for (int c = h * dh_; c < (h + 1) * dh_; ++c) out[i * d_ + c] += a[j] * v[j * d_ + c] * inv;
+    }
   return proj_[3]->forward_plain(out);
 }
 
@@ -480,32 +564,76 @@ Ctxt Attention::forward(const FHEContext& ctx, const Ctxt& x) const {
   const std::vector<Ctxt> kr = backend::rotate_hoisted(cc, k, offs, ctx.parallel());
   const std::vector<Ctxt> vr = backend::rotate_hoisted(cc, v, offs, ctx.parallel());
 
-  std::vector<Ctxt> partial(n_);
+  // score[i][h] = q_i . k_{i+s} over head h, accumulated into slot
+  // i*B + h*dh by summing a dh-wide window (slots i*B+d .. i*B+B-1 are
+  // zero, so the last head's window never reads the next token).
+  std::vector<Ctxt> p(n_);
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
   for (int s = 0; s < n_; ++s) {
-    const Ctxt& ks = kr[s];
-    const Ctxt& vs = vr[s];
-    // score[i][h] = q_i . k_{i+s} over head h, accumulated into slot
-    // i*B + h*dh by summing a dh-wide window (slots i*B+d .. i*B+B-1 are
-    // zero, so the last head's window never reads the next token).
-    Ctxt p = cc->EvalMult(q, ks);
-    for (int t = 1; t < dh_; t *= 2) cc->EvalAddInPlace(p, rot(p, t));
-    // a = mask * (c2 p^2 + c1 p + c0): 2 levels, zero outside slots i*B+h*dh.
-    const uint32_t lvl = p->GetLevel() + (p->GetNoiseScaleDeg() > 1 ? 1 : 0);
-    Ptxt c2 = ctx.encode(mask_c2_, lvl);
-    Ctxt a = cc->EvalMult(p, c2);
-    Ptxt c1 = ctx.encode(mask_c1_, a->GetLevel(), a->GetNoiseScaleDeg());
-    cc->EvalAddInPlace(a, c1);
-    a = cc->EvalMult(p, a);
-    Ptxt c0 = ctx.encode(mask_c0_, a->GetLevel(), a->GetNoiseScaleDeg());
-    cc->EvalAddInPlace(a, c0);
+    p[s] = cc->EvalMult(q, kr[s]);
+    for (int t = 1; t < dh_; t *= 2) cc->EvalAddInPlace(p[s], rot(p[s], t));
+  }
+  if (softmax_ && sm_.subtract_max) {
+    // Row maximum over the n offsets: a tournament of scheme-switching
+    // comparisons, max(a, b) = a + [a < b] (b - a). Scores (and the window
+    // partial sums in the other slots) must stay within the compare range.
+    const double range = 2.0 * std::max(std::fabs(sm_.lo), std::fabs(sm_.hi));
+    std::vector<Ctxt> vals = p;
+    while (vals.size() > 1) {
+      std::vector<Ctxt> next((vals.size() + 1) / 2);
+      for (size_t i = 0; i + 1 < vals.size(); i += 2) {
+        Ctxt sel = ctx.compare(vals[i], vals[i + 1], range);
+        next[i / 2] = cc->EvalAdd(vals[i], cc->EvalMult(sel, cc->EvalSub(vals[i + 1], vals[i])));
+      }
+      if (vals.size() % 2) next.back() = vals.back();
+      vals.swap(next);
+    }
+    for (int s = 0; s < n_; ++s) p[s] = cc->EvalSub(p[s], vals[0]);
+  }
+
+  std::vector<Ctxt> partial(n_), weights(n_);
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+  for (int s = 0; s < n_; ++s) {
+    Ctxt a;
+    if (softmax_) {
+      // a = mask * exp(p): the series everywhere, then the head slots kept.
+      std::vector<double> c = exp_coeffs_;
+      Ctxt e = cc->EvalChebyshevSeries(p[s], c, exp_lo(), exp_hi());
+      const uint32_t lvl = e->GetLevel() + (e->GetNoiseScaleDeg() > 1 ? 1 : 0);
+      a = cc->EvalMult(e, ctx.encode(mask_head_, lvl));
+    } else {
+      // a = mask * (c2 p^2 + c1 p + c0): 2 levels, zero outside slots i*B+h*dh.
+      const uint32_t lvl = p[s]->GetLevel() + (p[s]->GetNoiseScaleDeg() > 1 ? 1 : 0);
+      Ptxt c2 = ctx.encode(mask_c2_, lvl);
+      a = cc->EvalMult(p[s], c2);
+      Ptxt c1 = ctx.encode(mask_c1_, a->GetLevel(), a->GetNoiseScaleDeg());
+      cc->EvalAddInPlace(a, c1);
+      a = cc->EvalMult(p[s], a);
+      Ptxt c0 = ctx.encode(mask_c0_, a->GetLevel(), a->GetNoiseScaleDeg());
+      cc->EvalAddInPlace(a, c0);
+    }
     // Broadcast a[i*B+h*dh] over head h's sub-block (the dh-wide window
     // behind each slot holds at most one head slot), then weight v_{i+s}.
     for (int t = 1; t < dh_; t *= 2) cc->EvalAddInPlace(a, rot(a, -t));
-    partial[s] = cc->EvalMult(a, vs);
+    partial[s] = cc->EvalMult(a, vr[s]);
+    weights[s] = a;
   }
   Ctxt o = partial[0];
   for (int s = 1; s < n_; ++s) cc->EvalAddInPlace(o, partial[s]);
+  if (softmax_) {
+    // Divide by the row sums: 1/x series plus Newton steps y <- y (2 - D y).
+    Ctxt sum = weights[0];
+    for (int s = 1; s < n_; ++s) cc->EvalAddInPlace(sum, weights[s]);
+    Ptxt pad = ctx.encode(pad_sum_, sum->GetLevel(), sum->GetNoiseScaleDeg());
+    cc->EvalAddInPlace(sum, pad);
+    std::vector<double> c = inv_coeffs_;
+    Ctxt y = cc->EvalChebyshevSeries(sum, c, sum_lo(), sum_hi());
+    for (uint32_t i = 0; i < sm_.newton; ++i) {
+      Ctxt t = cc->EvalSub(2.0, cc->EvalMult(sum, y));
+      y = cc->EvalMult(y, t);
+    }
+    o = cc->EvalMult(o, y);
+  }
   return proj_[3]->forward(ctx, o);
 }
 
@@ -530,6 +658,10 @@ void Attention::save(std::ostream& os) const {
   bool has_bias = !b_[0].empty();
   os << "attention " << n_ << " " << d_ << " " << (has_bias ? 1 : 0);
   if (heads_ > 1) os << " heads " << heads_;
+  if (softmax_)
+    os << std::setprecision(std::numeric_limits<double>::max_digits10) << " softmax " << sm_.lo << " " << sm_.hi << " "
+       << sm_.exp_degree << " " << sm_.inv_degree << " " << sm_.newton << " " << (sm_.subtract_max ? 1 : 0) << " "
+       << sm_.sum_lo << " " << sm_.sum_hi;
   os << "\n";
   for (int i = 0; i < 4; ++i) write_vec(os, w_[i]);
   if (has_bias)

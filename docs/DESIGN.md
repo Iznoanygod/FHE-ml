@@ -128,16 +128,53 @@ with 3H score coefficients; single-head files are unchanged.
 
 ### Softmax and normalisation
 
-- Softmax is replaced by the fixed quadratic `A = (S+2)²/(8n)`. It is
-  non-negative, with a public normaliser 1/n, as in PowerSoftmax and
-  Powerformer's plaintext normaliser. 1/√d is learned into W_q.
-- LayerNorm is omitted. The toy model trains fine without it.
+- By default softmax is replaced by the fixed quadratic `A = (S+2)²/(8n)`.
+  It is non-negative, with a public normaliser 1/n, as in PowerSoftmax and
+  Powerformer's plaintext normaliser. 1/√d is learned into W_q. The example
+  models use this (depth 6 per attention block).
+- `Attention::set_softmax(SoftmaxOptions)` gives real softmax scores:
+  `exp` is a Chebyshev series on the score interval `[lo, hi]`, evaluated on
+  each per-offset score ciphertext; the row sum `D = Σ_s a_s` is free (the
+  broadcast weights are added) and inverted with a Chebyshev series of 1/x
+  on `[sum_lo, sum_hi]` plus Newton steps `y ← y (2 − D y)` (two levels
+  each); the attention output is multiplied by the inverse once. Slots
+  outside the head sub-blocks see a sum of 0, so a plaintext fills them with
+  a value inside the interval before the series (a Chebyshev series evaluated
+  far outside its interval is astronomically large and spoils the
+  decryption of every slot). Depth 7 + poly_depth(exp) + poly_depth(1/x)
+  + 2·newton: 17 with degree 15, 15, one step; 23 with a degree-31 1/x and
+  two steps. The plaintext reference evaluates the same approximations.
+- `subtract_max` is the numerically stable softmax: the row maximum is
+  found with a tournament of scheme-switching comparisons over the n score
+  ciphertexts (`FHEContext::compare`, n − 1 comparisons) and subtracted
+  before the exponential. Then the exponentials live on `[lo − hi, 0]` and
+  the sums on `[1, n]`, so no calibration of the sum is needed and nothing
+  can overflow. The comparison results arrive at 12 levels whatever the
+  input level, so the block costs about 12 + log2(n) + 17 levels (33 for
+  the test's n = 4) and needs a deeper ring or a bootstrap it cannot place
+  itself; and each comparison is a FHEW bootstrap per slot (minutes at
+  128-bit security). It is the exact method; the calibrated-range softmax
+  is the practical one.
+- `LayerNorm` normalises each token over its d features: the mean and
+  E[x²] are token-block sums (log2(d) rotations, one masked product by 1/d,
+  log2(d) rotations to broadcast), the variance is E[x²] − mean², and
+  1/√(var + ε) is a Chebyshev series on a calibrated variance interval
+  refined by Newton steps `r ← 1.5 r − 0.5 v r³`. The 1.5 is folded into the
+  series scale and the 0.5 rides on the variance, so a step costs two
+  levels and no scalar products. Degree 15 with one step is exact to ~1e-9
+  when var_max / var_min ≤ 10; degree 31 covers a 100× range. Depth
+  2 + poly_depth(degree) + 1 + 2·newton + 1 (10 for degree 15, 12 for
+  degree 31). The layer absorbs an input scale (eps and the interval scale
+  by c²) and emits an output scale (gamma, beta), so `place_bootstraps`
+  folds through it. Padding slots get a variance inside the interval for the
+  same reason as above.
 
 ### Next steps
 
-- Normalised power attention, using a Chebyshev 1/x on the rotation-free sum
-  of the per-offset score ciphertexts.
-- LayerNorm via a Chebyshev 1/√x on a training-calibrated range.
+- Bootstrapping inside the max-subtracted softmax block.
+- Training with LayerNorm and softmax (no backward yet; `fheml.nn` has no
+  torch twins of them, so the exporter still rejects `nn.LayerNorm` and
+  `nn.Softmax`).
 - Bootstrapping between blocks for deeper models.
 
 ## Encrypted weights
@@ -360,6 +397,9 @@ All of the following are tested under encryption:
 - Dense layers, average pooling and channel affine layers.
 - Exact max pooling through CKKS ↔ FHEW scheme switching (TOY FHEW
   parameters in the tests; the STD128 numbers are in the README).
+- LayerNorm (compact and padded token strides, inside a pre-norm residual
+  block) and softmax attention, with and without the scheme-switching
+  maximum subtraction.
 - Fused linear layers.
 - The square, polynomial and Chebyshev activations.
 - Bootstrapping in the middle of a network, placed by hand or by

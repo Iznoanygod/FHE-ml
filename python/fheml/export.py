@@ -167,10 +167,12 @@ class _Exporter:
         if isinstance(m, nn.MaxPool2d):
             raise ValueError("nn.MaxPool2d is not exported: fheml.MaxPool2d (exact, via CKKS<->FHEW scheme "
                              "switching) costs 15+ levels, add it to the fheml network by hand or use nn.AvgPool2d")
-        if isinstance(m, (nn.LayerNorm, nn.Softmax, nn.MultiheadAttention)):
-            hint = " (fheml.nn.Attention(dim, tokens, heads=h) is the polynomial multi-head form)" \
-                if isinstance(m, nn.MultiheadAttention) else ""
-            raise ValueError(f"nn.{name} is not supported under encryption (see docs/DESIGN.md#transformers){hint}")
+        if isinstance(m, (nn.LayerNorm, nn.Softmax)):
+            raise ValueError(f"nn.{name} is not exported: fheml.LayerNorm / fheml.SoftmaxOptions (polynomial, with "
+                             "intervals to calibrate) exist in the library, add them to the fheml network by hand")
+        if isinstance(m, nn.MultiheadAttention):
+            raise ValueError(f"nn.{name} is not supported under encryption (see docs/DESIGN.md#transformers)"
+                             " (fheml.nn.Attention(dim, tokens, heads=h) is the polynomial multi-head form)")
         raise ValueError(f"unsupported module {name}: build the model from nn.Sequential, the supported "
                          "torch.nn layers and fheml.nn modules")
 

@@ -110,12 +110,27 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
       is.seekg(pos);
     }
     if (heads < 1) throw std::runtime_error("model file: bad attention head count");
+    // Optional "softmax LO HI EXP_DEG INV_DEG NEWTON SUBTRACT_MAX SUM_LO SUM_HI".
+    bool softmax = false;
+    SoftmaxOptions sm;
+    pos = is.tellg();
+    if (is >> next && next == "softmax") {
+      int subtract_max;
+      is >> sm.lo >> sm.hi >> sm.exp_degree >> sm.inv_degree >> sm.newton >> subtract_max >> sm.sum_lo >> sm.sum_hi;
+      sm.subtract_max = subtract_max != 0;
+      softmax = true;
+    } else {
+      is.clear();
+      is.seekg(pos);
+    }
     std::vector<double> w[4], b[4];
     for (auto& wi : w) wi = read_vec(is, static_cast<size_t>(d) * d, "attention weights");
     if (hb)
       for (auto& bi : b) bi = read_vec(is, d, "attention bias");
     auto score = read_vec(is, 3u * heads, "attention score polynomial");
-    layer = std::make_shared<Attention>(n, d, w[0], w[1], w[2], w[3], b[0], b[1], b[2], b[3], score, heads);
+    auto att = std::make_shared<Attention>(n, d, w[0], w[1], w[2], w[3], b[0], b[1], b[2], b[3], score, heads);
+    if (softmax) att->set_softmax(sm);
+    layer = att;
   } else if (tok == "layernorm") {
     int n, d;
     double eps, vmin, vmax;

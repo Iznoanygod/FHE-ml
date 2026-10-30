@@ -122,13 +122,27 @@ PYBIND11_MODULE(_fheml, m) {
            "Per-token layer norm; 1/sqrt(var + eps) is a degree-`degree` Chebyshev series on "
            "[var_min, var_max] refined by `newton` Newton steps.")
       .def("inv_sqrt", &LayerNorm::inv_sqrt, py::arg("var"));
+  py::class_<SoftmaxOptions>(m, "SoftmaxOptions")
+      .def(py::init<>())
+      .def_readwrite("lo", &SoftmaxOptions::lo)
+      .def_readwrite("hi", &SoftmaxOptions::hi)
+      .def_readwrite("exp_degree", &SoftmaxOptions::exp_degree)
+      .def_readwrite("inv_degree", &SoftmaxOptions::inv_degree)
+      .def_readwrite("newton", &SoftmaxOptions::newton)
+      .def_readwrite("subtract_max", &SoftmaxOptions::subtract_max)
+      .def_readwrite("sum_lo", &SoftmaxOptions::sum_lo)
+      .def_readwrite("sum_hi", &SoftmaxOptions::sum_hi);
   py::class_<Attention, Layer, std::shared_ptr<Attention>>(m, "Attention")
       .def(py::init<int, int, Vec, Vec, Vec, Vec, Vec, Vec, Vec, Vec, Vec, int>(), py::arg("tokens"), py::arg("dim"),
            py::arg("wq"), py::arg("wk"), py::arg("wv"), py::arg("wo"), py::arg("bq") = Vec{}, py::arg("bk") = Vec{},
            py::arg("bv") = Vec{}, py::arg("bo") = Vec{}, py::arg("score") = Vec{0.0, 0.0, 1.0}, py::arg("heads") = 1,
            "Self-attention with `heads` heads of width dim/heads; score is (c0, c1, c2) shared by all heads "
            "or 3*heads values, one polynomial per head.")
-      .def_property_readonly("heads", &Attention::heads);
+      .def_property_readonly("heads", &Attention::heads)
+      .def("set_softmax", &Attention::set_softmax, py::arg("options"),
+           "Softmax scores (polynomial exp and 1/x, optionally with the row maximum subtracted through "
+           "scheme switching) instead of the quadratic score function; compile the network again afterwards.")
+      .def_property_readonly("softmax", &Attention::softmax);
 
   py::class_<Network>(m, "Network")
       .def(py::init<Shape>(), py::arg("input_shape"))

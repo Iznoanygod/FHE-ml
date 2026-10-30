@@ -30,9 +30,13 @@ That code is kept in [`legacy/`](legacy/) for reference.
 * **Small transformers.**
   * `TokenDense` is a per-token linear layer.
   * `Attention` is fully homomorphic self-attention: ct×ct QKᵀ and AV, with
-    a trainable quadratic in place of softmax. `heads=H` gives multi-head
+    a trainable quadratic in place of softmax, or real softmax
+    (`set_softmax`: polynomial exp and 1/x, optionally with the row maximum
+    subtracted through scheme switching). `heads=H` gives multi-head
     attention with the heads as sub-blocks of each token, which costs fewer
     rotations than one wide head and no extra levels.
+  * `LayerNorm` normalises each token with a Chebyshev + Newton inverse
+    square root on a calibrated variance interval (10–12 levels).
   * `Residual` and `TokenMean` complete the block.
   * See [docs/DESIGN.md](docs/DESIGN.md#transformers).
 * **A Python package**, `import fheml`, wraps the same API with numpy in and
@@ -242,8 +246,11 @@ logits = fheml.infer(net, ctx, image)        # image: (1, 28, 28) numpy array
 | `hnn.Attention(dim, tokens, heads=H)`, `hnn.Residual`, `hnn.TokenMean`, `hnn.PosEmbedding` | `attention` (single or multi-head), `residual`, `tokenmean`, per-token bias |
 | `hnn.Bootstrap` | `bootstrap` |
 
-`nn.ReLU`, softmax and LayerNorm have no exact encrypted form and are
-rejected with a message naming the replacement. `nn.MaxPool2d` is rejected
+`nn.ReLU` has no exact encrypted form and is rejected with a message naming
+the replacement. `nn.LayerNorm` and `nn.Softmax` are rejected too: the
+library has `LayerNorm` and softmax attention (see below), but their
+Chebyshev intervals need calibrating and `fheml.nn` has no torch twins of
+them yet. `nn.MaxPool2d` is rejected
 too for now: the library has an exact `MaxPool2d` layer (see below), but at
 15+ levels and a FHEW bootstrap per slot and comparison it is not something
 an exporter should insert silently. `hnn.Chebyshev`
@@ -314,6 +321,32 @@ which the next linear layer ignores. `place_bootstraps` cannot fold a scale
 through the layer yet and inserts a `scale` layer when it has to; the trainer
 has no backward for it; the FIDESlib (GPU) backend does not support scheme
 switching.
+
+## LayerNorm and softmax
+
+Both are polynomial, with intervals to calibrate like a Chebyshev
+activation's (see `docs/DESIGN.md#softmax-and-normalisation`):
+
+```cpp
+net.emplace<LayerNorm>(n, d, gamma, beta, /*eps=*/1e-5, /*var_min=*/0.05, /*var_max=*/1.2,
+                       /*degree=*/31, /*newton=*/1);          // 12 levels
+SoftmaxOptions sm;                                            // scores q.k in [lo, hi]
+sm.lo = -2; sm.hi = 2; sm.exp_degree = 15; sm.inv_degree = 31; sm.newton = 2;
+attention->set_softmax(sm);                                   // 23 levels instead of 6
+sm.subtract_max = true;                                       // exact row max via scheme switching: 33 levels for n = 4
+```
+
+`LayerNorm` computes the token mean and variance with rotations and inverts
+`sqrt(var + eps)` with a Chebyshev series refined by Newton steps (two
+levels each). Softmax attention evaluates a Chebyshev `exp` on every score
+ciphertext and divides by the row sum with a Chebyshev `1/x` plus Newton
+steps. With `subtract_max` the row maximum is first found with a tournament
+of the scheme-switching comparisons above and subtracted, so the
+exponentials are bounded by 1 and the sums lie in `[1, n]` with nothing to
+calibrate; it costs n − 1 comparisons (each a FHEW bootstrap per slot) and
+about 12 + log2(n) extra levels, which is beyond one bootstrapping budget at
+ring 2^16. Neither is used by the example models, the trainer or the
+PyTorch exporter yet.
 
 ## Encrypted training
 
