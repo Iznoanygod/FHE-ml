@@ -74,16 +74,23 @@ def deepcnn(exact_relu=False):
         nn.Linear(32, 10))
 
 
-def poolcnn():
-    # conv (stride 2, compact 4x7x7 output = 196 slots) -> exact 2x2 max pool
-    # -> square-ish polynomial -> dense head. Max pooling costs 15 levels
-    # here (12 for the FHEW-to-CKKS decoding of each comparison), 22 in all:
-    # it fits ring 2^16 without bootstrapping. The pool's inputs must stay in
-    # [-POOL_RANGE, POOL_RANGE] (the comparison wraps around beyond it).
+def poolcnn(channels=8, stride=2):
+    # conv -> exact 2x2 max pool -> square-ish polynomial -> dense head. The
+    # pool gathers its four taps into blocks of M slots (M = the pooled size
+    # rounded up to a power of two) and compares 2M then M slots, one FHEW
+    # bootstrap each: with the default 8 channels at stride 2 (8x7x7 ->
+    # 8x3x3, M = 128) that is 384, and the network fits 512 slots;
+    # poolcnn-s1 (4 channels at stride 1, 4x14x14 -> 4x7x7, M = 256) is more
+    # accurate but needs 1024 slots, whose 128-bit scheme-switching keys do
+    # not fit in 14 GB. The pool costs 15 levels (12 for the FHEW-to-CKKS
+    # decoding of each comparison), 22 in all: it fits ring 2^16 without
+    # bootstrapping. The pool's inputs must stay in [-POOL_RANGE, POOL_RANGE]
+    # (the comparison wraps around beyond it).
+    side = 14 // stride // 2
     return nn.Sequential(
-        nn.Conv2d(1, 4, 3, stride=2, padding=1), nn.BatchNorm2d(4), hnn.MaxPool2d(2, 2, range=POOL_RANGE),
-        hnn.Poly([0, 0.5, 0.25]),
-        nn.Flatten(), nn.Linear(36, 32), nn.BatchNorm1d(32), hnn.Poly([0, 0.5, 0.25]),
+        nn.Conv2d(1, channels, 3, stride=stride, padding=1), nn.BatchNorm2d(channels),
+        hnn.MaxPool2d(2, 2, range=POOL_RANGE), hnn.Poly([0, 0.5, 0.25]),
+        nn.Flatten(), nn.Linear(channels * side * side, 32), nn.BatchNorm1d(32), hnn.Poly([0, 0.5, 0.25]),
         nn.Linear(32, 10))
 
 
@@ -169,7 +176,7 @@ def patchify14(x):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arch", choices=("cnn", "vit", "deepcnn", "poolcnn", "lnvit", "lnvit16"), default="cnn")
+    ap.add_argument("--arch", choices=("cnn", "vit", "deepcnn", "poolcnn", "poolcnn-s1", "lnvit", "lnvit16"), default="cnn")
     ap.add_argument("--profile", action="store_true", help="print each layer's time for the first encrypted image")
     ap.add_argument("--json", help="append the run's numbers to this JSON-lines file")
     ap.add_argument("--bootstrap", action="store_true",
@@ -195,7 +202,7 @@ def main():
 
     torch.manual_seed(0)
     data = load_mnist(args.data)
-    prep = {"cnn": lambda x: x, "vit": patchify, "deepcnn": pool2, "poolcnn": pool2, "lnvit": patchify14,
+    prep = {"cnn": lambda x: x, "vit": patchify, "deepcnn": pool2, "poolcnn": pool2, "poolcnn-s1": pool2, "lnvit": patchify14,
             "lnvit16": patchify}[args.arch]
     xtr, ytr = torch.tensor(prep(data["train_x"]), dtype=torch.float32), torch.tensor(data["train_y"]).long()
     xte, yte = torch.tensor(prep(data["test_x"]), dtype=torch.float32), torch.tensor(data["test_y"]).long()
@@ -203,8 +210,9 @@ def main():
     if args.exact_relu and args.arch != "deepcnn":
         ap.error("--exact-relu is for --arch deepcnn")
     model = {"cnn": cnn, "vit": vit, "deepcnn": lambda: deepcnn(bool(args.exact_relu)), "poolcnn": poolcnn,
-             "lnvit": lambda: lnvit(4), "lnvit16": lambda: lnvit(16)}[args.arch]()
-    epochs = args.epochs or {"cnn": 3, "vit": 15, "deepcnn": 4, "poolcnn": 4, "lnvit": 10, "lnvit16": 10}[args.arch]
+             "poolcnn-s1": lambda: poolcnn(4, 1), "lnvit": lambda: lnvit(4), "lnvit16": lambda: lnvit(16)}[args.arch]()
+    epochs = args.epochs or {"cnn": 3, "vit": 15, "deepcnn": 4, "poolcnn": 4, "poolcnn-s1": 4, "lnvit": 10,
+                             "lnvit16": 10}[args.arch]
     opt = torch.optim.Adam(model.parameters(), 2e-3)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, 2e-3, total_steps=epochs * ((len(xtr) + 127) // 128))
     t0 = time.time()
@@ -223,7 +231,7 @@ def main():
         print(f"epoch {epoch + 1}: test accuracy {acc:.1%} ({time.time() - t:.0f}s)")
 
     train_time = time.time() - t0
-    shape = {"cnn": (1, 28, 28), "vit": (N_TOK, PATCH), "deepcnn": (1, 14, 14), "poolcnn": (1, 14, 14),
+    shape = {"cnn": (1, 28, 28), "vit": (N_TOK, PATCH), "deepcnn": (1, 14, 14), "poolcnn": (1, 14, 14), "poolcnn-s1": (1, 14, 14),
              "lnvit": (4, PATCH), "lnvit16": (N_TOK, PATCH)}[args.arch]
     if args.arch.startswith("lnvit"):
         check_softmax_ranges(model, xte[:2000])
@@ -233,7 +241,7 @@ def main():
         print("wrote", args.out)
     if args.arch in ("vit", "lnvit", "lnvit16"):
         net.fuse_linear()  # token mean + head -> one matrix, saves a level
-    if args.arch == "poolcnn":
+    if args.arch.startswith("poolcnn"):
         net.compile()
         check_ranges(net, xtr[:args.calibration].double().numpy())
     # Accuracy of the network as encrypted inference computes it (the same
@@ -241,11 +249,14 @@ def main():
     n_plain = min(len(xte), 2000)
     xp = xte[:n_plain].double().numpy()
     plain_acc = float(np.mean([fheml.plain(net, xp[i]).argmax() == int(yte[i]) for i in range(n_plain)]))
-    print(f"fheml plaintext accuracy {plain_acc:.1%} on {n_plain} test images (torch: {acc:.1%} on all)")
+    with torch.no_grad():
+        torch_head = (model(xte[:n_plain]).argmax(1) == yte[:n_plain]).float().mean().item()
+    print(f"fheml plaintext accuracy {plain_acc:.1%} on {n_plain} test images (torch: {torch_head:.1%} on them, "
+          f"{acc:.1%} on all)")
     level_budget = [3, 3]
     if args.packing:
         net.packing = args.packing
-    elif args.arch in ("deepcnn", "poolcnn"):
+    elif args.arch in ("deepcnn", "poolcnn", "poolcnn-s1"):
         # Compact activations: fewer slots, so fewer bootstrapping keys, and
         # max pooling compares only the slots up to its last input.
         net.set_gapped_layouts(False)
@@ -296,7 +307,7 @@ def main():
         import json
         import resource
         rec = dict(arch=args.arch, secure=not args.insecure, bootstrap=args.bootstrap, torch_accuracy=acc,
-                   plain_accuracy=plain_acc, plain_images=n_plain, train_seconds=train_time, depth=net.depth,
+                   plain_accuracy=plain_acc, torch_accuracy_plain_images=torch_head, plain_images=n_plain, train_seconds=train_time, depth=net.depth,
                    uses_bootstrapping=net.uses_bootstrapping, internal_bootstraps=net.internal_bootstraps,
                    bootstrap_layers=sum(1 for layer in net.layers if layer.type == "bootstrap"),
                    context=ctx.describe(), setup_seconds=setup, image_seconds=times, max_abs_err=errs,

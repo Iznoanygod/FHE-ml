@@ -260,11 +260,10 @@ rejected with a message naming the replacement (`hnn.LayerNorm`,
 `hnn.Attention(softmax=...)`). `nn.ReLU` is rejected too unless
 `from_torch(..., exact_relu=RANGE)` is given: it then becomes the exact
 scheme-switching `ExactReLU` (see below; `hnn.Chebyshev("relu", ...)` modules
-too); otherwise use `hnn.Chebyshev`. A plain `nn.MaxPool2d` is
-rejected too because the encrypted comparison needs an input bound:
-`hnn.MaxPool2d(k, stride, range=R)` is the same torch layer with that bound
-and exports to the exact `MaxPool2d` (see below), at 15+ levels and a FHEW
-bootstrap per slot and comparison. `hnn.Chebyshev`, `hnn.LayerNorm` and the
+too); otherwise use `hnn.Chebyshev`. Max pooling is exact (`maxpool2d`, see
+below) but needs the range its inputs stay in: `hnn.MaxPool2d(k, stride,
+range=R)` is torch's layer with that bound, or a plain `nn.MaxPool2d`
+exports with `from_torch(..., maxpool_range=R)`. `hnn.Chebyshev`, `hnn.LayerNorm` and the
 softmax of `hnn.Attention` evaluate the same polynomial approximations in
 torch that run encrypted, so training sees what inference computes (and
 pushes the model to keep its variances and scores inside the intervals). For token inputs the exporter pads
@@ -287,11 +286,16 @@ PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch vit 
 
 Max pooling is exact, not approximated: `MaxPool2d(k, stride, range)` compares
 window entries through OpenFHE's CKKS ↔ FHEW scheme switching
-(`cc->Enable(SCHEMESWITCH)`, `EvalCompareSchemeSwitching`). Each tap of the
-window is rotated onto the window's top-left slot, then the taps are reduced
-in a tournament: `max(a, b) = a + [a < b] (b - a)`, where `[a < b]` is
-computed by switching `a - b` to FHEW, evaluating the sign there with one
-FHEW bootstrap per slot and switching back. The layer needs a context built
+(`cc->Enable(SCHEMESWITCH)`, `EvalCompareSchemeSwitching`). A gather
+transform puts tap j of every window into block j of `M` slots (`M` = the
+output size rounded up to a power of two, the k² taps padded to a power of
+two), then the blocks are reduced in a tournament: each round compares the
+lower half of the blocks with the upper half rotated onto it,
+`max(a, b) = a + [a < b] (b - a)`, where `[a < b]` is computed by switching
+`a - b` to FHEW, evaluating the sign there with one FHEW bootstrap per slot
+and switching back. Only slots that hold a window go through FHEW
+(2·M + M for a 2×2 pool, 4× fewer than comparing the whole input span) and
+the output is compact. The layer needs a context built
 with `ContextOptions::scheme_switching` (`Network::context_options()` sets it
 when the network contains one); `keygen()` then also generates the FHEW
 context, its bootstrapping keys and the switching keys. `fheml.MaxPool2d`
@@ -305,34 +309,34 @@ FHEContext ctx(net.context_options(/*secure=*/true));
 ctx.keygen(net.rotation_indices());
 ```
 
-What it costs (measured, OpenFHE 1.4.2, 4 cores):
+What one comparison costs (measured, OpenFHE 1.4.2, 4 cores; the count
+of compared slots is rounded up to a power of two):
 
 | | TOY FHEW, ring 2048, 16 slots | STD128 FHEW, ring 2^16, 256 slots |
 |---|---|---|
 | key generation | 2 s | 99 s |
-| one comparison (all slots) | 1.8 s | 470–600 s |
+| one comparison | 1.8 s | 470–600 s |
 | peak memory | < 1 GB | 11.4 GB |
 | error of the max | ~1e-6 | ~2e-3 |
 
-A `k × k` pool runs `k² − 1` comparisons. Each comparison result is a fresh
-CKKS ciphertext at `FHEContext::compare_depth()` = 12 levels whatever the
-inputs' levels, so the pool output sits at `12 + ceil(log2 k²)` levels and the
-layer reserves one more (a comparison needs its inputs two levels above the
-bottom of the chain): a 2×2 pool is a 15-level layer, a 3×3 pool 17. With
-bootstrapping budgets of 20–26 levels at ring 2^16 it takes about one
-bootstrap per pool, which is why the example models do not use it.
-`hnn.MaxPool2d` exports it from PyTorch, and `Trainer` backpropagates through
-it with the forward's comparison bits (see [Encrypted training](#encrypted-training)). The comparison resolves differences down to about
-`4·range / 2^(fhew_log_q − 1)`; a smaller difference is decided either way,
-which moves the maximum by at most that much. Values outside `[-range, range]`
-wrap around in the FHEW plaintext space and compare wrongly, so calibrate
-`range` like a Chebyshev interval.
+A `k × k` pool runs `ceil(log2 k²)` rounds. Each comparison result is a
+fresh CKKS ciphertext at `FHEContext::compare_depth()` = 12 levels whatever
+the inputs' levels, so the pool output sits at `12 + ceil(log2 k²)` levels
+and the layer reserves one more (a comparison needs its inputs two levels
+above the bottom of the chain; the gather's level hides below the 12): a 2×2 pool is a
+15-level layer, a 3×3 pool 17. In a bootstrapped network the comparison
+results are fresher than a bootstrap's output, so the pool costs only
+`1 + ceil(log2 k²)` levels of the stretch it sits in, and its gather takes
+the bootstrap's range scale for free. The comparison resolves differences
+down to about `4·range / 2^(fhew_log_q − 1)`; a smaller difference is
+decided either way, which moves the maximum by at most that much. Values
+outside `[-range, range]` wrap around in the FHEW plaintext space and
+compare wrongly, so calibrate `range` like a Chebyshev interval.
 
-The output stays gapped at the input positions like a strided convolution;
-the slots between outputs hold maxima of other windows (bounded by `range`),
-which the next linear layer ignores. `place_bootstraps` cannot fold a scale
-through the layer yet and inserts a `scale` layer when it has to; the FIDESlib
-(GPU) backend does not support scheme switching.
+`hnn.MaxPool2d` exports it from PyTorch, and `Trainer` backpropagates
+through it with the forward's comparison bits and the gather's transpose
+(see [Encrypted training](#encrypted-training)). The FIDESlib (GPU) backend
+does not support scheme switching.
 
 ## Exact ReLU via scheme switching
 
@@ -409,8 +413,7 @@ strided conv into a dense mess of diagonals (15858 for `16->32 s=2`).
 `Packing::kMultiplexed` interleaves `m²` channels into the gaps of a stride-`m`
 output, as in Lee et al.'s multiplexed parallel convolutions: same slots as
 compact, offsets still constant per (channel pair, tap). Any linear layer can
-write any layout, so the BSGS plans need nothing new, and a conv after max
-pooling re-packs the pool's gapped output for free. Each strided layer takes
+write any layout, so the BSGS plans need nothing new. Each strided layer takes
 the cheapest collision-free layout (multiplexed, gapped or compact), weighting
 the BSGS cost by the slots it needs. Details in `docs/DESIGN.md`.
 
