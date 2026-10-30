@@ -12,6 +12,7 @@
 #include <functional>
 #include <iosfwd>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -78,6 +79,14 @@ class Layer {
   // One-line header followed by the parameters (see network.h for the format).
   virtual void save(std::ostream& os) const = 0;
 
+  // Trainable parameters (see train.h): a flat vector, empty when the layer
+  // has none. After set_params() compile() again before encrypted use.
+  virtual std::vector<double> params() const { return {}; }
+  virtual void set_params(const std::vector<double>& p) {
+    if (!p.empty()) throw std::logic_error(type() + ": has no trainable parameters");
+  }
+  virtual bool trainable() const { return false; }
+
   const Shape& in_shape() const { return in_; }
   const Shape& out_shape() const { return out_; }
   const Layout& in_layout() const { return in_layout_; }
@@ -135,9 +144,7 @@ class LinearLayer : public Layer {
   };
   virtual std::vector<ParamRef> weight_refs() const { return {}; }
   virtual std::vector<int> bias_refs() const { return {}; }
-  virtual std::vector<double> params() const { return {}; }
-  virtual void set_params(const std::vector<double>& p);
-  bool trainable() const { return !weight_refs().empty(); }
+  bool trainable() const override { return !weight_refs().empty(); }
 
  protected:
   // Forgets the compiled matrix and bias after the weights changed.

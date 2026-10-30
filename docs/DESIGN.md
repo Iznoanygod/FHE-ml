@@ -172,10 +172,9 @@ with 3H score coefficients; single-head files are unchanged.
 ### Next steps
 
 - Bootstrapping inside the max-subtracted softmax block.
-- Training with LayerNorm and softmax (no backward yet; `fheml.nn` has no
-  torch twins of them, so the exporter still rejects `nn.LayerNorm` and
-  `nn.Softmax`).
 - Bootstrapping between blocks for deeper models.
+- An example model that uses them (both train under encryption and export
+  from `fheml.nn.LayerNorm` / `fheml.nn.Attention(softmax=...)`).
 
 ## Encrypted weights
 
@@ -411,7 +410,9 @@ All of the following are tested under encryption:
 - A one-block MNIST vision transformer (95.6%): about 15 s per image.
 - Python bindings for all of the above.
 - Encrypted training (`Trainer`): SGD updates on encrypted data and weights
-  match plaintext SGD, with and without bootstrapping.
+  match plaintext SGD, with and without bootstrapping; this includes
+  layer norm (gamma, beta) and attention (quadratic or softmax scores),
+  whose backward passes reuse the forward's rotations and masks.
 - PyTorch export (`fheml.from_torch`): torch-trained CNN and ViT run
   encrypted with logits matching torch to about 1e-6.
 
@@ -445,8 +446,7 @@ All of the following are tested under encryption:
    (see the README). Next: tracing arbitrary `forward` code with `torch.fx`,
    and a range penalty during training so Chebyshev activations stay inside
    their interval.
-8. **Encrypted training.** Backpropagation through attention. An encrypted
-   softmax for cross-entropy. Hoisting for composed rotations (one
+8. **Encrypted training.** An encrypted softmax for cross-entropy. Hoisting for composed rotations (one
    decomposition per ladder digit).
 9. **Performance.**
    - Benchmark the FIDESlib GPU backend on a real GPU (see below), and batch

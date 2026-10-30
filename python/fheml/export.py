@@ -6,8 +6,8 @@
 
 * ``(C, H, W)`` image: Conv2d, AvgPool2d, AdaptiveAvgPool2d(1), BatchNorm2d;
   ``nn.Flatten`` then ``nn.Linear`` for the head.
-* ``(n, d)`` token sequence: ``nn.Linear`` acts per token, plus Attention,
-  Residual, PosEmbedding, TokenMean.
+* ``(n, d)`` token sequence: ``nn.Linear`` acts per token, plus Attention
+  (quadratic or softmax scores), LayerNorm, Residual, PosEmbedding, TokenMean.
 * ``(k,)`` vector: Linear, BatchNorm1d.
 
 Activations must be ``fheml.nn`` polynomials (Poly, Square, Chebyshev):
@@ -140,7 +140,13 @@ class _Exporter:
             self.need_width(d, m.q.in_features, name)
             ws = [_np(l.weight) for l in (m.q, m.k, m.v, m.o)]
             bs = [_np(l.bias) for l in (m.q, m.k, m.v, m.o)]
-            out.append(("attention", n, d, ws, bs, _np(m.score), m.heads))
+            out.append(("attention", n, d, ws, bs, _np(m.score), m.heads, m.softmax))
+            return state
+        if isinstance(m, hnn.LayerNorm):
+            self.need(kind, "tokens", name)
+            n, d = state[1:]
+            self.need_width(d, m.dim, name)
+            out.append(("layernorm", n, d, _np(m.gamma), _np(m.beta), m.eps, m.var_min, m.var_max, m.degree, m.newton))
             return state
         if isinstance(m, hnn.Residual):
             body, after = self.run(m.body, state)
@@ -167,9 +173,12 @@ class _Exporter:
         if isinstance(m, nn.MaxPool2d):
             raise ValueError("nn.MaxPool2d is not exported: fheml.MaxPool2d (exact, via CKKS<->FHEW scheme "
                              "switching) costs 15+ levels, add it to the fheml network by hand or use nn.AvgPool2d")
-        if isinstance(m, (nn.LayerNorm, nn.Softmax)):
-            raise ValueError(f"nn.{name} is not exported: fheml.LayerNorm / fheml.SoftmaxOptions (polynomial, with "
-                             "intervals to calibrate) exist in the library, add them to the fheml network by hand")
+        if isinstance(m, nn.LayerNorm):
+            raise ValueError("nn.LayerNorm has no exact encrypted form: use fheml.nn.LayerNorm(dim, eps, var_min, "
+                             "var_max, degree) on token sequences (a polynomial 1/sqrt on a calibrated variance range)")
+        if isinstance(m, nn.Softmax):
+            raise ValueError("nn.Softmax has no exact encrypted form: fheml.nn.Attention(dim, tokens, softmax={...}) "
+                             "evaluates a polynomial softmax inside attention")
         if isinstance(m, nn.MultiheadAttention):
             raise ValueError(f"nn.{name} is not supported under encryption (see docs/DESIGN.md#transformers)"
                              " (fheml.nn.Attention(dim, tokens, heads=h) is the polynomial multi-head form)")
@@ -236,8 +245,17 @@ def _build(s):
     if k == "bootstrap":
         return _fheml.Bootstrap()
     if k == "attention":
-        _, n, d, ws, bs, score, heads = s
-        return _fheml.Attention(n, d, *map(_flat, ws), *map(_flat, bs), score=_flat(score), heads=heads)
+        _, n, d, ws, bs, score, heads, softmax = s
+        att = _fheml.Attention(n, d, *map(_flat, ws), *map(_flat, bs), score=_flat(score), heads=heads)
+        if softmax:
+            o = _fheml.SoftmaxOptions()
+            for key, v in softmax.items():
+                setattr(o, key, v)
+            att.set_softmax(o)
+        return att
+    if k == "layernorm":
+        _, n, d, gamma, beta, eps, var_min, var_max, degree, newton = s
+        return _fheml.LayerNorm(n, d, _flat(gamma), _flat(beta), eps, var_min, var_max, degree, newton)
     if k == "residual":
         return _fheml.Residual([_build(b) for b in s[1]])
     raise AssertionError(k)

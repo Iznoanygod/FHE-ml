@@ -244,18 +244,19 @@ logits = fheml.infer(net, ctx, image)        # image: (1, 28, 28) numpy array
 | `nn.Flatten`, `nn.Dropout`, `nn.Identity` | nothing |
 | `hnn.Poly`, `hnn.Square`, `hnn.Chebyshev` | `poly`, `square`, `chebyshev` |
 | `hnn.Attention(dim, tokens, heads=H)`, `hnn.Residual`, `hnn.TokenMean`, `hnn.PosEmbedding` | `attention` (single or multi-head), `residual`, `tokenmean`, per-token bias |
+| `hnn.Attention(..., softmax={...})` | `attention` with softmax scores (`SoftmaxOptions`) |
+| `hnn.LayerNorm(dim, eps, var_min, var_max, degree, newton)` | `layernorm` |
 | `hnn.Bootstrap` | `bootstrap` |
 
-`nn.ReLU` has no exact encrypted form and is rejected with a message naming
-the replacement. `nn.LayerNorm` and `nn.Softmax` are rejected too: the
-library has `LayerNorm` and softmax attention (see below), but their
-Chebyshev intervals need calibrating and `fheml.nn` has no torch twins of
-them yet. `nn.MaxPool2d` is rejected
+`nn.ReLU`, `nn.LayerNorm` and `nn.Softmax` have no exact encrypted form and
+are rejected with a message naming the replacement (`hnn.Chebyshev`,
+`hnn.LayerNorm`, `hnn.Attention(softmax=...)`). `nn.MaxPool2d` is rejected
 too for now: the library has an exact `MaxPool2d` layer (see below), but at
 15+ levels and a FHEW bootstrap per slot and comparison it is not something
-an exporter should insert silently. `hnn.Chebyshev`
-evaluates the same polynomial approximation in torch that runs encrypted,
-so training sees what inference computes. For token inputs the exporter pads
+an exporter should insert silently. `hnn.Chebyshev`, `hnn.LayerNorm` and the
+softmax of `hnn.Attention` evaluate the same polynomial approximations in
+torch that run encrypted, so training sees what inference computes (and
+pushes the model to keep its variances and scores inside the intervals). For token inputs the exporter pads
 each token to the widest per-token layer, which makes those layers much cheaper
 under encryption; `fheml.infer` pads inputs to match.
 
@@ -345,8 +346,9 @@ of the scheme-switching comparisons above and subtracted, so the
 exponentials are bounded by 1 and the sums lie in `[1, n]` with nothing to
 calibrate; it costs n − 1 comparisons (each a FHEW bootstrap per slot) and
 about 12 + log2(n) extra levels, which is beyond one bootstrapping budget at
-ring 2^16. Neither is used by the example models, the trainer or the
-PyTorch exporter yet.
+ring 2^16. Both train under encryption (see below) and export from
+`fheml.nn.LayerNorm` / `fheml.nn.Attention(softmax=...)`; the example models
+do not use them yet.
 
 ## Encrypted training
 
@@ -365,10 +367,15 @@ trainer.decrypt_weights(ctx)                             # key holder: trained w
 ```
 
 * **What trains:** conv2d, dense, tokendense and affine weights and biases,
-  with shared weights handled exactly. Gradients flow through square, poly,
-  chebyshev, average pooling, token mean, residual and bootstrap layers.
-* **What does not:** attention layers can't be trained or backpropagated
-  through yet. They can sit in a frozen prefix, which only runs forward.
+  layernorm's gamma and beta, and the four projections of attention
+  (quadratic or softmax scores, any number of heads), with shared weights
+  handled exactly. Gradients flow through square, poly, chebyshev, average
+  pooling, token mean, layernorm, attention, residual and bootstrap layers.
+  The softmax and the layer norm's inverse square root are differentiated as
+  the functions they approximate (`exp' = exp`, `(1/S)' = -1/S²`), so their
+  gradients match the exact ones up to the approximation error.
+* **What does not:** max pooling has no backward. Layers in a frozen prefix
+  only run forward.
 * **Fine-tuning:** `frozen=[...]` keeps layers fixed. Everything before the
   first trainable layer runs as ordinary encrypted inference.
 * **Loss:** squared error against the encrypted target. Softmax

@@ -110,6 +110,21 @@ class LayerNorm : public Layer {
   void scale_output(double f);
   // 1 / sqrt(v + eps) as the layer approximates it.
   double inv_sqrt(double v) const;
+  // The pieces of forward() for the trainer: x - mean and r = 1/sqrt(var +
+  // eps) (broadcast over each token); forward() is gamma (*) centred (*) r +
+  // beta. r sits inv_sqrt_depth() levels below x.
+  void normalize(const FHEContext& ctx, const Ctxt& x, Ctxt& centred, Ctxt& r) const;
+  void normalize_plain(const std::vector<double>& x, std::vector<double>& centred, std::vector<double>& r) const;
+  uint32_t inv_sqrt_depth() const { return 2 + poly_depth(degree_) + 1 + 2 * newton_; }
+  // Mean over each token's d features, in every slot of the token (one level).
+  Ctxt block_mean(const FHEContext& ctx, const Ctxt& c) const;
+  // Training: gamma followed by beta.
+  std::vector<double> params() const override;
+  void set_params(const std::vector<double>& p) override;
+  bool trainable() const override { return true; }
+  int tokens() const { return n_; }
+  int dim() const { return d_; }
+  size_t stride() const { return stride_; }
   double eps() const { return eps_; }
   double var_min() const { return var_min_; }
   double var_max() const { return var_max_; }
@@ -216,6 +231,27 @@ class Attention : public Layer {
   double exp_hi() const { return softmax_ && sm_.subtract_max ? 0.0 : sm_.hi; }
   double sum_lo() const;
   double sum_hi() const;
+  // Training: the four projections' params() (q, k, v, o) concatenated.
+  std::vector<double> params() const override;
+  void set_params(const std::vector<double>& p) override;
+  bool trainable() const override { return true; }
+  // The trainer's view of the layer (after compile()).
+  const std::shared_ptr<TokenDense>& projection(int i) const { return proj_[i]; }
+  int tokens() const { return n_; }
+  int dim() const { return d_; }
+  int head_width() const { return dh_; }
+  int stride() const { return stride_; }
+  // Per-slot score coefficients (quadratic), the head mask and the row-sum
+  // padding, the exp and 1/x series (softmax).
+  const std::vector<double>& score_mask(int k) const { return k == 0 ? mask_c0_ : k == 1 ? mask_c1_ : mask_c2_; }
+  const std::vector<double>& head_mask() const { return mask_head_; }
+  const std::vector<double>& pad_sum() const { return pad_sum_; }
+  const std::vector<double>& exp_coeffs() const { return exp_coeffs_; }
+  const std::vector<double>& inv_coeffs() const { return inv_coeffs_; }
+  // Score polynomial coefficient k of head h (quadratic mode).
+  double score_coeff(int h, int k) const { return score_[static_cast<size_t>(3 * h + k)]; }
+  // 1 / x as the softmax approximates it (series plus Newton steps).
+  double inv_plain(double x) const;
 
  private:
   int n_, d_, heads_, dh_;
@@ -230,7 +266,6 @@ class Attention : public Layer {
   SoftmaxOptions sm_;
   std::vector<double> exp_coeffs_, inv_coeffs_;
   std::vector<double> mask_head_, pad_sum_;  // 1 at head slots; sum midpoint off the sub-blocks
-  double inv_plain(double x) const;
 };
 
 }  // namespace fheml

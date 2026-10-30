@@ -78,12 +78,14 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("depth", &Layer::depth)
       .def_property_readonly("in_shape", &Layer::in_shape)
       .def_property_readonly("out_shape", &Layer::out_shape)
-      .def("forward_plain", &Layer::forward_plain);
+      .def("forward_plain", &Layer::forward_plain)
+      .def("params", &Layer::params,
+           "Trainable values: weights then biases (linear layers), gamma then beta (layernorm), the four "
+           "projections' params (attention); empty for other layers.")
+      .def("set_params", &Layer::set_params, py::arg("params"))
+      .def_property_readonly("trainable", &Layer::trainable);
 
-  py::class_<LinearLayer, Layer, std::shared_ptr<LinearLayer>>(m, "LinearLayer")
-      .def("params", &LinearLayer::params, "Trainable values: weights, then biases.")
-      .def("set_params", &LinearLayer::set_params, py::arg("params"))
-      .def_property_readonly("trainable", &LinearLayer::trainable);
+  py::class_<LinearLayer, Layer, std::shared_ptr<LinearLayer>>(m, "LinearLayer");
   py::class_<Conv2d, LinearLayer, std::shared_ptr<Conv2d>>(m, "Conv2d")
       .def(py::init<int, int, int, int, int, int, Vec, Vec>(), py::arg("in_channels"), py::arg("out_channels"),
            py::arg("kh"), py::arg("kw"), py::arg("stride"), py::arg("pad"), py::arg("weights"),

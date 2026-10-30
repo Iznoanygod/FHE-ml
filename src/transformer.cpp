@@ -195,20 +195,13 @@ double LayerNorm::inv_sqrt(double v) const {
 }
 
 std::vector<double> LayerNorm::forward_plain(const std::vector<double>& x) const {
-  std::vector<double> y(x.size());
-  for (int t = 0; t < n_; ++t) {
-    const double* xt = &x[static_cast<size_t>(t) * d_];
-    double mean = 0.0, ex2 = 0.0;
+  std::vector<double> centred, r, y(x.size());
+  normalize_plain(x, centred, r);
+  for (int t = 0; t < n_; ++t)
     for (int j = 0; j < d_; ++j) {
-      mean += xt[j];
-      ex2 += xt[j] * xt[j];
+      const size_t i = static_cast<size_t>(t) * d_ + j;
+      y[i] = gamma_[static_cast<size_t>(j)] * centred[i] * r[static_cast<size_t>(t)] + beta_[static_cast<size_t>(j)];
     }
-    mean /= d_;
-    ex2 /= d_;
-    const double r = inv_sqrt(ex2 - mean * mean);
-    for (int j = 0; j < d_; ++j)
-      y[static_cast<size_t>(t) * d_ + j] = gamma_[static_cast<size_t>(j)] * (xt[j] - mean) * r + beta_[static_cast<size_t>(j)];
-  }
   return y;
 }
 
@@ -216,22 +209,24 @@ std::vector<double> LayerNorm::forward_plain(const std::vector<double>& x) const
 // the token's d features (slots t*B+d .. t*B+B-1 are zero, so nothing of the
 // next token leaks in); the masked product scales by 1/d and clears every
 // other slot; the backward rotations spread it over the token's d slots.
-Ctxt LayerNorm::forward(const FHEContext& ctx, const Ctxt& x) const {
+Ctxt LayerNorm::block_mean(const FHEContext& ctx, const Ctxt& in) const {
   const CC& cc = ctx.cc();
   if (mask_.size() != ctx.slots()) throw std::invalid_argument("layernorm: slot count mismatch with context");
-  auto block_mean = [&](const Ctxt& in) {
-    // (EvalAddInPlace on a copy of the handle would modify the caller's
-    // ciphertext.)
-    Ctxt s = cc->EvalAdd(in, ctx.rotate(in, 1));
-    for (int t = 2; t < d_; t *= 2) cc->EvalAddInPlace(s, ctx.rotate(s, t));
-    const uint32_t lvl = s->GetLevel() + (s->GetNoiseScaleDeg() > 1 ? 1 : 0);
-    Ptxt mask = ctx.encode(mask_, lvl);  // FIDESlib takes plaintexts by mutable reference
-    Ctxt m = cc->EvalMult(s, mask);
-    for (int t = 1; t < d_; t *= 2) cc->EvalAddInPlace(m, ctx.rotate(m, -t));
-    return m;
-  };
-  Ctxt mean = block_mean(x);
-  Ctxt var = cc->EvalSub(block_mean(cc->EvalMult(x, x)), cc->EvalMult(mean, mean));
+  // (EvalAddInPlace on a copy of the handle would modify the caller's
+  // ciphertext.)
+  Ctxt s = cc->EvalAdd(in, ctx.rotate(in, 1));
+  for (int t = 2; t < d_; t *= 2) cc->EvalAddInPlace(s, ctx.rotate(s, t));
+  const uint32_t lvl = s->GetLevel() + (s->GetNoiseScaleDeg() > 1 ? 1 : 0);
+  Ptxt mask = ctx.encode(mask_, lvl);  // FIDESlib takes plaintexts by mutable reference
+  Ctxt m = cc->EvalMult(s, mask);
+  for (int t = 1; t < d_; t *= 2) cc->EvalAddInPlace(m, ctx.rotate(m, -t));
+  return m;
+}
+
+void LayerNorm::normalize(const FHEContext& ctx, const Ctxt& x, Ctxt& centred, Ctxt& r) const {
+  const CC& cc = ctx.cc();
+  Ctxt mean = block_mean(ctx, x);
+  Ctxt var = cc->EvalSub(block_mean(ctx, cc->EvalMult(x, x)), cc->EvalMult(mean, mean));
   Ptxt pad = ctx.encode(pad_var_, var->GetLevel(), var->GetNoiseScaleDeg());
   cc->EvalAddInPlace(var, pad);
   // Newton steps r <- 1.5 r - 0.5 v r^3 without scalar products on r (each
@@ -241,7 +236,7 @@ Ctxt LayerNorm::forward(const FHEContext& ctx, const Ctxt& x) const {
   double k = std::pow(1.5, static_cast<double>(newton_));
   std::vector<double> c = coeffs_;  // FIDESlib takes the coefficients by mutable reference
   for (double& ci : c) ci *= k;
-  Ctxt r = cc->EvalChebyshevSeries(var, c, var_min_, var_max_);
+  r = cc->EvalChebyshevSeries(var, c, var_min_, var_max_);
   if (newton_) {
     Ctxt v = eps_ != 0.0 ? cc->EvalAdd(var, eps_) : var;
     for (uint32_t i = 0; i < newton_; ++i) {
@@ -251,12 +246,49 @@ Ctxt LayerNorm::forward(const FHEContext& ctx, const Ctxt& x) const {
       k /= 1.5;
     }
   }
-  Ctxt centred = cc->EvalSub(x, mean);
+  centred = cc->EvalSub(x, mean);
+}
+
+Ctxt LayerNorm::forward(const FHEContext& ctx, const Ctxt& x) const {
+  const CC& cc = ctx.cc();
+  Ctxt centred, r;
+  normalize(ctx, x, centred, r);
   const uint32_t lvl = centred->GetLevel() + (centred->GetNoiseScaleDeg() > 1 ? 1 : 0);
   Ptxt gamma = ctx.encode(gamma_slots_, lvl);
   Ctxt y = cc->EvalMult(cc->EvalMult(centred, gamma), r);
   Ptxt beta = ctx.encode(beta_slots_, y->GetLevel(), y->GetNoiseScaleDeg());
   return cc->EvalAdd(y, beta);
+}
+
+void LayerNorm::normalize_plain(const std::vector<double>& x, std::vector<double>& centred,
+                                std::vector<double>& r) const {
+  centred.assign(x.size(), 0.0);
+  r.assign(static_cast<size_t>(n_), 0.0);
+  for (int t = 0; t < n_; ++t) {
+    const double* xt = &x[static_cast<size_t>(t) * d_];
+    double mean = 0.0, ex2 = 0.0;
+    for (int j = 0; j < d_; ++j) {
+      mean += xt[j];
+      ex2 += xt[j] * xt[j];
+    }
+    mean /= d_;
+    ex2 /= d_;
+    r[static_cast<size_t>(t)] = inv_sqrt(ex2 - mean * mean);
+    for (int j = 0; j < d_; ++j) centred[static_cast<size_t>(t) * d_ + j] = xt[j] - mean;
+  }
+}
+
+std::vector<double> LayerNorm::params() const {
+  std::vector<double> p(gamma_);
+  p.insert(p.end(), beta_.begin(), beta_.end());
+  return p;
+}
+
+void LayerNorm::set_params(const std::vector<double>& p) {
+  if (p.size() != 2u * d_) throw std::invalid_argument("layernorm: wrong parameter count");
+  std::copy(p.begin(), p.begin() + d_, gamma_.begin());
+  std::copy(p.begin() + d_, p.end(), beta_.begin());
+  if (!mask_.empty()) compile(static_cast<uint32_t>(mask_.size()));
 }
 
 uint32_t LayerNorm::depth() const { return 2 + poly_depth(degree_) + 1 + 2 * newton_ + 1; }
@@ -638,6 +670,29 @@ Ctxt Attention::forward(const FHEContext& ctx, const Ctxt& x) const {
     o = cc->EvalMult(o, y);
   }
   return proj_[3]->forward(ctx, o);
+}
+
+std::vector<double> Attention::params() const {
+  std::vector<double> p;
+  for (const auto& pr : proj_) {
+    std::vector<double> q = pr->params();
+    p.insert(p.end(), q.begin(), q.end());
+  }
+  return p;
+}
+
+void Attention::set_params(const std::vector<double>& p) {
+  size_t at = 0;
+  for (int i = 0; i < 4; ++i) {
+    const size_t k = w_[i].size() + b_[i].size();
+    if (at + k > p.size()) throw std::invalid_argument("attention: wrong parameter count");
+    std::vector<double> q(p.begin() + static_cast<std::ptrdiff_t>(at), p.begin() + static_cast<std::ptrdiff_t>(at + k));
+    std::copy(q.begin(), q.begin() + static_cast<std::ptrdiff_t>(w_[i].size()), w_[i].begin());
+    std::copy(q.begin() + static_cast<std::ptrdiff_t>(w_[i].size()), q.end(), b_[i].begin());
+    proj_[i]->set_params(q);
+    at += k;
+  }
+  if (at != p.size()) throw std::invalid_argument("attention: wrong parameter count");
 }
 
 std::vector<int32_t> Attention::rotation_indices() const {
