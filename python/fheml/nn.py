@@ -2,7 +2,8 @@
 
 Train a model built from ``torch.nn.Sequential``, the supported ``torch.nn``
 layers (Conv2d, Linear, AvgPool2d, AdaptiveAvgPool2d(1), BatchNorm, Flatten,
-Dropout, Identity) and the modules below, then export it::
+Dropout, Identity) and the modules below (``MaxPool2d`` is torch's with an
+input bound), then export it::
 
     import torch, fheml
     from fheml import nn as hnn
@@ -22,8 +23,8 @@ import numpy as np
 import torch
 from torch import nn
 
-__all__ = ["Poly", "Square", "Chebyshev", "Attention", "LayerNorm", "Residual", "TokenMean", "PosEmbedding",
-           "Bootstrap", "chebyshev_coefficients"]
+__all__ = ["Poly", "Square", "Chebyshev", "Attention", "LayerNorm", "MaxPool2d", "Residual", "TokenMean",
+           "PosEmbedding", "Bootstrap", "chebyshev_coefficients"]
 
 
 class Poly(nn.Module):
@@ -280,6 +281,27 @@ class PosEmbedding(nn.Module):
 
     def forward(self, x):
         return x + self.pos
+
+
+class MaxPool2d(nn.MaxPool2d):
+    """Exact max pooling, exported to ``fheml.MaxPool2d`` (CKKS <-> FHEW scheme switching).
+
+    Computes ``torch.nn.MaxPool2d`` (square windows, no padding); ``range``
+    bounds the inputs, ``|x| <= range``, as the encrypted comparison wraps
+    around outside it: calibrate it like a Chebyshev interval. A k x k pool
+    costs k^2 - 1 comparisons (one FHEW bootstrap per slot each) and
+    12 + ceil(log2 k^2) + 1 levels. ``fheml.Trainer`` trains through it,
+    routing each window's gradient to the tap that won, like torch.
+    """
+
+    def __init__(self, kernel_size, stride=None, range=1.0):
+        super().__init__(kernel_size, stride)
+        if not range > 0:
+            raise ValueError("MaxPool2d: range must be positive")
+        self.range = float(range)
+
+    def extra_repr(self):
+        return super().extra_repr() + f", range={self.range}"
 
 
 class Bootstrap(nn.Module):
