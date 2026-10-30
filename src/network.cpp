@@ -93,14 +93,24 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
     is >> n >> d;
     layer = std::make_shared<TokenMean>(n, d);
   } else if (tok == "attention") {
-    int n, d, hb;
+    int n, d, hb, heads = 1;
     is >> n >> d >> hb;
+    // Optional "heads H" (multi-head); single-head files have none.
+    std::string next;
+    auto pos = is.tellg();
+    if (is >> next && next == "heads") {
+      is >> heads;
+    } else {
+      is.clear();
+      is.seekg(pos);
+    }
+    if (heads < 1) throw std::runtime_error("model file: bad attention head count");
     std::vector<double> w[4], b[4];
     for (auto& wi : w) wi = read_vec(is, static_cast<size_t>(d) * d, "attention weights");
     if (hb)
       for (auto& bi : b) bi = read_vec(is, d, "attention bias");
-    auto score = read_vec(is, 3, "attention score polynomial");
-    layer = std::make_shared<Attention>(n, d, w[0], w[1], w[2], w[3], b[0], b[1], b[2], b[3], score);
+    auto score = read_vec(is, 3u * heads, "attention score polynomial");
+    layer = std::make_shared<Attention>(n, d, w[0], w[1], w[2], w[3], b[0], b[1], b[2], b[3], score, heads);
   } else if (tok == "residual") {
     size_t k;
     is >> k;

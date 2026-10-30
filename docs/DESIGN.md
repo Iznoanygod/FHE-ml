@@ -102,6 +102,30 @@ There is one ciphertext in and one out, using the diagonal-over-offsets method
 - **Cost:** about n·(2 log₂ d + 2) rotations and 3n ct×ct products.
 - **Depth:** 6 for the block, including the four projections.
 
+#### Multiple heads
+
+`Attention(..., heads=H)` splits each token's d features into H heads of
+width dh = d/H (a power of two), laid out as the sub-blocks
+`[t·B + h·dh, t·B + (h+1)·dh)` of token t. That is exactly what the
+concatenated Q/K/V projections `kron(I_n, W)` already produce, and the head
+concatenation before W_o is the same slot order, so no split or concat
+rotations are needed at all. Only three things change in the single-head
+schedule:
+
+1. The window sum after Q ⊙ K_s runs over dh slots (log₂ dh rotations), which
+   puts head h's score q_i·k_{i+s} in slot `i·B + h·dh`.
+2. The score mask selects slot `i·B + h·dh` for every head. Since the mask
+   carries the coefficients, each head can have its own polynomial for free.
+3. The broadcast runs over dh slots. The window behind each slot holds at
+   most one masked head slot, so head h's score only reaches its own
+   sub-block (the zero padding past d keeps the last head from reading the
+   next token).
+
+So H heads cost n·(2 log₂(d/H) + 2) rotations instead of n·(2 log₂ d + 2):
+fewer than one wide head, with the same 3n products, the same depth 6 and
+fewer rotation keys. The model file writes `attention N D HAS_BIAS heads H`
+with 3H score coefficients; single-head files are unchanged.
+
 ### Softmax and normalisation
 
 - Softmax is replaced by the fixed quadratic `A = (S+2)²/(8n)`. It is
@@ -111,7 +135,6 @@ There is one ciphertext in and one out, using the diagonal-over-offsets method
 
 ### Next steps
 
-- Multiple heads, which fit as sub-blocks of each token.
 - Normalised power attention, using a Chebyshev 1/x on the rotation-free sum
   of the per-offset score ciphertexts.
 - LayerNorm via a Chebyshev 1/√x on a training-calibrated range.
@@ -378,8 +401,8 @@ All of the following are tested under encryption:
    - Add a residual `Add` layer that aligns levels and layouts.
 7. **More PyTorch export.** `fheml.from_torch` covers `nn.Sequential` models
    (see the README). Next: tracing arbitrary `forward` code with `torch.fx`,
-   multi-head attention, and a range penalty during training so Chebyshev
-   activations stay inside their interval.
+   and a range penalty during training so Chebyshev activations stay inside
+   their interval.
 8. **Encrypted training.** Backpropagation through attention. An encrypted
    softmax for cross-entropy. Hoisting for composed rotations (one
    decomposition per ladder digit).
