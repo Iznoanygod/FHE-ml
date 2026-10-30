@@ -179,7 +179,7 @@ Network& Network::add(std::shared_ptr<Layer> layer) {
   Shape in = output_shape();
   Layout lin = layers_.empty() ? Layout::compact(input_) : layers_.back()->out_layout();
   layer->configure(in);
-  layer->configure_layout(lin, gapped_);
+  layer->configure_layout(lin, packing_);
   layers_.push_back(std::move(layer));
   slots_ = 0;
   return *this;
@@ -190,7 +190,7 @@ Shape Network::configure() {
   Layout lay = Layout::compact(input_);
   for (auto& l : layers_) {
     s = l->configure(s);
-    lay = l->configure_layout(lay, gapped_);
+    lay = l->configure_layout(lay, packing_);
   }
   slots_ = 0;
   return s;

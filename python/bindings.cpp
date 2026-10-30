@@ -165,6 +165,24 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("uses_scheme_switching", &Network::uses_scheme_switching)
       .def("compile", &Network::compile, py::arg("slots") = 0, py::call_guard<py::gil_scoped_release>())
       .def("set_gapped_layouts", &Network::set_gapped_layouts)
+      .def_property(
+          "packing",
+          [](const Network& n) {
+            switch (n.packing()) {
+              case Packing::kCompact: return std::string("compact");
+              case Packing::kGapped: return std::string("gapped");
+              default: return std::string("multiplexed");
+            }
+          },
+          [](Network& n, const std::string& p) {
+            if (p == "compact") n.set_packing(Packing::kCompact);
+            else if (p == "gapped") n.set_packing(Packing::kGapped);
+            else if (p == "multiplexed") n.set_packing(Packing::kMultiplexed);
+            else throw std::invalid_argument("packing must be compact, gapped or multiplexed");
+          },
+          "Layout of strided conv/pool outputs: 'gapped' (default, fewest diagonals), 'compact' (fewest "
+          "slots) or 'multiplexed' (compact slot count, few diagonals; Lee et al. ICML'22). Compile again "
+          "afterwards.")
       .def("set_cache_plaintexts", &Network::set_cache_plaintexts)
       .def_property_readonly("depth", &Network::depth)
       .def_property_readonly("slots", &Network::slots)

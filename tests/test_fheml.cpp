@@ -113,6 +113,74 @@ void cleartext_tests() {
     check_plan("avgpool", n);
   }
   {
+    // Multiplexed packing: two stride-2 stages fill the gaps with channels
+    // (m = 2 then 4), so the activations need the compact slot count, with
+    // far fewer diagonals than compact strided convolutions.
+    auto build = [](Packing p) {
+      std::mt19937 keep = g_rng;
+      Network n(Shape{3, 16, 16});
+      n.set_packing(p);
+      n.emplace<Conv2d>(3, 8, 3, 3, 2, 1, rand_vec(216), std::vector<double>{});
+      n.emplace<Conv2d>(8, 8, 3, 3, 1, 1, rand_vec(576), std::vector<double>{});
+      n.emplace<Conv2d>(8, 16, 3, 3, 2, 1, rand_vec(1152), std::vector<double>{});
+      n.emplace<AvgPool2d>(2, 2);
+      n.emplace<Dense>(64, 5, rand_vec(320), std::vector<double>{});
+      g_rng = keep;  // same weights for every packing
+      n.compile();
+      return n;
+    };
+    Network g = build(Packing::kGapped), c = build(Packing::kCompact), m = build(Packing::kMultiplexed);
+    auto diags = [](const Network& n) {
+      size_t d = 0;
+      for (const auto& l : n.layers()) d += static_cast<const LinearLayer*>(l.get())->transform().num_diagonals();
+      return d;
+    };
+    const Layout& l0 = m.layers()[0]->out_layout();
+    const Layout& l2 = m.layers()[2]->out_layout();
+    check(l0.m == 2 && l2.m == 4, "multiplexed factors 2 then 4",
+          "(" + std::to_string(l0.m) + ", " + std::to_string(l2.m) + ")");
+    check(m.slots() == c.slots() && m.slots() < g.slots(), "multiplexed needs the compact slot count",
+          "(" + std::to_string(m.slots()) + " vs gapped " + std::to_string(g.slots()) + ")");
+    check(diags(m) < diags(c), "multiplexed has fewer diagonals than compact",
+          "(" + std::to_string(diags(m)) + " vs " + std::to_string(diags(c)) + ")");
+    auto x = rand_vec(768);
+    for (Network* n : {&g, &c, &m}) {
+      std::vector<double> slots(n->slots(), 0.0);
+      for (size_t i = 0; i < x.size(); ++i) slots[i] = x[i];
+      for (const auto& l : n->layers()) slots = static_cast<const LinearLayer*>(l.get())->transform().eval_slots(slots);
+      check_err(std::string("plan multiplexing chain, packing ") + (n == &g ? "gapped" : n == &c ? "compact" : "multiplexed"),
+                max_err(n->forward_plain(x), slots, 5), 1e-9);
+    }
+    // Every element of a multiplexed layout has its own slot.
+    for (const auto& l : m.layers()) {
+      std::vector<char> used(m.slots(), 0);
+      bool ok = true;
+      for (size_t i = 0; i < l->out_shape().size(); ++i) {
+        size_t sl = l->out_layout().slot(l->out_shape(), i);
+        ok = ok && sl < used.size() && !used[sl];
+        if (ok) used[sl] = 1;
+      }
+      check(ok, "multiplexed layout injective " + l->describe());
+    }
+  }
+  {
+    // Odd sizes: 7x7 -> 4x4 cannot interleave without collisions; the layer
+    // falls back to another layout and still computes the right thing.
+    Network n(Shape{2, 7, 7});
+    n.set_packing(Packing::kMultiplexed);
+    n.emplace<Conv2d>(2, 4, 3, 3, 2, 1, rand_vec(72), std::vector<double>{});
+    check_plan("conv stride2 odd size, multiplexed", n);
+  }
+  {
+    // Few channels: the gapped output fits in the input's slots and has
+    // fewer diagonals, so multiplexed packing keeps it gapped.
+    Network n(Shape{4, 8, 8});
+    n.set_packing(Packing::kMultiplexed);
+    n.emplace<Conv2d>(4, 4, 3, 3, 2, 1, rand_vec(144), std::vector<double>{});
+    check_plan("conv stride2, multiplexed packing", n);
+    check(n.layers()[0]->out_layout().m == 1 && n.slots() == 256, "gapped kept when it fits");
+  }
+  {
     // Fusion: conv -> avgpool -> affine == one matrix.
     Network n(Shape{2, 8, 8});
     n.emplace<Conv2d>(2, 3, 3, 3, 1, 1, rand_vec(54), rand_vec(3));
@@ -335,6 +403,21 @@ void scheme_switching_tests(bool quick) {
     n.emplace<ChebyshevActivation>("relu", -2, 2, 15);
     n.emplace<Dense>(18, 4, rand_vec(72, -0.5, 0.5), rand_vec(4));
     check_encrypted("conv maxpool relu dense", n, 1e-2);
+  }
+  {
+    // Max pooling leaves a gapped layout; with multiplexed packing the next
+    // (stride-1) conv, which widens 4 -> 16 channels, re-packs it into the
+    // gaps for free: 256 slots instead of the 1024 a gapped output needs.
+    Network n(Shape{1, 8, 8});
+    n.set_packing(Packing::kMultiplexed);
+    n.emplace<Conv2d>(1, 4, 3, 3, 1, 1, rand_vec(36, -0.3, 0.3), rand_vec(4, -0.1, 0.1));
+    n.emplace<MaxPool2d>(2, 2, 2.0);
+    n.emplace<Conv2d>(4, 16, 3, 3, 1, 1, rand_vec(576, -0.2, 0.2), rand_vec(16, -0.1, 0.1));
+    n.emplace<Dense>(256, 3, rand_vec(768, -0.1, 0.1), rand_vec(3));
+    n.compile();
+    check(n.layers()[2]->out_layout().m == 2 && n.slots() == 256, "conv after maxpool re-packs (m = 2)",
+          "(" + std::to_string(n.slots()) + " slots)");
+    check_encrypted("conv maxpool conv dense, multiplexed", n, 1e-2);
   }
 }
 
@@ -597,6 +680,22 @@ void encrypted_tests(bool quick) {
     Network n(Shape{40, 1, 1});
     n.emplace<Dense>(40, 10, rand_vec(400), rand_vec(10));
     check_encrypted("dense", n, 1e-4);
+  }
+  {
+    // Multiplexed packing through activations: conv s2 (m = 2, 8 channels in
+    // the slots of 2) -> square -> conv s1 (stays multiplexed) -> Chebyshev
+    // -> avgpool -> dense.
+    Network n(Shape{2, 8, 8});
+    n.set_packing(Packing::kMultiplexed);
+    n.emplace<Conv2d>(2, 8, 3, 3, 2, 1, rand_vec(144, -0.3, 0.3), rand_vec(8, -0.1, 0.1));
+    n.emplace<Square>();
+    n.emplace<Conv2d>(8, 4, 3, 3, 1, 1, rand_vec(288, -0.2, 0.2), rand_vec(4, -0.1, 0.1));
+    n.emplace<ChebyshevActivation>("relu", -2, 2, 15);
+    n.emplace<AvgPool2d>(2, 2);
+    n.emplace<Dense>(16, 3, rand_vec(48), rand_vec(3));
+    n.compile();
+    check(n.layers()[0]->out_layout().m == 2 && n.layers()[2]->out_layout().m == 2, "encrypted net is multiplexed");
+    check_encrypted("multiplexed conv square conv relu avgpool dense", n, 1e-3);
   }
   {
     Network n(Shape{2, 8, 8});

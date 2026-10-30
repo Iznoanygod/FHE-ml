@@ -99,6 +99,8 @@ def main():
                     "two more levels in ring 2^16 for 25%% larger keys)")
     ap.add_argument("--level-budget", type=int, default=2, help="bootstrap level budget {b,b}: 2 costs 18 levels and 69 "
                     "bootstrapping keys at 256 slots, 3 costs 20 levels and 45 keys (use 3 with --digits 4)")
+    ap.add_argument("--packing", choices=("gapped", "compact", "multiplexed"),
+                    help="layout of strided conv outputs (default: compact for deepcnn, gapped otherwise)")
     ap.add_argument("--data", default="data")
     ap.add_argument("--epochs", type=int, help="default: 3 (cnn), 15 (vit)")
     ap.add_argument("--out", help="also save the exported model here (.fheml)")
@@ -138,7 +140,9 @@ def main():
     if args.arch == "vit":
         net.fuse_linear()  # token mean + head -> one matrix, saves a level
     level_budget = [3, 3]
-    if args.arch == "deepcnn":
+    if args.packing:
+        net.packing = args.packing
+    elif args.arch == "deepcnn":
         net.set_gapped_layouts(False)  # compact activations: fewer slots, so fewer bootstrapping keys
     if args.bootstrap:
         # Levels per stretch at ring 2^16 and 50 bits: 5 with {2,2}, 3 with {3,3}, two more with --digits 4.
