@@ -5,6 +5,9 @@
 // 2. Encrypted SGD updates against train_plain on the same batch: the
 //    decrypted weights must match the plaintext-trained ones.
 // 3. The same with bootstrapped weights over several updates.
+// 4. Deep networks under a level budget: activations and gradients are
+//    bootstrapped inside the step (a softmax transformer block, softmax with
+//    the scheme-switching row maximum).
 #include <cmath>
 #include <cstdio>
 #include <algorithm>
@@ -158,7 +161,7 @@ Network norm_tokens(unsigned seed) {
   return n;
 }
 
-std::shared_ptr<Attention> attention(int t, int d, Rng& r, bool softmax) {
+std::shared_ptr<Attention> attention(int t, int d, Rng& r, bool softmax, bool subtract_max = false) {
   auto a = std::make_shared<Attention>(t, d, r.vec(d * d, 0.2), r.vec(d * d, 0.2), r.vec(d * d, 0.2), r.vec(d * d, 0.2),
                                        r.vec(d, 0.1), r.vec(d, 0.1), r.vec(d, 0.1), r.vec(d, 0.1),
                                        std::vector<double>{4.0 / (8 * t), 4.0 / (8 * t), 1.0 / (8 * t)}, 2);
@@ -169,18 +172,19 @@ std::shared_ptr<Attention> attention(int t, int d, Rng& r, bool softmax) {
     o.exp_degree = 15;
     o.inv_degree = 31;
     o.newton = 2;
+    o.subtract_max = subtract_max;
     a->set_softmax(o);
   }
   return a;
 }
 
 // Two-head attention (quadratic or softmax scores) between token layers.
-Network attention_tokens(unsigned seed, bool softmax) {
+Network attention_tokens(unsigned seed, bool softmax, bool subtract_max = false) {
   Rng r(seed);
   const int t = 4, d = 8;
   Network n(Shape{t, 1, 5});
   n.emplace<TokenDense>(t, 5, d, r.vec(40, 0.4), r.vec(d, 0.1))
-      .add(attention(t, d, r, softmax))
+      .add(attention(t, d, r, softmax, subtract_max))
       .emplace<TokenMean>(t, d)
       .emplace<Dense>(d, 2, r.vec(16, 0.4), r.vec(2, 0.1));
   return n;
@@ -282,14 +286,25 @@ FHEContext training_context(const Trainer& tr, bool boot, uint32_t updates, uint
   return ctx;
 }
 
+// budget > 0: bootstrap activations and gradients inside the step with that
+// level budget and bootstrap range.
 void encrypted_check(const std::string& name, const Builder& make, size_t updates, bool boot, double tol,
-                     const std::vector<size_t>& frozen = {}, double lr = 0.5, uint32_t window = 0) {
+                     const std::vector<size_t>& frozen = {}, double lr = 0.5, uint32_t window = 0,
+                     uint32_t budget = 0, double range = 1.0) {
   Network plain = make();
   plain.compile();
   Network enc = make();
-  // Bootstrapping: use all 2048 slots of the ring so weights are packed.
-  enc.compile(boot ? 2048 : 0);
+  // Bootstrapping: use all 2048 slots of the ring so weights are packed
+  // (only the slots needed with a level budget: sparse bootstraps are more
+  // precise and faster, and activations are bootstrapped many times).
+  enc.compile(boot && !budget ? 2048 : 0);
   Trainer tr(enc, frozen);
+  if (budget) {
+    tr.set_level_budget(budget, range);
+    check(tr.unbounded_step_depth() > budget && tr.step_depth() <= budget, name + " step fits the level budget",
+          "(" + std::to_string(tr.unbounded_step_depth()) + " levels unbounded, budget " + std::to_string(budget) +
+              ", min " + std::to_string(tr.min_level_budget()) + ")");
+  }
   FHEContext ctx = training_context(tr, boot, static_cast<uint32_t>(updates), window);
   std::printf("  %s\n  %s\n", tr.summary().c_str(), ctx.describe().c_str());
   if (window) {
@@ -303,8 +318,15 @@ void encrypted_check(const std::string& name, const Builder& make, size_t update
   for (size_t u = 0; u < updates; ++u) {
     Batch b = batch(plain, 2, 100 + static_cast<unsigned>(u));
     train_plain(plain, b.xs, b.ts, lr, frozen);
-    for (size_t s = 0; s < b.xs.size(); ++s) tr.accumulate(ctx, tr.encrypt_input(ctx, b.xs[s]), tr.encrypt_target(ctx, b.ts[s]));
+    size_t boots = 0;
+    for (size_t s = 0; s < b.xs.size(); ++s) {
+      tr.accumulate(ctx, tr.encrypt_input(ctx, b.xs[s]), tr.encrypt_target(ctx, b.ts[s]));
+      boots += tr.sample_bootstraps();
+    }
     tr.update(ctx, lr);
+    if (budget)
+      check(boots > 0, name + " bootstrapped activations and gradients",
+            "(" + std::to_string(boots) + " bootstraps for " + std::to_string(b.xs.size()) + " samples)");
     if (!boot)
       check(tr.weight_level() <= ctx.total_depth(), name + " weights within the planned depth",
             "(level " + std::to_string(tr.weight_level()) + " of " + std::to_string(ctx.total_depth()) + ")");
@@ -373,6 +395,20 @@ int main(int argc, char** argv) {
         2, true, 1e-3, {}, 0.3, 1);
   if (!quick) encrypted_check("mlp, bootstrapped weights", [] { return mlp(6); }, 3, true, 1e-3, {}, 0.3);
   if (!quick) encrypted_check("cnn, bootstrapped weights", [] { return cnn(7); }, 2, true, 1e-3, {}, 0.3);
+  // Bootstrapping inside the step: activations and gradients are refreshed
+  // whenever an operation would go deeper than the level budget.
+  encrypted_check("cnn, level budget 2", [] { return cnn(7); }, 2, true, 1e-3, {}, 0.3, 0, 2, 16.0);
+  if (!quick) {
+    Network probe = transformer_block(13);
+    probe.compile();
+    const uint32_t min_budget = Trainer(probe).min_level_budget();
+    encrypted_check("pre-norm transformer block, level budget", [] { return transformer_block(13); }, 1, true, 1e-3,
+                    {}, 0.3, 0, min_budget + 1, 32.0);
+    Network probe2 = attention_tokens(14, true, true);
+    probe2.compile();
+    encrypted_check("softmax attention with row maximum, level budget", [] { return attention_tokens(14, true, true); },
+                    1, true, 1e-3, {}, 0.3, 0, Trainer(probe2).min_level_budget() + 1, 8.0);
+  }
 
   std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");
   return g_failures ? 1 : 0;

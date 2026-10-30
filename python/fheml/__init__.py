@@ -141,7 +141,7 @@ def make_training_context(trainer, secure=True, bootstrapping=True, updates=1, r
 
 
 def make_trainer(net, frozen=(), secure=True, bootstrapping=True, updates=1, full_slots=True, slots=None,
-                 rotation_window=None, **overrides):
+                 rotation_window=None, level_budget=None, bootstrap_range=1.0, **overrides):
     """Encrypted-training setup: returns ``(trainer, ctx)``.
 
     full_slots recompiles ``net`` to use every slot of the ring (free per
@@ -149,9 +149,21 @@ def make_trainer(net, frozen=(), secure=True, bootstrapping=True, updates=1, ful
     ``slots`` caps that (bootstrapping keys grow with the slot count: at ring
     2^16 about 45 keys for 256 slots, 96 for 4096). See
     make_training_context for rotation_window.
+
+    level_budget bootstraps activations and gradients inside each step so
+    that no ciphertext goes deeper than that many levels (deep networks:
+    the step otherwise needs its whole depth between two bootstraps);
+    "min" picks Trainer.min_level_budget. bootstrap_range bounds the slot
+    values at those bootstraps (see Trainer.set_level_budget).
     """
     if rotation_window is None:
         rotation_window = 1 if secure else 0
+
+    def new_trainer():
+        t = Trainer(net, list(frozen))
+        if level_budget and bootstrapping:
+            t.set_level_budget(t.min_level_budget if level_budget == "min" else level_budget, bootstrap_range)
+        return t
 
     def options(tr):
         opts = tr.context_options(secure, bootstrapping, updates, rotation_window)
@@ -159,13 +171,13 @@ def make_trainer(net, frozen=(), secure=True, bootstrapping=True, updates=1, ful
             setattr(opts, k, v)
         return opts
 
-    trainer = Trainer(net, list(frozen))
+    trainer = new_trainer()
     opts = options(trainer)
     if full_slots or slots:
         want = slots or Context.ring_dim_for(opts) // 2
         if want != net.slots and want >= net.required_slots():
             net.compile(want)
-            trainer = Trainer(net, list(frozen))
+            trainer = new_trainer()
             opts = options(trainer)
     ctx = Context(opts)
     ctx.keygen(trainer.rotation_indices(rotation_window > 0))

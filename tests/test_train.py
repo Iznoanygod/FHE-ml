@@ -67,4 +67,25 @@ err = np.abs(params(enc) - params(ref)).max()
 print(f"layernorm + attention: max weight error {err:.1e}")
 assert err < 1e-4
 assert np.abs(params(ref) - params(build_tokens())).max() > 1e-3
+
+# Bootstrapping activations and gradients inside the step (level budget).
+xs, ts = rng.uniform(-1, 1, (2, 10)), rng.uniform(-1, 1, (2, 3))
+enc, ref = build(), build()
+trainer, ctx = fheml.make_trainer(enc, [], secure=False, full_slots=False, level_budget="min", bootstrap_range=4)
+print(trainer.summary())
+assert trainer.step_depth == trainer.level_budget < trainer.unbounded_step_depth
+try:
+    trainer.set_level_budget(1)
+    raise AssertionError("a budget below min_level_budget must be rejected")
+except ValueError:
+    pass
+trainer.encrypt_weights(ctx)
+fheml.train_step(trainer, ctx, xs, ts, lr=0.3)
+assert trainer.sample_bootstraps > 0
+fheml.train_plain(ref, xs, ts, lr=0.3)
+trainer.decrypt_weights(ctx)
+err = np.abs(params(enc) - params(ref)).max()
+print(f"level budget {trainer.level_budget}: {trainer.sample_bootstraps} bootstraps per sample, "
+      f"max weight error {err:.1e}")
+assert err < 1e-3
 print("PASSED")

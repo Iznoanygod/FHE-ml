@@ -28,6 +28,15 @@
 // with their ordinary encrypted evaluation, so fine-tuning the last layers
 // of any network is the same API.
 //
+// Deep networks (a softmax transformer block takes 36 levels per step) do
+// not fit one bootstrapping context. set_level_budget(K) caps the step at K
+// levels: before any operation that would take a ciphertext deeper than K
+// levels below the weights, its operands are bootstrapped, so activations in
+// the forward pass, gradients in the backward pass and the stored activations
+// the backward pass reuses are refreshed where needed, also in the middle of a
+// layer (between the max tournament, exp and 1/x of a softmax, or around the
+// 1/sqrt of a layer norm).
+//
 // This is slow: every weight diagonal is a ciphertext, and each update
 // bootstraps all of them. It exists to show the full pipeline works.
 #ifndef FHEML_TRAIN_H_
@@ -53,8 +62,28 @@ class Trainer {
   Trainer& operator=(const Trainer&) = delete;
 
   // Levels one training step (frozen prefix, forward, backward and update)
-  // consumes, counted from the weights' level.
+  // consumes, counted from the weights' level: at most the level budget when
+  // one is set.
   uint32_t step_depth() const;
+  // The same without bootstrapping inside the step.
+  uint32_t unbounded_step_depth() const;
+
+  // Bootstrapping inside the step (needs a bootstrapping context): no
+  // ciphertext goes deeper than `levels` below the weights' level. Values
+  // are divided by `range` (rounded up to a power of two) before each of
+  // these bootstraps and multiplied back after it, so slot values up to
+  // `range` in magnitude survive (bootstrapping needs about [-1, 1]); a range
+  // above 1 costs one more level of the context. levels = 0 turns it off.
+  // Throws when an indivisible operation (an activation polynomial, the
+  // 1/sqrt of a layer norm, the exp or 1/x series of a softmax, a frozen
+  // layer) needs more than `levels`, see min_level_budget().
+  void set_level_budget(uint32_t levels, double range = 1.0);
+  uint32_t level_budget() const { return budget_; }
+  double bootstrap_range() const { return static_cast<double>(1u << log_range_); }
+  uint32_t min_level_budget() const;
+  // Bootstraps of activations and gradients during the last accumulate() or
+  // forward() call (not counting the weights' bootstraps in update()).
+  size_t sample_bootstraps() const { return sample_bootstraps_; }
   // Rotation keys to generate. ladder = false: one key per rotation the step
   // uses (every diagonal offset and its negative, the rotate-and-sum steps),
   // which is heavy at 128-bit security. ladder = true: only the hoisted
@@ -62,7 +91,9 @@ class Trainer {
   // context's rotation-key ladder (set ContextOptions::rotation_window).
   std::vector<int32_t> rotation_indices(bool ladder = false) const;
   // CKKS parameters for training. Without bootstrapping, `updates` SGD
-  // updates fit before the weights run out of levels.
+  // updates fit before the weights run out of levels. With bootstrapping the
+  // depth between bootstraps is step_depth() (see set_level_budget). Scheme
+  // switching is enabled when an attention layer subtracts the row maximum.
   // With rotation_window > 0 the context uses a rotation-key ladder (see
   // rotation_indices(true)).
   ContextOptions context_options(bool secure = true, bool bootstrapping = true, uint32_t updates = 1,
@@ -103,6 +134,9 @@ class Trainer {
   size_t batch_ = 0;
   uint32_t base_level_ = 0;  // level weights and inputs are encrypted at
   bool encrypted_ = false;
+  uint32_t budget_ = 0;     // set_level_budget; 0 = no bootstrapping inside the step
+  uint32_t log_range_ = 0;  // log2 of the bootstrap range
+  size_t sample_bootstraps_ = 0;
 };
 
 // Plaintext reference of Trainer: one SGD update on a batch with the same

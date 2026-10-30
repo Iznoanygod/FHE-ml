@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <map>
 #include <set>
 #include <sstream>
@@ -45,6 +46,44 @@ void add_to(const FHEContext& ctx, Ctxt& acc, const Ctxt& c) {
     ctx.cc()->EvalAddInPlace(acc, c);
   else
     acc = c;
+}
+
+// Bootstrapping inside a step (Trainer::set_level_budget). Levels are counted
+// from `base`, the level weights and inputs are encrypted at; fit(c, d) makes
+// sure c has d levels left within the budget, bootstrapping it when not. The
+// passes call fit on every operand before an operation that consumes levels,
+// and never inside a parallel loop.
+struct Refresh {
+  const FHEContext* ctx = nullptr;
+  int base = 0;
+  uint32_t budget = 0;  // 0: never
+  uint32_t log_range = 0;
+  size_t count = 0;
+
+  int level(const Ctxt& c) const { return static_cast<int>(lvl(c)) - base; }
+
+  void fit(Ctxt& c, uint32_t depth) {
+    if (!budget || !c || level(c) + static_cast<int>(depth) <= static_cast<int>(budget)) return;
+    if (depth > budget)
+      throw std::invalid_argument("train: an operation needs " + std::to_string(depth) +
+                                  " levels, more than the level budget " + std::to_string(budget));
+    const CC& cc = ctx->cc();
+    // Into [-1, 1] for the bootstrap (one level), back with doublings (none).
+    Ctxt t = log_range ? cc->EvalMult(c, std::ldexp(1.0, -static_cast<int>(log_range))) : c;
+    t = ctx->bootstrap(t);
+    for (uint32_t i = 0; i < log_range; ++i) t = cc->EvalAdd(t, t);
+    c = t;
+    ++count;
+  }
+
+  void fit_all(std::vector<Ctxt>& v, uint32_t depth) {
+    for (Ctxt& c : v) fit(c, depth);
+  }
+};
+
+// Levels of a Chebyshev series of this degree on [a, b].
+uint32_t chebyshev_depth(uint32_t degree, double a, double b) {
+  return poly_depth(degree) + (a == -1.0 && b == 1.0 ? 0 : 1);
 }
 
 // d/dx of sum_k c_k x^k.
@@ -569,8 +608,9 @@ void for_each_attention(std::vector<std::unique_ptr<Node>>& nodes, F f) {
 
 // --------------------------------------------------------- encrypted passes
 
-Ctxt linear_forward(const FHEContext& ctx, Node& n, const Ctxt& x) {
+Ctxt linear_forward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt x) {
   const CC& cc = ctx.cc();
+  rf.fit(x, 1);
   n.in = x;
   const std::vector<Ctxt> rot = ctx.rotate_many(x, n.offs);
   std::vector<Ctxt> terms(n.offs.size());
@@ -587,9 +627,11 @@ Ctxt linear_forward(const FHEContext& ctx, Node& n, const Ctxt& x) {
 }
 
 // dL/dD_i = g (*) rot_i(x) summed over the batch; returns dL/dx when asked.
-Ctxt linear_backward(const FHEContext& ctx, Node& n, const Ctxt& g, bool need) {
+Ctxt linear_backward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt g, bool need) {
   const CC& cc = ctx.cc();
+  rf.fit(g, 1);
   if (n.trainable) {
+    rf.fit(n.in, 1);
     const std::vector<Ctxt> rot = ctx.rotate_many(n.in, n.offs);
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
     for (size_t i = 0; i < n.offs.size(); ++i) add_to(ctx, n.gD[i], cc->EvalMult(g, rot[i]));
@@ -625,15 +667,20 @@ Ctxt window_broadcast(const FHEContext& ctx, const Ctxt& c, int width) {
 
 // Attention::forward with the projections as trainable nodes and every
 // rotation through the context (so a rotation-key ladder works); keeps what
-// the backward pass needs.
-Ctxt attention_forward(const FHEContext& ctx, Node& n, const Ctxt& x) {
+// the backward pass needs. With a level budget the scores, exponentials, the
+// row sum and its inverse are refreshed between the steps as needed.
+Ctxt attention_forward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt x) {
   const CC& cc = ctx.cc();
   const Attention& at = *n.att;
   const int tokens = at.tokens(), dh = at.head_width(), B = at.stride();
   const int32_t nd = tokens * B;
-  n.q = linear_forward(ctx, *n.body[0], x);
-  Ctxt k = linear_forward(ctx, *n.body[1], x);
-  Ctxt v = linear_forward(ctx, *n.body[2], x);
+  rf.fit(x, 1);  // once for the three projections
+  n.q = linear_forward(ctx, rf, *n.body[0], x);
+  Ctxt k = linear_forward(ctx, rf, *n.body[1], x);
+  Ctxt v = linear_forward(ctx, rf, *n.body[2], x);
+  rf.fit(n.q, 1);
+  rf.fit(k, 1);
+  rf.fit(v, 1);
   // Cyclic copies in [n*B, 2n*B) so rotating by s*B maps token i to (i + s) mod n.
   k = cc->EvalAdd(k, ctx.rotate(k, -nd));
   v = cc->EvalAdd(v, ctx.rotate(v, -nd));
@@ -653,6 +700,9 @@ Ctxt attention_forward(const FHEContext& ctx, Node& n, const Ctxt& x) {
     while (vals.size() > 1) {
       std::vector<Ctxt> next((vals.size() + 1) / 2);
       for (size_t i = 0; i + 1 < vals.size(); i += 2) {
+        // compare() needs two levels left, the selection product one.
+        rf.fit(vals[i], 1);
+        rf.fit(vals[i + 1], 1);
         Ctxt sel = ctx.compare(vals[i], vals[i + 1], range);
         next[i / 2] = cc->EvalAdd(vals[i], cc->EvalMult(sel, cc->EvalSub(vals[i + 1], vals[i])));
       }
@@ -663,20 +713,34 @@ Ctxt attention_forward(const FHEContext& ctx, Node& n, const Ctxt& x) {
   }
   n.aw.assign(static_cast<size_t>(tokens), nullptr);
   n.A.assign(static_cast<size_t>(tokens), nullptr);
+  if (softmax) {
+    const SoftmaxOptions& o = at.softmax_options();
+    rf.fit_all(n.p, chebyshev_depth(o.exp_degree, at.exp_lo(), at.exp_hi()));
+    std::vector<Ctxt> e(static_cast<size_t>(tokens));
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+    for (int s = 0; s < tokens; ++s) {
+      std::vector<double> c = at.exp_coeffs();
+      e[static_cast<size_t>(s)] = cc->EvalChebyshevSeries(n.p[static_cast<size_t>(s)], c, at.exp_lo(), at.exp_hi());
+    }
+    rf.fit_all(e, 1);
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+    for (int s = 0; s < tokens; ++s) n.aw[static_cast<size_t>(s)] = mul_plain(ctx, e[static_cast<size_t>(s)], at.head_mask());
+  } else {
+    rf.fit_all(n.p, 2);
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+    for (int s = 0; s < tokens; ++s) {
+      const size_t i = static_cast<size_t>(s);
+      Ctxt a = add_plain(ctx, mul_plain(ctx, n.p[i], at.score_mask(2)), at.score_mask(1));
+      n.aw[i] = add_plain(ctx, cc->EvalMult(n.p[i], a), at.score_mask(0));
+    }
+  }
+  rf.fit_all(n.aw, 1);
+  rf.fit_all(n.vr, 1);
   std::vector<Ctxt> partial(static_cast<size_t>(tokens));
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
   for (int s = 0; s < tokens; ++s) {
     const size_t i = static_cast<size_t>(s);
-    Ctxt a;
-    if (softmax) {
-      std::vector<double> c = at.exp_coeffs();
-      a = mul_plain(ctx, cc->EvalChebyshevSeries(n.p[i], c, at.exp_lo(), at.exp_hi()), at.head_mask());
-    } else {
-      a = add_plain(ctx, mul_plain(ctx, n.p[i], at.score_mask(2)), at.score_mask(1));
-      a = add_plain(ctx, cc->EvalMult(n.p[i], a), at.score_mask(0));
-    }
-    n.aw[i] = a;
-    n.A[i] = window_broadcast(ctx, a, dh);
+    n.A[i] = window_broadcast(ctx, n.aw[i], dh);
     partial[i] = cc->EvalMult(n.A[i], n.vr[i]);
   }
   Ctxt o = sum(ctx, std::move(partial));
@@ -685,50 +749,79 @@ Ctxt attention_forward(const FHEContext& ctx, Node& n, const Ctxt& x) {
     Ctxt S = tokens > 1 ? cc->EvalAdd(n.A[0], n.A[1]) : n.A[0];
     for (int s = 2; s < tokens; ++s) cc->EvalAddInPlace(S, n.A[static_cast<size_t>(s)]);
     S = add_plain(ctx, S, at.pad_sum());
+    rf.fit(S, chebyshev_depth(sm.inv_degree, at.sum_lo(), at.sum_hi()));
     std::vector<double> c = at.inv_coeffs();
     Ctxt y = cc->EvalChebyshevSeries(S, c, at.sum_lo(), at.sum_hi());
-    for (uint32_t i = 0; i < sm.newton; ++i) y = cc->EvalMult(y, cc->EvalSub(2.0, cc->EvalMult(S, y)));
+    for (uint32_t i = 0; i < sm.newton; ++i) {
+      rf.fit(S, 2);
+      rf.fit(y, 2);
+      y = cc->EvalMult(y, cc->EvalSub(2.0, cc->EvalMult(S, y)));
+    }
+    rf.fit(y, 1);
+    rf.fit(o, 1);
     n.y = y;
     n.o = o;
     o = cc->EvalMult(o, y);
   }
-  return linear_forward(ctx, *n.body[3], o);
+  return linear_forward(ctx, rf, *n.body[3], o);
 }
 
 // The gradient of attention_forward. The softmax and 1/x are differentiated
 // as the functions they approximate (exp' = exp, (1/S)' = -1/S^2), so the
 // gradient matches the exact softmax up to the approximation error.
-Ctxt attention_backward(const FHEContext& ctx, Node& n, const Ctxt& g, bool need) {
+Ctxt attention_backward(const FHEContext& ctx, Refresh& rf, Node& n, const Ctxt& g, bool need) {
   const CC& cc = ctx.cc();
   const Attention& at = *n.att;
   const int tokens = at.tokens(), dh = at.head_width(), B = at.stride();
   const int32_t nd = tokens * B;
   const bool softmax = at.softmax();
-  Ctxt go = linear_backward(ctx, *n.body[3], g, true);
+  Ctxt go = linear_backward(ctx, rf, *n.body[3], g, true);
   Ctxt dO = go, c;
   if (softmax) {
     // out = o (*) y, y = 1 / S, S = sum_s A_s: dL/dA_s = dO (*) v_s - go (*) o (*) y^2.
+    rf.fit(go, 2);
+    rf.fit(n.o, 2);
+    rf.fit(n.y, 2);
     dO = cc->EvalMult(go, n.y);
     c = cc->EvalMult(cc->EvalMult(go, n.o), cc->EvalMult(n.y, n.y));
   }
-  std::vector<Ctxt> P(static_cast<size_t>(tokens)), dqs(static_cast<size_t>(tokens)), dks(static_cast<size_t>(tokens)),
-      dvs(static_cast<size_t>(tokens));
+  rf.fit(dO, 1);
+  rf.fit_all(n.vr, 1);
+  const size_t T = static_cast<size_t>(tokens);
+  std::vector<Ctxt> da(T), P(T), dqs(T), dks(T), dvs(T);
+  // A_s broadcasts a_s over the head: da_s = window sum of dA_s.
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
   for (int s = 0; s < tokens; ++s) {
     const size_t i = static_cast<size_t>(s);
     Ctxt dA = cc->EvalMult(dO, n.vr[i]);
     if (c) dA = cc->EvalSub(dA, c);
-    // A_s broadcasts a_s over the head: da_s = window sum of dA_s; then through
-    // the (masked) score function to the q.k sums.
-    Ctxt da = window_sum(ctx, dA, dh);
+    da[i] = window_sum(ctx, dA, dh);
+  }
+  // Then through the (masked) score function to the q.k sums.
+  rf.fit_all(da, 1);
+  if (softmax)
+    rf.fit_all(n.aw, 1);
+  else
+    rf.fit_all(n.p, 2);
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+  for (int s = 0; s < tokens; ++s) {
+    const size_t i = static_cast<size_t>(s);
     Ctxt dp;
     if (softmax) {
-      dp = cc->EvalMult(da, n.aw[i]);
+      dp = cc->EvalMult(da[i], n.aw[i]);
     } else {
       Ctxt slope = add_plain(ctx, mul_plain(ctx, n.p[i], scaled(at.score_mask(2), 2.0)), at.score_mask(1));
-      dp = cc->EvalMult(da, slope);
+      dp = cc->EvalMult(da[i], slope);
     }
     P[i] = window_broadcast(ctx, dp, dh);  // the q.k sums spread over the head
+  }
+  rf.fit_all(P, 1);
+  rf.fit(n.q, 1);
+  rf.fit_all(n.kr, 1);
+  rf.fit_all(n.A, 1);
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+  for (int s = 0; s < tokens; ++s) {
+    const size_t i = static_cast<size_t>(s);
     dqs[i] = cc->EvalMult(P[i], n.kr[i]);
     dks[i] = ctx.rotate(cc->EvalMult(P[i], n.q), -s * B);
     dvs[i] = ctx.rotate(cc->EvalMult(dO, n.A[i]), -s * B);
@@ -739,9 +832,9 @@ Ctxt attention_backward(const FHEContext& ctx, Node& n, const Ctxt& g, bool need
   dk = cc->EvalAdd(dk, ctx.rotate(dk, nd));
   Ctxt dv = sum(ctx, std::move(dvs));
   dv = cc->EvalAdd(dv, ctx.rotate(dv, nd));
-  Ctxt gx = linear_backward(ctx, *n.body[0], dq, need);
-  Ctxt gk = linear_backward(ctx, *n.body[1], dk, need);
-  Ctxt gv = linear_backward(ctx, *n.body[2], dv, need);
+  Ctxt gx = linear_backward(ctx, rf, *n.body[0], dq, need);
+  Ctxt gk = linear_backward(ctx, rf, *n.body[1], dk, need);
+  Ctxt gv = linear_backward(ctx, rf, *n.body[2], dv, need);
   n.kr.clear();
   n.vr.clear();
   n.p.clear();
@@ -754,14 +847,18 @@ Ctxt attention_backward(const FHEContext& ctx, Node& n, const Ctxt& g, bool need
   return gx;
 }
 
-Ctxt forward_nodes(const FHEContext& ctx, std::vector<std::unique_ptr<Node>>& nodes, Ctxt x) {
+Ctxt forward_nodes(const FHEContext& ctx, Refresh& rf, std::vector<std::unique_ptr<Node>>& nodes, Ctxt x) {
   for (auto& np : nodes) {
     Node& n = *np;
     switch (n.kind) {
-      case Node::kLinear: x = linear_forward(ctx, n, x); break;
+      case Node::kLinear: x = linear_forward(ctx, rf, n, x); break;
       case Node::kNorm: {
+        rf.fit(x, n.norm->inv_sqrt_depth());
         n.norm->normalize(ctx, x, n.centred, n.r);
+        rf.fit(n.centred, 1);
         Ctxt cg = n.trainable ? ctx.cc()->EvalMult(n.centred, n.D[0]) : mul_plain(ctx, n.centred, n.diag[0]);
+        rf.fit(cg, 1);
+        rf.fit(n.r, 1);
         x = ctx.cc()->EvalMult(cg, n.r);
         if (n.trainable)
           ctx.cc()->EvalAddInPlace(x, n.B);
@@ -769,14 +866,15 @@ Ctxt forward_nodes(const FHEContext& ctx, std::vector<std::unique_ptr<Node>>& no
           x = add_plain(ctx, x, n.bias);
         break;
       }
-      case Node::kAttn: x = attention_forward(ctx, n, x); break;
+      case Node::kAttn: x = attention_forward(ctx, rf, n, x); break;
       case Node::kResidual: {
         n.in = x;
-        Ctxt y = forward_nodes(ctx, n.body, x);
+        Ctxt y = forward_nodes(ctx, rf, n.body, x);
         x = ctx.cc()->EvalAdd(y, x);
         break;
       }
       default:
+        rf.fit(x, n.layer->depth());
         n.in = x;
         x = n.layer->forward(ctx, x);
         break;
@@ -786,44 +884,59 @@ Ctxt forward_nodes(const FHEContext& ctx, std::vector<std::unique_ptr<Node>>& no
 }
 
 // Returns dL/dx (null when need_input_grad is false).
-Ctxt backward_nodes(const FHEContext& ctx, std::vector<std::unique_ptr<Node>>& nodes, Ctxt g, bool need_input_grad) {
+Ctxt backward_nodes(const FHEContext& ctx, Refresh& rf, std::vector<std::unique_ptr<Node>>& nodes, Ctxt g,
+                    bool need_input_grad) {
   const CC& cc = ctx.cc();
   for (size_t k = nodes.size(); k-- > 0;) {
     Node& n = *nodes[k];
     const bool need = k > 0 || need_input_grad;
     switch (n.kind) {
-      case Node::kLinear: g = linear_backward(ctx, n, g, need); break;
+      case Node::kLinear: g = linear_backward(ctx, rf, n, g, need); break;
       case Node::kNorm: {
         // y = gamma (*) x_hat + beta, x_hat = centred (*) r:
         // dgamma = g (*) x_hat, dbeta = g (summed over the tokens at update),
         // dx = r (*) (gg - mean(gg) - x_hat (*) mean(gg (*) x_hat)), gg = g (*) gamma.
+        rf.fit(n.centred, 1);
+        rf.fit(n.r, 1);
         Ctxt xhat = cc->EvalMult(n.centred, n.r);
+        rf.fit(g, 1);
+        rf.fit(xhat, 1);
         if (n.trainable) {
           add_to(ctx, n.gD[0], cc->EvalMult(g, xhat));
           add_to(ctx, n.gB, g);
         }
         if (need) {
           Ctxt gg = n.trainable ? cc->EvalMult(g, n.D[0]) : mul_plain(ctx, g, n.diag[0]);
+          rf.fit(gg, 1);
           Ctxt m1 = n.norm->block_mean(ctx, gg);
-          Ctxt m2 = n.norm->block_mean(ctx, cc->EvalMult(gg, xhat));
+          Ctxt t = cc->EvalMult(gg, xhat);
+          rf.fit(t, 1);
+          Ctxt m2 = n.norm->block_mean(ctx, t);
+          rf.fit(m2, 1);
           Ctxt inner = cc->EvalSub(cc->EvalSub(gg, m1), cc->EvalMult(xhat, m2));
+          rf.fit(inner, 1);
+          rf.fit(n.r, 1);
           g = cc->EvalMult(inner, n.r);
         }
         n.centred = n.r = nullptr;
         break;
       }
-      case Node::kAttn: g = attention_backward(ctx, n, g, need); break;
+      case Node::kAttn: g = attention_backward(ctx, rf, n, g, need); break;
       case Node::kSquare:
       case Node::kPoly:
       case Node::kCheb:
         if (need) {
+          rf.fit(g, 1);
           if (n.kind == Node::kSquare) {
+            rf.fit(n.in, 1);
             g = cc->EvalMult(g, cc->EvalAdd(n.in, n.in));
           } else if (n.dcoef.size() == 1) {
             g = cc->EvalMult(g, n.kind == Node::kCheb ? n.dcoef[0] / 2.0 : n.dcoef[0]);
           } else {
+            rf.fit(n.in, derivative_depth(n));
             Ctxt f = n.kind == Node::kPoly ? PolyActivation(n.dcoef).forward(ctx, n.in)
                                            : cc->EvalChebyshevSeries(n.in, n.dcoef, n.a, n.b);
+            rf.fit(f, 1);
             g = cc->EvalMult(g, f);
           }
         }
@@ -833,7 +946,7 @@ Ctxt backward_nodes(const FHEContext& ctx, std::vector<std::unique_ptr<Node>>& n
         if (need) g = ctx.bootstrap(g);
         break;
       case Node::kResidual: {
-        Ctxt gb = backward_nodes(ctx, n.body, g, need);
+        Ctxt gb = backward_nodes(ctx, rf, n.body, g, need);
         if (need) g = cc->EvalAdd(gb, g);
         n.in = nullptr;
         break;
@@ -850,8 +963,11 @@ Ctxt allsum(const FHEContext& ctx, Ctxt c) {
   return c;
 }
 
-void update_linear(const FHEContext& ctx, Node& n, double step) {
+void update_linear(const FHEContext& ctx, Refresh& rf, Node& n, double step) {
   const CC& cc = ctx.cc();
+  // Masking takes one level, a shared weight's masked sum and broadcast two.
+  rf.fit_all(n.gD, n.groups.empty() ? 1 : 2);
+  rf.fit(n.gB, n.groups.empty() ? 1 : 2);
   std::vector<Ctxt> delta(n.offs.size());
   Ctxt delta_b;
   // Unshared weights: their own slot's gradient.
@@ -1123,6 +1239,11 @@ Trainer::Trainer(Network& net, std::vector<size_t> frozen) : net_(net) {
 Trainer::~Trainer() = default;
 
 uint32_t Trainer::step_depth() const {
+  const uint32_t d = unbounded_step_depth();
+  return budget_ ? std::min(d, budget_) : d;
+}
+
+uint32_t Trainer::unbounded_step_depth() const {
   // Relative to the weights' level; the frozen prefix runs first.
   uint32_t prefix = 0;
   const auto& layers = net_.layers();
@@ -1132,6 +1253,46 @@ uint32_t Trainer::step_depth() const {
   uint32_t y = sim_forward(s, nodes_, prefix, tr);
   sim_backward(s, nodes_, tr, y);
   return std::max(s.max, s.new_w);
+}
+
+uint32_t Trainer::min_level_budget() const {
+  // The deepest indivisible operation; any product of fitted operands takes
+  // one level, a shared-weight update or the softmax backward two.
+  uint32_t m = 2;
+  const auto& layers = net_.layers();
+  for (size_t i = 0; i < first_; ++i) m = std::max(m, layers[i]->depth());
+  std::function<void(const std::vector<std::unique_ptr<Node>>&)> walk = [&](const auto& nodes) {
+    for (const auto& np : nodes) {
+      const Node& n = *np;
+      switch (n.kind) {
+        case Node::kSquare:
+        case Node::kPoly:
+        case Node::kCheb: m = std::max({m, n.layer->depth(), derivative_depth(n)}); break;
+        case Node::kNorm: m = std::max(m, n.norm->inv_sqrt_depth()); break;
+        case Node::kAttn:
+          if (n.att->softmax()) {
+            const SoftmaxOptions& o = n.att->softmax_options();
+            m = std::max({m, chebyshev_depth(o.exp_degree, n.att->exp_lo(), n.att->exp_hi()),
+                          chebyshev_depth(o.inv_degree, n.att->sum_lo(), n.att->sum_hi())});
+          }
+          break;
+        case Node::kResidual: walk(n.body); break;
+        default: break;
+      }
+    }
+  };
+  walk(nodes_);
+  return m;
+}
+
+void Trainer::set_level_budget(uint32_t levels, double range) {
+  if (!(range >= 1.0)) throw std::invalid_argument("train: the bootstrap range must be at least 1");
+  if (levels && levels < min_level_budget())
+    throw std::invalid_argument("train: a level budget of " + std::to_string(levels) + " is below the " +
+                                std::to_string(min_level_budget()) + " levels the deepest single operation needs");
+  budget_ = levels;
+  log_range_ = 0;
+  while (std::ldexp(1.0, static_cast<int>(log_range_)) < range) ++log_range_;
 }
 
 std::vector<int32_t> Trainer::rotation_indices(bool ladder) const {
@@ -1154,10 +1315,13 @@ ContextOptions Trainer::context_options(bool secure, bool bootstrapping, uint32_
   o.secure = secure;
   o.bootstrapping = bootstrapping;
   o.rotation_window = rotation_window;
+  o.scheme_switching = net_.uses_scheme_switching();
   if (bootstrapping) {
     // +1: weights restart one level below a fresh bootstrap (unpacking mask);
-    // +1: EvalBootstrap needs one level left.
-    o.mult_depth = step_depth() + 2;
+    // +1: EvalBootstrap needs one level left; +1 when activations and
+    // gradients are bootstrapped with a range: the division before it.
+    const bool inside = budget_ && unbounded_step_depth() > budget_;
+    o.mult_depth = step_depth() + 2 + (inside && log_range_ ? 1 : 0);
     // Bootstrapping precision: about 1e-2 at 50 bits on full-slot toy rings,
     // 1e-10 at 50 bits on ring 2^16, where 55 bits would not fit 24 levels.
     o.scale_mod_bits = secure ? 50 : 55;
@@ -1212,18 +1376,44 @@ Ctxt Trainer::encrypt_target(const FHEContext& ctx, const std::vector<double>& t
   return ctx.encrypt(v, ctx.options().bootstrapping ? ctx.bootstrap_depth() + 1 : 0);
 }
 
+namespace {
+
+Refresh make_refresh(const FHEContext& ctx, uint32_t base, uint32_t budget, uint32_t log_range) {
+  Refresh rf;
+  rf.ctx = &ctx;
+  rf.base = static_cast<int>(base);
+  rf.budget = ctx.options().bootstrapping ? budget : 0;
+  rf.log_range = log_range;
+  return rf;
+}
+
+Ctxt run_forward(const FHEContext& ctx, Refresh& rf, const Network& net, size_t first,
+                 std::vector<std::unique_ptr<Node>>& nodes, Ctxt c) {
+  const auto& layers = net.layers();
+  for (size_t i = 0; i < first; ++i) {
+    if (!layers[i]->is_bootstrap()) rf.fit(c, layers[i]->depth());
+    c = layers[i]->forward(ctx, c);
+  }
+  return forward_nodes(ctx, rf, nodes, c);
+}
+
+}  // namespace
+
 Ctxt Trainer::forward(const FHEContext& ctx, const Ctxt& x) {
   if (!encrypted_) throw std::logic_error("train: encrypt_weights() first");
-  const auto& layers = net_.layers();
-  Ctxt c = x;
-  for (size_t i = 0; i < first_; ++i) c = layers[i]->forward(ctx, c);
-  return forward_nodes(ctx, nodes_, c);
+  Refresh rf = make_refresh(ctx, base_level_, budget_, log_range_);
+  Ctxt y = run_forward(ctx, rf, net_, first_, nodes_, x);
+  sample_bootstraps_ = rf.count;
+  return y;
 }
 
 Ctxt Trainer::accumulate(const FHEContext& ctx, const Ctxt& x, const Ctxt& target) {
-  Ctxt y = forward(ctx, x);
+  if (!encrypted_) throw std::logic_error("train: encrypt_weights() first");
+  Refresh rf = make_refresh(ctx, base_level_, budget_, log_range_);
+  Ctxt y = run_forward(ctx, rf, net_, first_, nodes_, x);
   Ctxt g = ctx.cc()->EvalSub(y, target);  // d(0.5 |y - t|^2)/dy
-  backward_nodes(ctx, nodes_, g, false);
+  backward_nodes(ctx, rf, nodes_, g, false);
+  sample_bootstraps_ = rf.count;
   ++batch_;
   return y;
 }
@@ -1231,8 +1421,9 @@ Ctxt Trainer::accumulate(const FHEContext& ctx, const Ctxt& x, const Ctxt& targe
 void Trainer::update(const FHEContext& ctx, double lr) {
   if (!batch_) throw std::logic_error("train: no accumulated gradients");
   const double step = -lr / static_cast<double>(batch_);
+  Refresh rf = make_refresh(ctx, base_level_, budget_, log_range_);
   for_each_weighted(nodes_, [&](Node& n) {
-    if (n.trainable) update_linear(ctx, n, step);
+    if (n.trainable) update_linear(ctx, rf, n, step);
   });
   if (ctx.options().bootstrapping) {
     std::map<uint32_t, std::vector<Ctxt*>> by_window;
@@ -1306,6 +1497,9 @@ std::string Trainer::summary() const {
     os << "\n";
   });
   os << "weight ciphertexts " << weight_ciphertexts() << ", step depth " << step_depth();
+  if (budget_ && unbounded_step_depth() > budget_)
+    os << " (" << unbounded_step_depth() << " without bootstrapping activations and gradients, range "
+       << bootstrap_range() << ")";
   return os.str();
 }
 

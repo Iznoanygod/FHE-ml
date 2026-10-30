@@ -491,6 +491,32 @@ ring buys 55-bit scaling and far better bootstraps at twice the memory.
 The same bootstraps work inside encrypted training: the trainer bootstraps
 the activation on the way forward and the gradient on the way back.
 
+### Training deep networks: bootstrapping inside the step
+
+`place_bootstraps` works layer by layer and only for inference. A training
+step is much deeper than the forward pass (one softmax transformer block
+takes 36 levels from the forward pass through the backward pass to the
+weight update), its activations are reused by the backward pass, and the
+deepest pieces (softmax, layer norm) are single layers. With a level budget
+the trainer bootstraps inside the step instead:
+
+```python
+trainer, ctx = fheml.make_trainer(net, level_budget="min", bootstrap_range=32)
+# or: trainer.set_level_budget(12, range=32) before building the context
+```
+
+Before every operation that would take a ciphertext deeper than the budget,
+its operands are bootstrapped: activations on the way forward, gradients on
+the way back, the stored activations the backward pass reuses, and the
+intermediate values inside a layer (between the max tournament, the exp and
+the 1/x of a softmax, around the 1/sqrt of a layer norm, before a weight
+update). The context then only needs the budget plus the bootstrap's own
+levels. `range` bounds the slot values at these bootstraps: they are divided
+by it (a power of two, one level) before and doubled back after (free).
+`min_level_budget` is the deepest indivisible operation (the 1/sqrt series
+of a layer norm, a softmax series, an activation polynomial),
+`sample_bootstraps` counts the bootstraps of the last sample.
+
 ## Using the library
 
 ```cpp
