@@ -15,18 +15,32 @@
 // a masked rotate-and-sum, which also broadcasts the sum back to every slot.
 // Activations backpropagate through their derivative polynomial, evaluated
 // under encryption. The loss is 0.5 * |y - t|^2 against an encrypted target
-// (so dL/dy = y - t). Gradients are summed over a batch and applied in one
-// update, after which the weights are bootstrapped so the next step starts
+// (so dL/dy = y - t), or softmax cross-entropy (see Loss). Gradients are
+// summed over a batch and applied in one update, after which the weights are
+// bootstrapped so the next step starts
 // fresh; without bootstrapping only as many updates fit as the depth allows.
 //
 // Layer norms train gamma and beta (shared over the tokens like a conv tap)
 // and backpropagate through the normalisation with the forward's 1/sqrt;
 // attention trains its four projections and backpropagates through the
 // scores (quadratic or softmax) with the forward's rotated keys and values.
+// Max pooling backpropagates with the forward's comparison bits (no further
+// scheme switching): each window's gradient goes to the tap that won the
+// tournament.
 //
 // The layers before the first trainable layer (`frozen`) only run forward,
 // with their ordinary encrypted evaluation, so fine-tuning the last layers
 // of any network is the same API.
+//
+// Deep networks (a pre-norm softmax transformer block takes 80 levels per
+// step, softmax attention alone 36) do
+// not fit one bootstrapping context. set_level_budget(K) caps the step at K
+// levels: before any operation that would take a ciphertext deeper than K
+// levels below the weights, its operands are bootstrapped, so activations in
+// the forward pass, gradients in the backward pass and the stored activations
+// the backward pass reuses are refreshed where needed, also in the middle of a
+// layer (between the max tournament, exp and 1/x of a softmax, or around the
+// 1/sqrt of a layer norm).
 //
 // This is slow: every weight diagonal is a ciphertext, and each update
 // bootstraps all of them. It exists to show the full pipeline works.
@@ -38,23 +52,88 @@
 #include <vector>
 
 #include "fheml/network.h"
+#include "fheml/transformer.h"
 
 namespace fheml {
+
+// Training loss against an encrypted target t.
+//
+// kMSE: 0.5 |y - t|^2, dL/dy = y - t (no levels).
+//
+// kCrossEntropy: -sum_i t_i log softmax(y)_i for a probability-vector
+// (normally one-hot) target, dL/dy = softmax(y) - t. The softmax runs under
+// encryption with the approximations of softmax attention (SoftmaxOptions):
+// exp is a Chebyshev series on [lo, hi] (the range of the logits), masked to
+// the output slots, summed over all slots (a rotate-and-sum, so every slot
+// holds the sum), inverted with a Chebyshev series of 1/x on
+// [sum_lo, sum_hi] (0, 0 = k e^lo .. k e^hi for k outputs) plus `newton`
+// Newton steps. Levels: pd(exp_degree) + 2 + pd(inv_degree) + 1 + 2 newton
+// + 1, plus one when the last layer is not linear (its padding slots are
+// masked first).
+//
+// subtract_max: the largest logit is found with scheme-switching comparisons
+// (FHEContext::compare; a max tree over log2 of the output span, so 4
+// comparisons for 10 outputs) and subtracted first; then exp lives on
+// [lo - hi, 0] and the sum on [1, k], so no calibration is needed. Costs about
+// compare_depth() + log2(span) + 2 levels on top and the comparisons' time;
+// the context then needs scheme switching (context_options sets it).
+//
+// The loss value itself is not computed under encryption: the client
+// decrypts the returned logits and evaluates it (cross_entropy_plain).
+struct Loss {
+  enum Kind { kMSE, kCrossEntropy };
+  Kind kind = kMSE;
+  SoftmaxOptions softmax;  // kCrossEntropy only
+
+  static Loss mse() { return Loss{}; }
+  static Loss cross_entropy(const SoftmaxOptions& o = SoftmaxOptions{}) {
+    Loss l;
+    l.kind = kCrossEntropy;
+    l.softmax = o;
+    return l;
+  }
+};
+
+// The softmax Trainer computes under encryption for cross-entropy (same
+// polynomials), and the exact -sum t log softmax(y).
+std::vector<double> softmax_plain(const Loss& loss, const std::vector<double>& y);
+double cross_entropy_plain(const std::vector<double>& y, const std::vector<double>& t);
 
 class Trainer {
  public:
   // `net` must be compiled and outlive the trainer. `frozen` lists top-level
   // layer indices whose weights stay fixed. From the first trainable layer on
   // the network may contain linear layers, square / poly / chebyshev
-  // activations, layernorm, attention, bootstrap and residual layers.
-  explicit Trainer(Network& net, std::vector<size_t> frozen = {});
+  // activations, layernorm, attention, maxpool2d, bootstrap and residual
+  // layers.
+  explicit Trainer(Network& net, std::vector<size_t> frozen = {}, Loss loss = Loss{});
   ~Trainer();
   Trainer(const Trainer&) = delete;
   Trainer& operator=(const Trainer&) = delete;
 
   // Levels one training step (frozen prefix, forward, backward and update)
-  // consumes, counted from the weights' level.
+  // consumes, counted from the weights' level: at most the level budget when
+  // one is set.
   uint32_t step_depth() const;
+  // The same without bootstrapping inside the step.
+  uint32_t unbounded_step_depth() const;
+
+  // Bootstrapping inside the step (needs a bootstrapping context): no
+  // ciphertext goes deeper than `levels` below the weights' level. Values
+  // are divided by `range` (rounded up to a power of two) before each of
+  // these bootstraps and multiplied back after it, so slot values up to
+  // `range` in magnitude survive (bootstrapping needs about [-1, 1]); a range
+  // above 1 costs one more level of the context. levels = 0 turns it off.
+  // Throws when an indivisible operation (an activation polynomial, the
+  // 1/sqrt of a layer norm, the exp or 1/x series of a softmax, a frozen
+  // layer) needs more than `levels`, see min_level_budget().
+  void set_level_budget(uint32_t levels, double range = 1.0);
+  uint32_t level_budget() const { return budget_; }
+  double bootstrap_range() const { return static_cast<double>(1u << log_range_); }
+  uint32_t min_level_budget() const;
+  // Bootstraps of activations and gradients during the last accumulate() or
+  // forward() call (not counting the weights' bootstraps in update()).
+  size_t sample_bootstraps() const { return sample_bootstraps_; }
   // Rotation keys to generate. ladder = false: one key per rotation the step
   // uses (every diagonal offset and its negative, the rotate-and-sum steps),
   // which is heavy at 128-bit security. ladder = true: only the hoisted
@@ -62,7 +141,9 @@ class Trainer {
   // context's rotation-key ladder (set ContextOptions::rotation_window).
   std::vector<int32_t> rotation_indices(bool ladder = false) const;
   // CKKS parameters for training. Without bootstrapping, `updates` SGD
-  // updates fit before the weights run out of levels.
+  // updates fit before the weights run out of levels. With bootstrapping the
+  // depth between bootstraps is step_depth() (see set_level_budget). Scheme
+  // switching is enabled when an attention layer subtracts the row maximum.
   // With rotation_window > 0 the context uses a rotation-key ladder (see
   // rotation_indices(true)).
   ContextOptions context_options(bool secure = true, bool bootstrapping = true, uint32_t updates = 1,
@@ -92,8 +173,11 @@ class Trainer {
   // Highest level of any weight ciphertext (for tests and planning).
   uint32_t weight_level() const;
   std::string summary() const;
+  const Loss& loss() const { return loss_; }
 
   struct Node;
+  struct CrossEntropy;
+  struct Refresh;
 
  private:
   Network& net_;
@@ -103,13 +187,21 @@ class Trainer {
   size_t batch_ = 0;
   uint32_t base_level_ = 0;  // level weights and inputs are encrypted at
   bool encrypted_ = false;
+  Loss loss_;
+  std::unique_ptr<CrossEntropy> ce_;
+
+  // dL/dy for the network output y (bootstrapping inside it under a level budget).
+  Ctxt loss_gradient(const FHEContext& ctx, Refresh& rf, Ctxt y, const Ctxt& target) const;
+  uint32_t budget_ = 0;     // set_level_budget; 0 = no bootstrapping inside the step
+  uint32_t log_range_ = 0;  // log2 of the bootstrap range
+  size_t sample_bootstraps_ = 0;
 };
 
 // Plaintext reference of Trainer: one SGD update on a batch with the same
 // loss, the same polynomials and the same weight sharing. Updates the
 // network's layers in place (compile() again before encrypted inference).
 void train_plain(Network& net, const std::vector<std::vector<double>>& xs, const std::vector<std::vector<double>>& ts,
-                 double lr, const std::vector<size_t>& frozen = {});
+                 double lr, const std::vector<size_t>& frozen = {}, const Loss& loss = Loss{});
 
 }  // namespace fheml
 

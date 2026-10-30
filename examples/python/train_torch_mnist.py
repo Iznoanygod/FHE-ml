@@ -4,6 +4,7 @@ encrypted.
     PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch cnn [--n 3] [--insecure]
     PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch vit
     PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch deepcnn --bootstrap
+    PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch deepcnn --bootstrap --exact-relu
 
 The model is ordinary torch code: torch.nn layers plus the polynomial
 activation / attention modules in fheml.nn, which compute exactly what the
@@ -13,6 +14,10 @@ deepcnn is a four-block CNN with Chebyshev ReLUs whose 25 levels exceed what
 a 128-bit ring 2^16 holds. --bootstrap folds the activation intervals into
 the convolutions (one level each) and lets fheml.auto_bootstrap() insert
 bootstraps, scaled from the training images, so it runs at ring 2^16.
+--exact-relu trains deepcnn with plain nn.ReLU and exports it as
+fheml.ExactReLU (sign through CKKS<->FHEW scheme switching): no approximation
+error and one level per ReLU past a bootstrap, but one FHEW bootstrap per
+slot per ReLU, so encrypted inference is far slower.
 
 poolcnn is a small CNN with exact max pooling (CKKS <-> FHEW scheme
 switching; one FHEW bootstrap per compared slot, so it keeps the pooled
@@ -52,7 +57,7 @@ def cnn():
         nn.Linear(64, 10))
 
 
-def deepcnn():
+def deepcnn(exact_relu=False):
     # Deeper than ring 2^16 allows without bootstrapping: 4 x (linear + relu
     # approximation on [-R, R], degree 15: 1 + 5 levels) + head = 25 levels
     # once the intervals are folded. The ReLU intervals must cover the
@@ -60,7 +65,7 @@ def deepcnn():
     # check_ranges() reports how well they do. The client pools the image to
     # 14x14 first, so every activation fits in 256 slots: at ring 2^16 the
     # bootstrapping key set grows with the slot count (45-69 keys at 256).
-    relu = lambda r: hnn.Chebyshev("relu", -r, r, 15)  # noqa: E731
+    relu = (lambda r: nn.ReLU()) if exact_relu else (lambda r: hnn.Chebyshev("relu", -r, r, 15))  # noqa: E731
     return nn.Sequential(
         nn.Conv2d(1, 4, 3, stride=2, padding=1), nn.BatchNorm2d(4), relu(8),
         nn.Conv2d(4, 4, 3, stride=1, padding=1), nn.BatchNorm2d(4), relu(8),
@@ -137,7 +142,7 @@ def check_ranges(net, xs):
     """Largest |input| of every chebyshev layer over xs, against its interval."""
     xs = [np.asarray(x, dtype=np.float64).ravel() for x in xs]
     for i, layer in enumerate(net.layers):
-        if layer.type in ("chebyshev", "maxpool2d"):
+        if layer.type in ("chebyshev", "exactrelu", "maxpool2d"):
             peak = max(np.abs(x).max() for x in xs)
             print(f"  layer {i} {layer.describe()}: max |input| {peak:.2f} over {len(xs)} images")
         xs = [np.asarray(layer.forward_plain(x)) for x in xs]
@@ -176,6 +181,11 @@ def main():
                     "two more levels in ring 2^16 for 25%% larger keys)")
     ap.add_argument("--level-budget", type=int, default=2, help="bootstrap level budget {b,b}: 2 costs 18 levels and 69 "
                     "bootstrapping keys at 256 slots, 3 costs 20 levels and 45 keys (use 3 with --digits 4)")
+    ap.add_argument("--exact-relu", type=float, nargs="?", const=8.0, default=None, metavar="RANGE",
+                    help="deepcnn: train with nn.ReLU and run it as the exact scheme-switching ReLU on "
+                    "[-RANGE, RANGE] (default 8)")
+    ap.add_argument("--packing", choices=("gapped", "compact", "multiplexed"),
+                    help="layout of strided conv outputs (default: compact for deepcnn, gapped otherwise)")
     ap.add_argument("--data", default="data")
     ap.add_argument("--epochs", type=int, help="default: 3 (cnn), 15 (vit)")
     ap.add_argument("--out", help="also save the exported model here (.fheml)")
@@ -190,8 +200,10 @@ def main():
     xtr, ytr = torch.tensor(prep(data["train_x"]), dtype=torch.float32), torch.tensor(data["train_y"]).long()
     xte, yte = torch.tensor(prep(data["test_x"]), dtype=torch.float32), torch.tensor(data["test_y"]).long()
 
-    model = {"cnn": cnn, "vit": vit, "deepcnn": deepcnn, "poolcnn": poolcnn, "lnvit": lambda: lnvit(4),
-             "lnvit16": lambda: lnvit(16)}[args.arch]()
+    if args.exact_relu and args.arch != "deepcnn":
+        ap.error("--exact-relu is for --arch deepcnn")
+    model = {"cnn": cnn, "vit": vit, "deepcnn": lambda: deepcnn(bool(args.exact_relu)), "poolcnn": poolcnn,
+             "lnvit": lambda: lnvit(4), "lnvit16": lambda: lnvit(16)}[args.arch]()
     epochs = args.epochs or {"cnn": 3, "vit": 15, "deepcnn": 4, "poolcnn": 4, "lnvit": 10, "lnvit16": 10}[args.arch]
     opt = torch.optim.Adam(model.parameters(), 2e-3)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, 2e-3, total_steps=epochs * ((len(xtr) + 127) // 128))
@@ -215,7 +227,7 @@ def main():
              "lnvit": (4, PATCH), "lnvit16": (N_TOK, PATCH)}[args.arch]
     if args.arch.startswith("lnvit"):
         check_softmax_ranges(model, xte[:2000])
-    net = fheml.from_torch(model, shape)  # checks fheml plaintext == torch
+    net = fheml.from_torch(model, shape, exact_relu=args.exact_relu)  # checks fheml plaintext == torch
     if args.out:
         net.save(args.out)
         print("wrote", args.out)
@@ -231,7 +243,9 @@ def main():
     plain_acc = float(np.mean([fheml.plain(net, xp[i]).argmax() == int(yte[i]) for i in range(n_plain)]))
     print(f"fheml plaintext accuracy {plain_acc:.1%} on {n_plain} test images (torch: {acc:.1%} on all)")
     level_budget = [3, 3]
-    if args.arch in ("deepcnn", "poolcnn"):
+    if args.packing:
+        net.packing = args.packing
+    elif args.arch in ("deepcnn", "poolcnn"):
         # Compact activations: fewer slots, so fewer bootstrapping keys, and
         # max pooling compares only the slots up to its last input.
         net.set_gapped_layouts(False)

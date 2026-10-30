@@ -68,6 +68,17 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("rotation_key_bytes", &FHEContext::rotation_key_bytes)
       .def("has_rotation_key", &FHEContext::has_rotation_key, py::arg("k"))
       .def("rotation_cost", &FHEContext::rotation_cost, py::arg("k"))
+      .def(
+          "rotation_plan",
+          [](const FHEContext& c, const std::vector<int32_t>& ks) {
+            auto p = c.plan_rotations(ks);
+            py::dict d;
+            d["key_switches"] = p->key_switches();
+            d["decompositions"] = p->decompositions();
+            d["max_depth"] = p->max_depth();
+            return d;
+          },
+          py::arg("ks"), "Cost of rotate_many(c, ks): key switches, digit decompositions and depth of its rotation tree.")
       .def_property_readonly("on_gpu", &FHEContext::on_gpu)
       .def("describe", &FHEContext::describe)
       .def_static("ring_dim_for", &FHEContext::ring_dim_for, py::arg("options"));
@@ -114,6 +125,14 @@ PYBIND11_MODULE(_fheml, m) {
            py::arg("degree"))
       .def(py::init<std::string, double, double, uint32_t, double, double, double>(), py::arg("fn"), py::arg("a"),
            py::arg("b"), py::arg("degree"), py::arg("eval_a"), py::arg("eval_b"), py::arg("out_scale") = 1.0);
+  py::class_<ExactReLU, Layer, std::shared_ptr<ExactReLU>>(m, "ExactReLU")
+      .def(py::init<double, double, bool>(), py::arg("range") = 1.0, py::arg("out_scale") = 1.0,
+           py::arg("after_bootstrap") = false,
+           "Exact ReLU: sign through CKKS<->FHEW scheme switching; inputs must lie in [-range, range]. "
+           "after_bootstrap: inputs are past a CKKS bootstrap, the layer then costs one level "
+           "(set by place_bootstraps).")
+      .def_property_readonly("range", &ExactReLU::range)
+      .def_property("after_bootstrap", &ExactReLU::after_bootstrap, &ExactReLU::set_after_bootstrap);
   py::class_<Bootstrap, Layer, std::shared_ptr<Bootstrap>>(m, "Bootstrap").def(py::init<>());
   py::class_<Residual, Layer, std::shared_ptr<Residual>>(m, "Residual")
       .def(py::init<std::vector<LayerPtr>>(), py::arg("body"));
@@ -154,6 +173,8 @@ PYBIND11_MODULE(_fheml, m) {
           "add", [](Network& n, LayerPtr l) -> Network& { return n.add(std::move(l)); }, py::arg("layer"),
           py::return_value_policy::reference_internal)
       .def("fuse_linear", &Network::fuse_linear)
+      .def("use_exact_relu", &Network::use_exact_relu, py::arg("range") = 0.0,
+           "Replace Chebyshev relu activations by scheme-switching ExactReLU; returns how many.")
       .def("place_bootstraps", &Network::place_bootstraps, py::arg("budget"),
            py::arg("calibration") = std::vector<std::vector<double>>{}, py::arg("headroom") = 1.5,
            "Insert bootstraps so no stretch exceeds `budget` levels; compile() again afterwards.")
@@ -167,6 +188,24 @@ PYBIND11_MODULE(_fheml, m) {
                              "Bootstraps run inside self-bootstrapping layers per inference.")
       .def("compile", &Network::compile, py::arg("slots") = 0, py::call_guard<py::gil_scoped_release>())
       .def("set_gapped_layouts", &Network::set_gapped_layouts)
+      .def_property(
+          "packing",
+          [](const Network& n) {
+            switch (n.packing()) {
+              case Packing::kCompact: return std::string("compact");
+              case Packing::kGapped: return std::string("gapped");
+              default: return std::string("multiplexed");
+            }
+          },
+          [](Network& n, const std::string& p) {
+            if (p == "compact") n.set_packing(Packing::kCompact);
+            else if (p == "gapped") n.set_packing(Packing::kGapped);
+            else if (p == "multiplexed") n.set_packing(Packing::kMultiplexed);
+            else throw std::invalid_argument("packing must be compact, gapped or multiplexed");
+          },
+          "Layout of strided conv/pool outputs: 'gapped' (default, fewest diagonals), 'compact' (fewest "
+          "slots) or 'multiplexed' (compact slot count, few diagonals; Lee et al. ICML'22). Compile again "
+          "afterwards.")
       .def("set_cache_plaintexts", &Network::set_cache_plaintexts)
       .def_property_readonly("depth", &Network::depth)
       .def_property_readonly("slots", &Network::slots)
@@ -203,10 +242,32 @@ PYBIND11_MODULE(_fheml, m) {
       .def("encrypt_weights", &Network::encrypt_weights, py::arg("ctx"), py::arg("drop_plaintext") = true,
            py::call_guard<py::gil_scoped_release>());
 
+  py::class_<Loss> loss(m, "Loss", "Training loss: Loss.mse() or Loss.cross_entropy(SoftmaxOptions) (see train.h).");
+  py::enum_<Loss::Kind>(loss, "Kind").value("MSE", Loss::kMSE).value("CROSS_ENTROPY", Loss::kCrossEntropy);
+  loss.def(py::init<>())
+      .def_readwrite("kind", &Loss::kind)
+      .def_readwrite("softmax", &Loss::softmax)
+      .def_static("mse", &Loss::mse)
+      .def_static("cross_entropy", &Loss::cross_entropy, py::arg("softmax") = SoftmaxOptions{},
+                  "Softmax cross-entropy against one-hot targets; the softmax uses the polynomial exp and 1/x "
+                  "(optionally with the maximum subtracted through scheme switching).");
+  m.def("softmax_plain", &softmax_plain, py::arg("loss"), py::arg("y"),
+        "The softmax the cross-entropy Trainer computes under encryption.");
+  m.def("cross_entropy_plain", &cross_entropy_plain, py::arg("y"), py::arg("target"),
+        "Exact -sum t log softmax(y).");
+
   py::class_<Trainer>(m, "Trainer", "Encrypted SGD training (see include/fheml/train.h).")
-      .def(py::init<Network&, std::vector<size_t>>(), py::arg("net"), py::arg("frozen") = std::vector<size_t>{},
-           py::keep_alive<1, 2>())
+      .def(py::init<Network&, std::vector<size_t>, Loss>(), py::arg("net"), py::arg("frozen") = std::vector<size_t>{},
+           py::arg("loss") = Loss{}, py::keep_alive<1, 2>())
+      .def_property_readonly("loss", &Trainer::loss)
       .def_property_readonly("step_depth", &Trainer::step_depth)
+      .def_property_readonly("unbounded_step_depth", &Trainer::unbounded_step_depth)
+      .def("set_level_budget", &Trainer::set_level_budget, py::arg("levels"), py::arg("range") = 1.0,
+           "Bootstrap activations and gradients so that no ciphertext of a step goes deeper than `levels`.")
+      .def_property_readonly("level_budget", &Trainer::level_budget)
+      .def_property_readonly("bootstrap_range", &Trainer::bootstrap_range)
+      .def_property_readonly("min_level_budget", &Trainer::min_level_budget)
+      .def_property_readonly("sample_bootstraps", &Trainer::sample_bootstraps)
       .def_property_readonly("weight_ciphertexts", &Trainer::weight_ciphertexts)
       .def_property_readonly("first_trained_layer", &Trainer::first_trained_layer)
       .def_property_readonly("weight_level", &Trainer::weight_level)
@@ -246,6 +307,7 @@ PYBIND11_MODULE(_fheml, m) {
   m.def("gpu_backend_built", &gpu_backend_built, "True when built with FIDESlib (-DFHEML_GPU=ON).");
   m.def("gpu_device_count", &gpu_device_count, "Visible CUDA devices (0 without the GPU backend).");
   m.def("train_plain", &train_plain, py::arg("net"), py::arg("xs"), py::arg("targets"), py::arg("lr"),
-        py::arg("frozen") = std::vector<size_t>{}, "Plaintext reference of Trainer: one SGD update on a batch.",
+        py::arg("frozen") = std::vector<size_t>{}, py::arg("loss") = Loss{},
+        "Plaintext reference of Trainer: one SGD update on a batch.",
         py::call_guard<py::gil_scoped_release>());
 }

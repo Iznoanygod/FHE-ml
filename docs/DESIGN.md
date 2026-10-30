@@ -29,6 +29,47 @@ kernel tap): 125 diagonals for the same layer. It needs more slots
 (Co·H·W instead of Co·H/s·W/s). That costs nothing until it forces a larger
 ring.
 
+### Multiplexed packing
+
+`Network::set_packing(Packing::kMultiplexed)` (Python: `net.packing =
+"multiplexed"`) fills the gaps with other channels, as in the multiplexed
+parallel convolutions of Lee et al. (ICML'22). A layout carries a
+multiplexing factor `m` and the fine grid `(fy, fx)` of the original image;
+`m²` channels share one block of `cs` slots, and channel `c` sits at
+sub-offset `(i, j) = ((c mod m²) / m, c mod m)`:
+
+    slot = (c / m²)·cs + i·fy + j·fx + y·ys + x·xs
+
+After a stride-2 conv on a compact `H×W` input, `ys = 2W`, `xs = 2`, `m = 2`,
+`(fy, fx) = (W, 1)`: the four channels of a block interleave like the pixels
+of a 2×2 window, and a second stride-2 stage makes `m = 4`. The offset
+between an input and an output element still depends only on (input
+channel, output channel, kernel tap), so a strided conv keeps few diagonals,
+while the activation needs `C·H·W/m²` slots, like a compact one.
+
+There is no new evaluation algorithm: a layout is only a map from elements to
+slots, and every linear layer's slot matrix is built from its input and output
+layouts, so the BSGS diagonal method handles any layout. The masks of Lee et
+al. are the zeros of the diagonals. That also makes re-packing free: a
+stride-1 conv after max pooling (whose output stays gapped) writes its output
+multiplexed.
+
+**Choosing a layout per layer.** Multiplexing is not always cheapest. A stride-1
+conv on a compact input already has constant offsets (`(Ci+Co-1)·k²`
+diagonals), while the interleaved sub-offsets of a multiplexed one give up to
+`(Ci/m²+Co/m²-1)·((k+1)m-1)²`. With `kMultiplexed`, each strided (or
+re-packing) linear layer considers the multiplexed, gapped and compact output
+layouts that are collision-free, and takes the one with the lowest estimated
+cost `(diagonals + 8·sqrt(diagonals)) × slots`, where slots is the power of
+two that holds both the input and that output. Weighting by slots stops a
+gapped layout from winning on diagonals when it would double the ring.
+Odd sizes (7×7 → 4×4 with padding) can't interleave without collisions and
+fall back to gapped or compact. `kGapped` stays the default; `kCompact` is
+`set_gapped_layouts(false)`.
+
+Measured numbers (`packing_bench`, `mnist_cnn --packing`) are in the README section
+"Multiplexed packing".
+
 ## Linear layers → one BSGS transform
 
 `LinearLayer::compile` works in three steps:
@@ -65,10 +106,19 @@ cryptography.
 | `poly` degree 2 | `x·(c2·x + c1) + c0` | 2 (1 if c2 = 1) |
 | `poly` degree d > 2 | `EvalPoly` | `poly_depth(d)` |
 | `chebyshev f a b d` | `EvalChebyshevSeries` | `poly_depth(d)` (+1 unless [a,b] = [-1,1]) |
+| `exactrelu R s` | `EvalCompareSchemeSwitching(0, x)` (FHEW sign), `x · sign` | 13; 1 past a bootstrap |
 
 The plaintext reference evaluates the *same* approximation
 (`EvalChebyshevFunctionPtxt`). Encrypted-vs-plaintext error therefore measures
 only the CKKS noise. The approximation error is a training-time concern.
+
+`exactrelu` has no approximation: its reference is `max(x, 0)`. Its sign
+comes back from FHEW as a fresh ciphertext 12 levels deep regardless of the
+input, so its cost in levels depends on where it sits: 13 from a fresh
+input, 1 when the input is already deeper than 12, which always holds past a
+CKKS bootstrap (18–20 levels). The additive depth model expresses this with a
+per-layer flag (`after_bootstrap`) that `place_bootstraps` sets, and the
+layer checks at run time that its input really is that deep.
 
 ## Transformers
 
@@ -171,8 +221,6 @@ with 3H score coefficients; single-head files are unchanged.
 
 ### Next steps
 
-- Bootstrapping inside the max-subtracted softmax block.
-- Bootstrapping between blocks for deeper models.
 - An example model that uses them (both train under encryption and export
   from `fheml.nn.LayerNorm` / `fheml.nn.Attention(softmax=...)`).
 
@@ -235,9 +283,44 @@ encryption:
 - `chebyshev`: the derivative Chebyshev series (Numerical Recipes `chder`,
   same `c0/2` convention as OpenFHE).
 
+**Max pooling** reuses the forward's comparisons. Each round of the
+tournament computes `max(a, b) = a + s (b - a)` with `s = [a < b]`, so
+`∂max/∂a = 1 - s` and `∂max/∂b = s`. The forward keeps `s ⊙ m` and
+`m - s ⊙ m`, where `m` masks the pool's output slots. The backward walks the
+tournament from the root, multiplying the gradient by these, and rotates
+each tap's gradient back by `-offset` to its input slot (overlapping windows
+add up). That is `ceil(log2 k²)` levels and no scheme switching. The mask
+matters when the pool is the output layer: `g = y - t` is nonzero in the
+gap slots there and must not reach the layer below. `train_plain` runs the
+same tournament in the clear (a tie keeps the first tap, as `[a < b] = 0`
+does).
+
 The loss is `0.5 |y - t|²`, so `g = y - t` with an encrypted target `t`. No
 masking is needed: unused slots of `y` only meet zero rows of the matrices,
 and the update masks keep gradients out of unused weight slots.
+
+With `Loss::cross_entropy` the loss is `-Σ t log softmax(y)` against a one-hot
+`t`, so `g = softmax(y) - t` (`Trainer::loss_gradient`):
+
+1. `z = y + pad`, where `pad` puts the interval midpoint in every non-output
+   slot (they hold 0 after a linear last layer; otherwise `y` is masked
+   first, one level), so the exp series never sees a value off its interval.
+2. `e = mask (*) exp~(z)`: Chebyshev series on `[lo, hi]` (+1 level for the
+   interval map), masked to the output slots (+1).
+3. `S = Σ_k rot_k(e)` over log2(slots) power-of-two rotations: the sum in
+   every slot, so the 1/x series has no padding problem.
+4. `r = inv~(S)`: Chebyshev series of 1/x on `[sum_lo, sum_hi]` plus Newton
+   steps `r <- r (2 - S r)` (2 levels each); `g = e (*) r - t`.
+
+With `subtract_max` the logits are first masked and padded with `lo` (never
+above a logit); a max tree `m <- m + [m < rot_t(m)] (rot_t(m) - m)` over
+`t = 1, 2, ..., window/2` (the comparison through `FHEContext::compare`, fresh
+at `compare_depth()`) leaves the maximum in slot 0, which is masked and
+broadcast back over the window and subtracted. Slots outside the window get
+`(lo - hi)/2`, so every slot lands in `[lo - hi, 0]`. `train_plain` runs the
+same polynomials (`softmax_plain`); `tests/test_train.cpp` checks the gradient
+against finite differences of the exact cross-entropy and the encrypted
+update against `train_plain`.
 
 **Levels.** `Trainer::step_depth()` simulates the levels of a whole step
 (forward, backward, update) and `context_options()` sizes the context from
@@ -253,6 +336,22 @@ that.
   update.
 - Bootstrapping uses 55-bit scaling: at 50 bits, full-slot bootstrapping
   error is about 1e-2.
+- **Level budget** (`Trainer::set_level_budget(K, range)`): for steps
+  deeper than one bootstrapping context holds, every ciphertext stays within
+  K levels of the weights. The passes call `fit(c, d)` on each operand before
+  an operation that consumes d levels; it bootstraps c when its level plus d
+  would pass K. Decisions use the ciphertexts' real levels, so nothing has to
+  be planned per layer: activations, gradients, the forward values kept for
+  the backward pass (bootstrapped in place, so later uses see the fresh copy)
+  and the intermediate values of attention and layer norm are refreshed
+  exactly where needed, including between the comparison tournament, the exp
+  series and the 1/x series of the max-subtracted softmax. Fits run between
+  the parallel loops, never inside them. Indivisible operations (a
+  polynomial, the layer norm's `normalize`, a frozen layer) must fit K
+  (`min_level_budget()`). Values are divided by `range` (a power of two, one
+  level) before each of these bootstraps and doubled back after it with
+  additions (no level), so the context needs K + 3 levels plus the
+  bootstrap's. The weights are still refreshed once per update, packed.
 
 **Cost and limits.**
 - **Rotation keys:** by default one per diagonal offset, plus its negative.
@@ -263,8 +362,6 @@ that.
   rotation from 2·log2(slots) keys instead; `Trainer::rotation_indices(true)`
   then lists only the hoisted rotations of the frozen prefix.
 - **Attention:** no backward pass yet.
-- **Loss:** cross-entropy needs an encrypted softmax (exp and inverse
-  approximations).
 
 ## Parameters and bootstrapping
 
@@ -309,17 +406,41 @@ that.
 written in balanced base `2^w`, one key switch per non-zero digit (at most
 `ceil(log2(slots) / w)`; signed digits make `-1` as cheap as `+1`).
 `FHEContext::rotate_many(x, ks)` rotates one ciphertext by many offsets: with
-direct keys it hoists them; otherwise it orders the offsets by cost and
-derives each from the already rotated copy nearest to it, so the conv
-offsets `28, 29, 30` cost one key switch each after the first.
+direct keys it hoists them (one digit decomposition, then one key-switch
+inner product per offset). With a ladder it evaluates a **hoisted rotation
+tree** (`FHEContext::plan_rotations`): every node is a rotated copy of `x`,
+every edge one ladder key, and every node with children is decomposed once
+for all of them. The planner adds the offsets cheapest first, each from the
+tree node (input, earlier offset or intermediate copy) that is cheapest to
+extend, counting a new key switch as 2 and a new decomposition as 1
+(measured: the decomposition is about a third of an OpenFHE HYBRID key
+switch, 19 of 55 ms at ring 2^15). Composed paths take their largest digit
+first, so offsets with a common coarse part (conv rows `±W`, attention
+tokens `s·B`) share the copy at that part and fan out from it. The tree is
+evaluated level by level, each level's decompositions and rotations as one
+parallel loop (one batched FIDESlib call per node on the GPU); plans are
+cached per offset list.
+
+Every place that rotates one ciphertext by several offsets goes through
+`rotate_many`: BSGS baby steps (conv, pooling, dense), max pooling taps,
+attention's key/value token rotations (which used per-index keys directly
+before), and the trainer's linear forward/backward. A frozen layer's
+backward `Σ_i rot_{-o_i}(g ⊙ diag_i)` is now evaluated as
+`Σ_i rot_{-o_i}(g) ⊙ rot_{-o_i}(diag_i)`, so its rotations all act on `g`
+and are hoisted, with the constant diagonals rotated in the clear. What
+stays unhoisted are chains where each rotation acts on the previous result
+(rotate-and-sum in LayerNorm, attention windows and folded dense heads,
+BSGS giant steps), which hoisting cannot share. `examples/rotation_bench`
+measures all of this; see the README.
 
 - `Trainer` and `LinearTransform::eval` rotate through the context, so both
   training and inference work with a ladder; `rotation_indices(true)` on a
   `Trainer` or `Network` lists the rotations that still need their own key
   (attention, the trainer's frozen prefix).
-- A composed rotation cannot be hoisted, so each costs 1-3 full key
-  switches instead of one hoisted one. The trade is memory for time; at ring
-  2^16 the memory is what decides whether a run fits at all.
+- A composed rotation still costs 1-3 key switches instead of one hoisted
+  one; the tree shares the decompositions and common prefixes but not the
+  digits themselves. The trade is memory for time; at ring 2^16 the memory
+  is what decides whether a run fits at all.
 
 ### Automatic bootstrap placement
 
@@ -392,7 +513,8 @@ bit-identical to the CPU ones.
 ## Status
 
 All of the following are tested under encryption:
-- Convolutions with stride, padding and multiple channels.
+- Convolutions with stride, padding and multiple channels, with gapped,
+  compact or multiplexed outputs (also through encrypted training).
 - Dense layers, average pooling and channel affine layers.
 - Exact max pooling through CKKS ↔ FHEW scheme switching (TOY FHEW
   parameters in the tests; the STD128 numbers are in the README).
@@ -400,7 +522,8 @@ All of the following are tested under encryption:
   block) and softmax attention, with and without the scheme-switching
   maximum subtraction.
 - Fused linear layers.
-- The square, polynomial and Chebyshev activations.
+- The square, polynomial and Chebyshev activations, and the exact
+  scheme-switching ReLU (checked against `max(x, 0)`, also past bootstraps).
 - Bootstrapping in the middle of a network, placed by hand or by
   `place_bootstraps` (with scale folding and interval folding).
 - Rotations composed from a key ladder, for inference and training.
@@ -412,7 +535,8 @@ All of the following are tested under encryption:
 - Encrypted training (`Trainer`): SGD updates on encrypted data and weights
   match plaintext SGD, with and without bootstrapping; this includes
   layer norm (gamma, beta) and attention (quadratic or softmax scores),
-  whose backward passes reuse the forward's rotations and masks.
+  whose backward passes reuse the forward's rotations and masks, and exact
+  max pooling, whose backward pass reuses the forward's comparison bits.
 - PyTorch export (`fheml.from_torch`): torch-trained CNN and ViT run
   encrypted with logits matching torch to about 1e-6.
 
@@ -429,9 +553,10 @@ All of the following are tested under encryption:
      data alone.
    - Serialize the encrypted weights so the server never sees them in the
      clear.
-3. **Multiplexed packing (Lee et al. ICML'22, Orion).** After stride-2 layers,
-   re-pack gapped outputs densely so deep networks (ResNet-20 on CIFAR-10) fit
-   in fewer slots and need fewer bootstraps.
+3. **Multiplexed packing**: done (`Packing::kMultiplexed`, see above). Next:
+   residual blocks on images (a residual `Add` that lines up multiplexed
+   layouts), and a network-level layout search instead of the per-layer
+   greedy choice.
 4. **Better activations.**
    - Composite minimax sign/ReLU, built by composing `EvalChebyshevSeries`
      calls.
@@ -446,8 +571,7 @@ All of the following are tested under encryption:
    (see the README). Next: tracing arbitrary `forward` code with `torch.fx`,
    and a range penalty during training so Chebyshev activations stay inside
    their interval.
-8. **Encrypted training.** An encrypted softmax for cross-entropy. Hoisting for composed rotations (one
-   decomposition per ladder digit).
+8. **Encrypted training.** An encrypted softmax for cross-entropy.
 9. **Performance.**
    - Benchmark the FIDESlib GPU backend on a real GPU (see below), and batch
      the remaining single-ciphertext calls (giant steps, rotate-and-sum) for it.

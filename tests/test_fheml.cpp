@@ -113,6 +113,74 @@ void cleartext_tests() {
     check_plan("avgpool", n);
   }
   {
+    // Multiplexed packing: two stride-2 stages fill the gaps with channels
+    // (m = 2 then 4), so the activations need the compact slot count, with
+    // far fewer diagonals than compact strided convolutions.
+    auto build = [](Packing p) {
+      std::mt19937 keep = g_rng;
+      Network n(Shape{3, 16, 16});
+      n.set_packing(p);
+      n.emplace<Conv2d>(3, 8, 3, 3, 2, 1, rand_vec(216), std::vector<double>{});
+      n.emplace<Conv2d>(8, 8, 3, 3, 1, 1, rand_vec(576), std::vector<double>{});
+      n.emplace<Conv2d>(8, 16, 3, 3, 2, 1, rand_vec(1152), std::vector<double>{});
+      n.emplace<AvgPool2d>(2, 2);
+      n.emplace<Dense>(64, 5, rand_vec(320), std::vector<double>{});
+      g_rng = keep;  // same weights for every packing
+      n.compile();
+      return n;
+    };
+    Network g = build(Packing::kGapped), c = build(Packing::kCompact), m = build(Packing::kMultiplexed);
+    auto diags = [](const Network& n) {
+      size_t d = 0;
+      for (const auto& l : n.layers()) d += static_cast<const LinearLayer*>(l.get())->transform().num_diagonals();
+      return d;
+    };
+    const Layout& l0 = m.layers()[0]->out_layout();
+    const Layout& l2 = m.layers()[2]->out_layout();
+    check(l0.m == 2 && l2.m == 4, "multiplexed factors 2 then 4",
+          "(" + std::to_string(l0.m) + ", " + std::to_string(l2.m) + ")");
+    check(m.slots() == c.slots() && m.slots() < g.slots(), "multiplexed needs the compact slot count",
+          "(" + std::to_string(m.slots()) + " vs gapped " + std::to_string(g.slots()) + ")");
+    check(diags(m) < diags(c), "multiplexed has fewer diagonals than compact",
+          "(" + std::to_string(diags(m)) + " vs " + std::to_string(diags(c)) + ")");
+    auto x = rand_vec(768);
+    for (Network* n : {&g, &c, &m}) {
+      std::vector<double> slots(n->slots(), 0.0);
+      for (size_t i = 0; i < x.size(); ++i) slots[i] = x[i];
+      for (const auto& l : n->layers()) slots = static_cast<const LinearLayer*>(l.get())->transform().eval_slots(slots);
+      check_err(std::string("plan multiplexing chain, packing ") + (n == &g ? "gapped" : n == &c ? "compact" : "multiplexed"),
+                max_err(n->forward_plain(x), slots, 5), 1e-9);
+    }
+    // Every element of a multiplexed layout has its own slot.
+    for (const auto& l : m.layers()) {
+      std::vector<char> used(m.slots(), 0);
+      bool ok = true;
+      for (size_t i = 0; i < l->out_shape().size(); ++i) {
+        size_t sl = l->out_layout().slot(l->out_shape(), i);
+        ok = ok && sl < used.size() && !used[sl];
+        if (ok) used[sl] = 1;
+      }
+      check(ok, "multiplexed layout injective " + l->describe());
+    }
+  }
+  {
+    // Odd sizes: 7x7 -> 4x4 cannot interleave without collisions; the layer
+    // falls back to another layout and still computes the right thing.
+    Network n(Shape{2, 7, 7});
+    n.set_packing(Packing::kMultiplexed);
+    n.emplace<Conv2d>(2, 4, 3, 3, 2, 1, rand_vec(72), std::vector<double>{});
+    check_plan("conv stride2 odd size, multiplexed", n);
+  }
+  {
+    // Few channels: the gapped output fits in the input's slots and has
+    // fewer diagonals, so multiplexed packing keeps it gapped.
+    Network n(Shape{4, 8, 8});
+    n.set_packing(Packing::kMultiplexed);
+    n.emplace<Conv2d>(4, 4, 3, 3, 2, 1, rand_vec(144), std::vector<double>{});
+    check_plan("conv stride2, multiplexed packing", n);
+    check(n.layers()[0]->out_layout().m == 1 && n.slots() == 256, "gapped kept when it fits");
+  }
+  {
     // Fusion: conv -> avgpool -> affine == one matrix.
     Network n(Shape{2, 8, 8});
     n.emplace<Conv2d>(2, 3, 3, 3, 1, 1, rand_vec(54), rand_vec(3));
@@ -160,6 +228,40 @@ void cleartext_tests() {
           "(depth " + std::to_string(n.depth()) + ")");
     n.compile();
     check(n.uses_scheme_switching() && n.context_options(false).scheme_switching, "maxpool enables scheme switching");
+  }
+
+  {
+    // Exact ReLU in the clear, its rescale (what bootstrap placement folds in),
+    // replacing Chebyshev relus (with an interval map) and a save/load trip.
+    Network n(Shape{1, 1, 8});
+    n.emplace<ChebyshevActivation>("relu", -3, 3, 15, -1.5, 1.5, 2.0);  // 2 relu(2 x) on [-1.5, 1.5]
+    n.emplace<ChebyshevActivation>("relu", -1, 3, 15);                   // asymmetric, no map: exact replacement
+    n.emplace<ChebyshevActivation>("relu", 0, 2, 15, -1, 1, 1.0);       // relu(x + 1): has an offset, kept
+    n.emplace<ChebyshevActivation>("sigmoid", -2, 2, 15);
+    check(n.use_exact_relu() == 2, "use_exact_relu replaces only offset-free relus");
+    auto* r = dynamic_cast<const ExactReLU*>(n.layers()[0].get());
+    check(r && r->range() == 1.5 && r->out_scale() == 4.0, "use_exact_relu keeps the interval and scales",
+          r ? "(range " + std::to_string(r->range()) + ", out " + std::to_string(r->out_scale()) + ")" : "");
+    check(n.layers()[2]->type() == "chebyshev" && n.uses_scheme_switching(), "offset relu kept, switching on");
+    ExactReLU e(2.0);
+    e.configure(Shape{1, 1, 8});
+    auto x = rand_vec(8, -2, 2);
+    auto y = e.forward_plain(x);
+    double err = 0;
+    for (size_t i = 0; i < 8; ++i) err = std::max(err, std::fabs(y[i] - std::max(x[i], 0.0)));
+    check_err("exactrelu plain vs max(x, 0)", err, 0.0);
+    e.rescale(0.5, 3.0);  // 3 relu(x / 2) = 1.5 relu(x), inputs may now be twice as large
+    y = e.forward_plain(x);
+    err = 0;
+    for (size_t i = 0; i < 8; ++i) err = std::max(err, std::fabs(y[i] - 1.5 * std::max(x[i], 0.0)));
+    check(err < 1e-15 && e.range() == 4.0, "exactrelu rescale");
+    check(e.depth() == FHEContext::compare_depth() + 1, "exactrelu depth");
+    const char* path = "test_exactrelu.fheml";
+    n.save(path);
+    Network m = Network::load(path);
+    std::remove(path);
+    x = rand_vec(8, -1.5, 1.5);
+    check_err("exactrelu save/load", max_err(n.forward_plain(x), m.forward_plain(x), 8), 1e-12);
   }
 }
 
@@ -325,16 +427,108 @@ void scheme_switching_tests(bool quick) {
     n.emplace<MaxPool2d>(3, 2, 2.0);
     check_encrypted("maxpool 3x3 stride 2", n, 1e-3, 2.0);
   }
+  {
+    // Exact ReLU against true max(x, 0) (not against a polynomial), next to
+    // the Chebyshev ReLU it replaces, on the same encrypted input.
+    const double range = 4.0;
+    auto x = rand_vec(16, -range, range);
+    x[0] = 0.0, x[1] = 1e-3, x[2] = -1e-3, x[3] = range * 0.999, x[4] = -range * 0.999;
+    std::vector<double> relu(16);
+    for (size_t i = 0; i < 16; ++i) relu[i] = std::max(x[i], 0.0);
+    // The FHEW sign is only resolved down to about 2 range / 2^(fhew_log_q - 1);
+    // below that either branch is right to within |x|.
+    const double tol = 1e-3;
+    FHEContext ctx = make_ctx(FHEContext::compare_depth() + 1, 16, {}, false, true);
+    ExactReLU layer(range);
+    Ctxt c = ctx.encrypt(x);
+    auto got = ctx.decrypt(layer.forward(ctx, c), 16);
+    check_err("exactrelu vs true relu", max_err(got, relu, 16), tol);
+    // Output scale folded in (place_bootstraps / use_exact_relu use it).
+    ExactReLU scaled(range, 0.25);
+    got = ctx.decrypt(scaled.forward(ctx, c), 16);
+    double err = 0;
+    for (size_t i = 0; i < 16; ++i) err = std::max(err, std::fabs(got[i] - 0.25 * relu[i]));
+    check_err("exactrelu with output scale vs 0.25 relu", err, tol);
+    // A deep input still works and only costs one more level.
+    Ctxt deep = ctx.encrypt(x, FHEContext::compare_depth() - 1);
+    Ctxt yd = layer.forward(ctx, deep);
+    got = ctx.decrypt(yd, 16);
+    check_err("exactrelu from a deep input vs true relu", max_err(got, relu, 16), tol);
+    check(yd->GetLevel() + (yd->GetNoiseScaleDeg() > 1 ? 1 : 0) == FHEContext::compare_depth() + 1,
+          "exactrelu output level is compare_depth() + 1");
+    // For comparison: Chebyshev ReLUs on the same interval against true relu.
+    for (uint32_t deg : {15u, 31u, 63u}) {
+      ChebyshevActivation cheb("relu", -range, range, deg);
+      FHEContext cc = make_ctx(cheb.depth(), 16, {});
+      auto gc = cc.decrypt(cheb.forward(cc, cc.encrypt(x)), 16);
+      std::printf("  chebyshev relu degree %u on [-%g, %g]: max err vs true relu %.2e (exactrelu %.2e)\n", deg, range,
+                  range, max_err(gc, relu, 16), max_err(ctx.decrypt(layer.forward(ctx, c), 16), relu, 16));
+    }
+  }
+  {
+    // A Chebyshev-ReLU network switched over with use_exact_relu: its
+    // plaintext reference becomes the true ReLU and the encrypted output
+    // matches it.
+    Network n(Shape{1, 4, 4});
+    n.emplace<Conv2d>(1, 2, 3, 3, 1, 1, rand_vec(18, -0.3, 0.3), rand_vec(2, -0.1, 0.1));
+    n.emplace<ChebyshevActivation>("relu", -2, 2, 15);
+    n.emplace<Dense>(32, 4, rand_vec(128, -0.5, 0.5), rand_vec(4));
+    check(n.use_exact_relu() == 1 && n.layers()[1]->type() == "exactrelu", "use_exact_relu replaces the relu");
+    check_encrypted("conv exactrelu dense", n, 1e-3);
+  }
+  {
+    // With bootstraps placed, every exact ReLU sits past one and costs a
+    // single level: two of them plus three dense layers fit a budget of 3.
+    Network n(Shape{1, 1, 8});
+    n.emplace<Dense>(8, 8, rand_vec(64, -0.6, 0.6), rand_vec(8, -0.2, 0.2));
+    n.emplace<ExactReLU>(4.0);
+    n.emplace<Dense>(8, 8, rand_vec(64, -0.6, 0.6), rand_vec(8, -0.2, 0.2));
+    n.emplace<ExactReLU>(4.0);
+    n.emplace<Dense>(8, 4, rand_vec(32, -0.6, 0.6), rand_vec(4, -0.2, 0.2));
+    std::vector<std::vector<double>> calib;
+    for (int i = 0; i < 8; ++i) calib.push_back(rand_vec(8));
+    auto x = rand_vec(8);
+    auto before = n.forward_plain(x);
+    size_t k = n.place_bootstraps(3, calib);
+    size_t deep = 0;
+    for (const auto& l : n.layers())
+      if (auto* r = dynamic_cast<const ExactReLU*>(l.get())) deep += r->after_bootstrap() && r->depth() == 1;
+    check(k > 0 && deep == 2 && n.depth_between_bootstraps() <= 3, "exactrelu past bootstraps costs one level",
+          "(" + std::to_string(k) + " bootstraps, depth between " + std::to_string(n.depth_between_bootstraps()) + ")");
+    check_err("exactrelu placement keeps the function", max_err(before, n.forward_plain(x), 4), 1e-9);
+    check_encrypted("dense exactrelu x2 with bootstraps", n, 1e-2);
+    // Without bootstraps the layers go back to their full depth.
+    Network m(Shape{1, 1, 8});
+    m.emplace<Dense>(8, 8, rand_vec(64, -0.6, 0.6), std::vector<double>{});
+    m.emplace<ExactReLU>(4.0);
+    check(m.place_bootstraps(20) == 0 && m.depth() == FHEContext::compare_depth() + 2,
+          "exactrelu keeps its full depth when no bootstrap is placed");
+  }
   if (quick) return;
   {
-    // conv -> maxpool (gapped output) -> relu -> dense: the pooled layout is
-    // absorbed by the dense layer, the activation sees bounded garbage slots.
+    // conv -> maxpool -> relu -> dense: the activation sees the pool's other
+    // tap blocks (partial maxima, bounded by the range) as garbage slots.
     Network n(Shape{1, 6, 6});
     n.emplace<Conv2d>(1, 2, 3, 3, 1, 1, rand_vec(18, -0.3, 0.3), rand_vec(2, -0.1, 0.1));
     n.emplace<MaxPool2d>(2, 2, 2.0);
     n.emplace<ChebyshevActivation>("relu", -2, 2, 15);
     n.emplace<Dense>(18, 4, rand_vec(72, -0.5, 0.5), rand_vec(4));
     check_encrypted("conv maxpool relu dense", n, 1e-2);
+  }
+  {
+    // Max pooling packs its output compactly, so with multiplexed packing the
+    // next (stride-1) conv, which widens 4 -> 16 channels, has no gaps to
+    // re-pack: 256 slots instead of the 1024 a gapped output would need.
+    Network n(Shape{1, 8, 8});
+    n.set_packing(Packing::kMultiplexed);
+    n.emplace<Conv2d>(1, 4, 3, 3, 1, 1, rand_vec(36, -0.3, 0.3), rand_vec(4, -0.1, 0.1));
+    n.emplace<MaxPool2d>(2, 2, 2.0);
+    n.emplace<Conv2d>(4, 16, 3, 3, 1, 1, rand_vec(576, -0.2, 0.2), rand_vec(16, -0.1, 0.1));
+    n.emplace<Dense>(256, 3, rand_vec(768, -0.1, 0.1), rand_vec(3));
+    n.compile();
+    check(n.layers()[2]->out_layout().m == 1 && n.slots() == 256, "conv after maxpool stays compact",
+          "(" + std::to_string(n.slots()) + " slots)");
+    check_encrypted("conv maxpool conv dense, multiplexed", n, 1e-2);
   }
 }
 
@@ -599,6 +793,22 @@ void encrypted_tests(bool quick) {
     check_encrypted("dense", n, 1e-4);
   }
   {
+    // Multiplexed packing through activations: conv s2 (m = 2, 8 channels in
+    // the slots of 2) -> square -> conv s1 (stays multiplexed) -> Chebyshev
+    // -> avgpool -> dense.
+    Network n(Shape{2, 8, 8});
+    n.set_packing(Packing::kMultiplexed);
+    n.emplace<Conv2d>(2, 8, 3, 3, 2, 1, rand_vec(144, -0.3, 0.3), rand_vec(8, -0.1, 0.1));
+    n.emplace<Square>();
+    n.emplace<Conv2d>(8, 4, 3, 3, 1, 1, rand_vec(288, -0.2, 0.2), rand_vec(4, -0.1, 0.1));
+    n.emplace<ChebyshevActivation>("relu", -2, 2, 15);
+    n.emplace<AvgPool2d>(2, 2);
+    n.emplace<Dense>(16, 3, rand_vec(48), rand_vec(3));
+    n.compile();
+    check(n.layers()[0]->out_layout().m == 2 && n.layers()[2]->out_layout().m == 2, "encrypted net is multiplexed");
+    check_encrypted("multiplexed conv square conv relu avgpool dense", n, 1e-3);
+  }
+  {
     Network n(Shape{2, 8, 8});
     n.emplace<AvgPool2d>(2, 2);
     check_encrypted("avgpool", n, 1e-4);
@@ -693,6 +903,39 @@ void ladder_tests() {
     check_err("ladder rotations window " + std::to_string(window), err, 1e-6);
     check(cost <= (9 + window - 1) / window, "ladder window " + std::to_string(window) + " cost bound",
           "(max " + std::to_string(cost) + " key switches)");
+
+    // rotate_many: a hoisted rotation tree (3x3 conv taps on a 20-wide
+    // image, attention-like strided offsets, a duplicate and a zero).
+    std::vector<int32_t> offs = {0, 1, 2, 20, 21, 22, 40, 41, 42, -1, -21, 64, 128, 192, 448, 41};
+    auto rot = ctx.rotate_many(c, offs);
+    err = 0;
+    for (size_t r = 0; r < offs.size(); ++r) {
+      auto got = ctx.decrypt(rot[r], o.slots);
+      for (uint32_t i = 0; i < o.slots; ++i)
+        err = std::max(err, std::fabs(got[i] - x[(i + offs[r] + 4 * o.slots) % o.slots]));
+    }
+    check_err("hoisted rotation tree window " + std::to_string(window), err, 1e-6);
+    auto plan = ctx.plan_rotations(offs);
+    size_t independent = 0;
+    for (int32_t k : offs) independent += ctx.rotation_cost(k);
+    check(plan->key_switches() < independent && plan->decompositions() < plan->key_switches(),
+          "hoisted rotation tree window " + std::to_string(window) + " shares work",
+          "(" + std::to_string(plan->key_switches()) + " key switches, " + std::to_string(plan->decompositions()) +
+              " decompositions; " + std::to_string(independent) + " key switches independently)");
+  }
+  {
+    // With a key per index the tree is a star: one decomposition.
+    ContextOptions o;
+    o.mult_depth = 1;
+    o.slots = 512;
+    o.secure = false;
+    o.ring_dim = 2048;
+    FHEContext ctx(o);
+    std::vector<int32_t> offs = {1, 5, 77, -3};
+    ctx.keygen(offs);
+    auto plan = ctx.plan_rotations(offs);
+    check(plan->key_switches() == 4 && plan->decompositions() == 1 && plan->max_depth() == 1,
+          "rotation plan with direct keys is one hoisted fan-out");
   }
 }
 

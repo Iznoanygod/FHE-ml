@@ -64,6 +64,11 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
       is.seekg(pos);
     }
     layer = mp;
+  } else if (tok == "exactrelu") {
+    double range, out;
+    int after_boot;
+    is >> range >> out >> after_boot;
+    layer = std::make_shared<ExactReLU>(range, out, after_boot != 0);
   } else if (tok == "affine") {
     size_t c;
     is >> c;
@@ -226,7 +231,7 @@ Network& Network::add(std::shared_ptr<Layer> layer) {
   Shape in = output_shape();
   Layout lin = layers_.empty() ? Layout::compact(input_) : layers_.back()->out_layout();
   layer->configure(in);
-  layer->configure_layout(lin, gapped_);
+  layer->configure_layout(lin, packing_);
   layers_.push_back(std::move(layer));
   const bool b = uses_bootstrapping();
   for (auto& l : layers_) l->set_bootstrapped(b);
@@ -239,7 +244,7 @@ Shape Network::configure() {
   Layout lay = Layout::compact(input_);
   for (auto& l : layers_) {
     s = l->configure(s);
-    lay = l->configure_layout(lay, gapped_);
+    lay = l->configure_layout(lay, packing_);
   }
   const bool b = uses_bootstrapping();
   for (auto& l : layers_) l->set_bootstrapped(b);
@@ -296,6 +301,7 @@ void Network::encrypt_weights(const FHEContext& ctx, bool drop_plaintext) {
 
 namespace {
 
+
 // How a scale on a layer's signal can move through it (see place_bootstraps).
 enum class Fold {
   kAbsorb,  // the layer can take a scale into its parameters for free
@@ -307,8 +313,8 @@ enum class Fold {
 Fold fold_kind(const Layer& l) {
   if (dynamic_cast<const Square*>(&l)) return Fold::kSquare;
   if (dynamic_cast<const PolyActivation*>(&l) || dynamic_cast<const ChebyshevActivation*>(&l) ||
-      dynamic_cast<const Scale*>(&l) || dynamic_cast<const FusedLinear*>(&l) || dynamic_cast<const LayerNorm*>(&l) ||
-      dynamic_cast<const MaxPool2d*>(&l))
+      dynamic_cast<const ExactReLU*>(&l) || dynamic_cast<const Scale*>(&l) || dynamic_cast<const FusedLinear*>(&l) ||
+      dynamic_cast<const LayerNorm*>(&l) || dynamic_cast<const MaxPool2d*>(&l))
     return Fold::kAbsorb;  // MaxPool2d: max(c x) = c max(x), c > 0, taken by its gather
   if (l.is_bootstrap()) return Fold::kPass;
   if (auto* lin = dynamic_cast<const LinearLayer*>(&l)) {
@@ -339,6 +345,7 @@ bool can_scale_output(const std::vector<std::shared_ptr<Layer>>& layers, size_t 
 void scale_output(std::shared_ptr<Layer>& l, double f) {
   if (auto* p = dynamic_cast<PolyActivation*>(l.get())) return p->rescale(1.0, f);
   if (auto* c = dynamic_cast<ChebyshevActivation*>(l.get())) return c->rescale(1.0, f);
+  if (auto* r = dynamic_cast<ExactReLU*>(l.get())) return r->rescale(1.0, f);
   if (auto* sc = dynamic_cast<Scale*>(l.get())) return sc->multiply(f);
   if (auto* fu = dynamic_cast<FusedLinear*>(l.get())) return fu->scale(f, f);
   if (auto* ln = dynamic_cast<LayerNorm*>(l.get())) return ln->scale_output(f);
@@ -372,6 +379,7 @@ void scale_output_chain(std::vector<std::shared_ptr<Layer>>& layers, double f) {
 void absorb_input(std::shared_ptr<Layer>& l, double c) {
   if (auto* p = dynamic_cast<PolyActivation*>(l.get())) return p->rescale(1.0 / c, 1.0);
   if (auto* ch = dynamic_cast<ChebyshevActivation*>(l.get())) return ch->rescale(1.0 / c, 1.0);
+  if (auto* r = dynamic_cast<ExactReLU*>(l.get())) return r->rescale(1.0 / c, 1.0);
   if (auto* sc = dynamic_cast<Scale*>(l.get())) return sc->multiply(1.0 / c);
   if (auto* fu = dynamic_cast<FusedLinear*>(l.get())) return fu->scale(1.0 / c, 1.0);
   if (auto* ln = dynamic_cast<LayerNorm*>(l.get())) return ln->absorb_input_scale(c);
@@ -754,6 +762,36 @@ uint32_t Network::input_level(const FHEContext& ctx) const {
   // One spare level: EvalBootstrap first rescales a pending product.
   const uint32_t need = depth_before_first_bootstrap() + 1;
   return ctx.total_depth() > need ? ctx.total_depth() - need : 0;
+}
+
+size_t Network::use_exact_relu(double range) {
+  std::function<size_t(std::vector<std::shared_ptr<Layer>>&)> walk = [&](auto& layers) {
+    size_t n = 0;
+    for (auto& l : layers) {
+      if (auto* r = dynamic_cast<Residual*>(l.get())) {
+        std::vector<std::shared_ptr<Layer>> body = r->body();
+        if (size_t f = walk(body)) {
+          l = std::make_shared<Residual>(std::move(body));
+          n += f;
+        }
+        continue;
+      }
+      auto* c = dynamic_cast<ChebyshevActivation*>(l.get());
+      if (!c || c->function_name() != "relu") continue;
+      // c computes out * relu(t + s x), the map taking the evaluation
+      // interval [a, b] onto the approximation interval [a', b'].
+      const double s = (c->approx_b() - c->approx_a()) / (c->b() - c->a());
+      const double t = c->approx_a() - s * c->a();
+      if (!(s > 0.0) || std::fabs(t) > 1e-12 * std::max(std::fabs(c->approx_a()), std::fabs(c->approx_b()))) continue;
+      const double r = range > 0.0 ? range : std::max(std::fabs(c->a()), std::fabs(c->b()));
+      l = std::make_shared<ExactReLU>(r, c->out_scale() * s);
+      ++n;
+    }
+    return n;
+  };
+  const size_t n = walk(layers_);
+  if (n) configure();
+  return n;
 }
 
 bool Network::uses_scheme_switching() const {

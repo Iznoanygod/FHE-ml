@@ -48,10 +48,10 @@ Shape TokenDense::configure(const Shape& in) {
   return out_;
 }
 
-Layout TokenDense::configure_layout(const Layout& in, bool gapped) {
+Layout TokenDense::configure_layout(const Layout& in, Packing packing) {
   in_layout_ = in;
   // Keep the input's token stride when the output tokens fit in it.
-  if (gapped && in.xs == 1 && in.cs >= static_cast<size_t>(out_dim_))
+  if (packing != Packing::kCompact && in.m == 1 && in.xs == 1 && in.cs >= static_cast<size_t>(out_dim_))
     out_layout_ = Layout{in.cs, static_cast<size_t>(out_dim_), 1};
   else
     out_layout_ = Layout::compact(out_);
@@ -161,9 +161,9 @@ Shape LayerNorm::configure(const Shape& in) {
   return out_;
 }
 
-Layout LayerNorm::configure_layout(const Layout& in, bool gapped) {
-  (void)gapped;
-  if (in.xs != 1 || in.ys != static_cast<size_t>(d_) && n_ > 1)
+Layout LayerNorm::configure_layout(const Layout& in, Packing packing) {
+  (void)packing;
+  if (in.m != 1 || in.xs != 1 || in.ys != static_cast<size_t>(d_) && n_ > 1)
     throw std::invalid_argument("layernorm: tokens must be contiguous in the slots");
   in_layout_ = out_layout_ = in;
   stride_ = n_ > 1 ? in.cs : static_cast<size_t>(d_);
@@ -471,9 +471,9 @@ Shape Residual::configure(const Shape& in) {
   return out_;
 }
 
-Layout Residual::configure_layout(const Layout& in, bool gapped) {
+Layout Residual::configure_layout(const Layout& in, Packing packing) {
   Layout l = in;
-  for (auto& b : body_) l = b->configure_layout(l, gapped);
+  for (auto& b : body_) l = b->configure_layout(l, packing);
   bool same = true;
   for (size_t i = 0; i < in_.size() && same; ++i) same = l.slot(body_.back()->out_shape(), i) == in.slot(in_, i);
   if (!same) {
@@ -632,13 +632,13 @@ Shape Attention::configure(const Shape& in) {
   return out_;
 }
 
-Layout Attention::configure_layout(const Layout& in, bool gapped) {
-  (void)gapped;
-  if (in.xs != 1 || in.cs < static_cast<size_t>(d_))
+Layout Attention::configure_layout(const Layout& in, Packing packing) {
+  (void)packing;
+  if (in.m != 1 || in.xs != 1 || in.cs < static_cast<size_t>(d_))
     throw std::invalid_argument("attention: tokens must be contiguous with stride >= d");
   stride_ = static_cast<int>(in.cs);
   for (auto& p : proj_)
-    if (p->configure_layout(in, true).cs != in.cs) throw std::logic_error("attention: projection changed the layout");
+    if (p->configure_layout(in, Packing::kGapped).cs != in.cs) throw std::logic_error("attention: projection changed the layout");
   in_layout_ = out_layout_ = in;
   return in;
 }
@@ -1017,8 +1017,7 @@ Ctxt Attention::forward(const FHEContext& ctx, const Ctxt& x) const {
     if (!p.plain) return forward_self(ctx, x, p);
   }
   const int32_t nd = n_ * stride_;
-  // Keys exist for indices normalised to [0, slots) (see FHEContext::keygen).
-  auto rot = [&](const Ctxt& c, int32_t r) { return cc->EvalRotate(c, normalize_rotation(r, slots_)); };
+  auto rot = [&](const Ctxt& c, int32_t r) { return ctx.rotate(c, r); };
   Ctxt q = proj_[0]->forward(ctx, x);
   Ctxt k = proj_[1]->forward(ctx, x);
   Ctxt v = proj_[2]->forward(ctx, x);
@@ -1028,8 +1027,8 @@ Ctxt Attention::forward(const FHEContext& ctx, const Ctxt& x) const {
   cc->EvalAddInPlace(v, rot(v, -nd));
   std::vector<int32_t> offs(n_);
   for (int s = 0; s < n_; ++s) offs[s] = s * stride_;
-  const std::vector<Ctxt> kr = backend::rotate_hoisted(cc, k, offs, ctx.parallel());
-  const std::vector<Ctxt> vr = backend::rotate_hoisted(cc, v, offs, ctx.parallel());
+  const std::vector<Ctxt> kr = ctx.rotate_many(k, offs);
+  const std::vector<Ctxt> vr = ctx.rotate_many(v, offs);
 
   // score[i][h] = q_i . k_{i+s} over head h, accumulated into slot
   // i*B + h*dh by summing a dh-wide window (slots i*B+d .. i*B+B-1 are

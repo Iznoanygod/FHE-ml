@@ -4,14 +4,17 @@
 (see ``fheml.nn`` for the HE-friendly modules) into an ``fheml.Network``.
 ``input_shape`` excludes the batch dimension:
 
-* ``(C, H, W)`` image: Conv2d, AvgPool2d, AdaptiveAvgPool2d(1), BatchNorm2d;
-  ``nn.Flatten`` then ``nn.Linear`` for the head.
+* ``(C, H, W)`` image: Conv2d, AvgPool2d, AdaptiveAvgPool2d(1), BatchNorm2d,
+  ``fheml.nn.MaxPool2d`` (exact, scheme switching); ``nn.Flatten`` then
+  ``nn.Linear`` for the head.
 * ``(n, d)`` token sequence: ``nn.Linear`` acts per token, plus Attention
   (quadratic or softmax scores), LayerNorm, Residual, PosEmbedding, TokenMean.
 * ``(k,)`` vector: Linear, BatchNorm1d.
 
-Activations must be ``fheml.nn`` polynomials (Poly, Square, Chebyshev):
-``nn.ReLU`` and friends have no exact encrypted equivalent.
+Activations must be ``fheml.nn`` polynomials (Poly, Square, Chebyshev).
+``nn.ReLU`` exports only with ``exact_relu=RANGE``: it then becomes an
+``fheml.ExactReLU`` (sign through CKKS<->FHEW scheme switching, inputs in
+[-RANGE, RANGE]), as do ``fheml.nn.Chebyshev('relu', ...)`` modules.
 """
 import numpy as np
 import torch
@@ -43,9 +46,10 @@ class _Exporter:
     """Walks the module tree tracking the activation shape and emits a list of
     layer specs (plain tuples), so later passes can fold or pad weights."""
 
-    def __init__(self, maxpool_range=None):
+    def __init__(self, maxpool_range=None, exact_relu=None):
         self.max_token_width = 0
         self.maxpool_range = maxpool_range
+        self.exact_relu = exact_relu
 
     def run(self, modules, state):
         out = []
@@ -91,6 +95,17 @@ class _Exporter:
             c, h, w = state[1:]
             out.append(("avgpool2d", k, s))
             return ("image", c, (h - k) // s + 1, (w - k) // s + 1)
+        if isinstance(m, hnn.MaxPool2d):
+            self.need(kind, "image", name)
+            if _pair(m.padding, "MaxPool2d padding") != 0 or _pair(m.dilation, "MaxPool2d dilation") != 1:
+                raise ValueError("MaxPool2d: padding and dilation are unsupported")
+            if m.ceil_mode or m.return_indices:
+                raise ValueError("MaxPool2d: ceil_mode and return_indices are unsupported")
+            k = _pair(m.kernel_size, "MaxPool2d kernel size")
+            s = _pair(m.stride if m.stride is not None else k, "MaxPool2d stride")
+            c, h, w = state[1:]
+            out.append(("maxpool2d", k, s, m.range))
+            return ("image", c, (h - k) // s + 1, (w - k) // s + 1)
         if isinstance(m, nn.AdaptiveAvgPool2d):
             self.need(kind, "image", name)
             c, h, w = state[1:]
@@ -131,6 +146,9 @@ class _Exporter:
         if isinstance(m, hnn.Poly):
             out.append(("poly", _np(m.coeffs)))
             return state
+        if self.exact_relu and (isinstance(m, nn.ReLU) or (isinstance(m, hnn.Chebyshev) and m.fn == "relu")):
+            out.append(("exactrelu", float(self.exact_relu)))
+            return state
         if isinstance(m, hnn.Chebyshev):
             out.append(("chebyshev", m.fn, m.a, m.b, m.degree))
             return state
@@ -169,21 +187,22 @@ class _Exporter:
             return ("vector", d)
 
         if isinstance(m, (nn.ReLU, nn.GELU, nn.SiLU, nn.Sigmoid, nn.Tanh, nn.LeakyReLU)):
+            hint = " or from_torch(..., exact_relu=RANGE) (scheme switching)" if name == "ReLU" else ""
             raise ValueError(f"nn.{name} has no exact encrypted form: use fheml.nn.Chebyshev"
-                             f"('{name.lower()}', a, b, degree) or a trained fheml.nn.Poly")
+                             f"('{name.lower()}', a, b, degree) or a trained fheml.nn.Poly{hint}")
         if isinstance(m, nn.MaxPool2d):
+            if self.maxpool_range is None:
+                raise ValueError("nn.MaxPool2d needs an input bound: pass from_torch(..., maxpool_range=R) with "
+                                 "R >= max |input|, or use fheml.nn.MaxPool2d(k, stride, range=R) (exact, via "
+                                 "CKKS<->FHEW scheme switching, 15+ levels) or nn.AvgPool2d")
             self.need(kind, "image", name)
-            rng = m.range if isinstance(m, hnn.MaxPool2d) else self.maxpool_range
-            if rng is None:
-                raise ValueError("nn.MaxPool2d: pass from_torch(..., maxpool_range=R) with R >= max |input|, or use "
-                                 "fheml.nn.MaxPool2d(k, stride, range) (exact max via CKKS<->FHEW scheme switching)")
             if _pair(m.padding, "MaxPool2d padding") != 0 or _pair(m.dilation, "MaxPool2d dilation") != 1 \
                     or m.ceil_mode or m.return_indices:
                 raise ValueError("nn.MaxPool2d: padding, dilation, ceil_mode and return_indices are unsupported")
             k = _pair(m.kernel_size, "MaxPool2d kernel size")
             s = _pair(m.stride if m.stride is not None else k, "MaxPool2d stride")
             c, h, w = state[1:]
-            out.append(("maxpool2d", k, s, float(rng)))
+            out.append(("maxpool2d", k, s, float(self.maxpool_range)))
             return ("image", c, (h - k) // s + 1, (w - k) // s + 1)
         if isinstance(m, nn.LayerNorm):
             raise ValueError("nn.LayerNorm has no exact encrypted form: use fheml.nn.LayerNorm(dim, eps, var_min, "
@@ -256,6 +275,8 @@ def _build(s):
         return _fheml.Poly(_flat(s[1]))
     if k == "chebyshev":
         return _fheml.Chebyshev(*s[1:])
+    if k == "exactrelu":
+        return _fheml.ExactReLU(s[1])
     if k == "bootstrap":
         return _fheml.Bootstrap()
     if k == "attention":
@@ -275,7 +296,7 @@ def _build(s):
     raise AssertionError(k)
 
 
-def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range=None):
+def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range=None, exact_relu=None):
     """Converts a trained torch model to an ``fheml.Network`` (not yet compiled).
 
     token_width: for token inputs, zero-pad each input token to this width
@@ -283,6 +304,11 @@ def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range
       stride makes per-token layers much cheaper under encryption; the
       helpers ``fheml.infer``/``encrypt``/``plain`` pad inputs automatically.
     check: compare the fheml plaintext reference with the torch model on a
+      random input and raise if they disagree (skipped for Chebyshev relus
+      replaced by exact_relu, which no longer match the torch polynomial).
+    exact_relu: input bound R; nn.ReLU and Chebyshev relu modules become
+      fheml.ExactReLU(R), the exact ReLU through CKKS<->FHEW scheme switching
+      (12+ levels and one FHEW bootstrap per slot each, see the README).
       random input and raise if they disagree.
     maxpool_range: input bound R of every plain nn.MaxPool2d (exported as the
       exact scheme-switching max pool; fheml.nn.MaxPool2d carries its own).
@@ -297,7 +323,7 @@ def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range
     else:
         raise ValueError("input_shape must be (C, H, W), (tokens, dim) or (features,)")
 
-    ex = _Exporter(maxpool_range)
+    ex = _Exporter(maxpool_range, exact_relu)
     modules = model if isinstance(model, nn.Sequential) else [model]
     with torch.no_grad():
         specs, _ = ex.run(modules, state)
@@ -317,7 +343,8 @@ def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range
     for s in specs:
         net.add(_build(s))
 
-    if check:
+    replaced_poly = exact_relu and any(isinstance(m, hnn.Chebyshev) and m.fn == "relu" for m in model.modules())
+    if check and not replaced_poly:
         _check(model, net, shape)
     return net
 

@@ -81,6 +81,7 @@ class LinearTransform {
   std::vector<int32_t> rotation_indices() const;
   size_t num_diagonals() const { return num_diagonals_; }
   size_t num_baby_steps() const { return babies_.size(); }
+  const std::vector<int32_t>& baby_steps() const { return babies_; }
   size_t num_giant_steps() const { return giants_.size(); }
   uint32_t baby_step() const { return baby_step_; }
   uint32_t slots() const { return slots_; }

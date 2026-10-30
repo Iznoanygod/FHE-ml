@@ -38,4 +38,18 @@ net.encrypt_weights(ctx)
 err = np.abs(fheml.infer(net, ctx, x) - ref).max()
 print(f"encrypted weights: max err {err:.1e}")
 assert err < 1e-3
+
+# Multiplexed packing: the stride-2 conv interleaves 8 channels into the gaps.
+cnn = fheml.Network(fheml.Shape(2, 8, 8))
+cnn.packing = "multiplexed"
+cnn.add(fheml.Conv2d(2, 8, 3, 3, 2, 1, rng.uniform(-0.3, 0.3, 144), rng.uniform(-0.1, 0.1, 8)))
+cnn.add(fheml.Square()).add(fheml.Dense(128, 3, w(3, 128, 0.1), w(1, 3, 0.1)))
+cnn.compile()
+print(cnn.summary())
+assert cnn.packing == "multiplexed" and "multiplexed out m=2" in cnn.layers[0].describe() and cnn.slots == 128
+ctx = fheml.make_context(cnn, secure=False)
+x = rng.uniform(-1, 1, (2, 8, 8))
+err = np.abs(fheml.infer(cnn, ctx, x) - fheml.plain(cnn, x)).max()
+print(f"multiplexed cnn: max err {err:.1e}")
+assert err < 1e-3
 print("PASSED")

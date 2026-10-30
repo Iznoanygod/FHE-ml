@@ -19,6 +19,9 @@ That code is kept in [`legacy/`](legacy/) for reference.
 * **Strided layers keep their outputs "gapped".** The outputs stay where the
   input pixels were instead of being compacted. That keeps a strided
   convolution at `k*k*(Ci+Co-1)` diagonals; the next layer absorbs the gaps.
+  With `Packing::kMultiplexed` the gaps hold other channels instead
+  (multiplexed packing, Lee et al. ICML'22): compact slot counts with few
+  diagonals.
 * **Dense heads use the Gazelle hybrid method.** Partial sums are folded into
   at most `2R-1` diagonals, plus `log2(S/R)` rotate-and-sum steps.
   * The MNIST `845->64` layer needs 126 diagonals instead of 908.
@@ -27,6 +30,9 @@ That code is kept in [`legacy/`](legacy/) for reference.
   * Trained polynomials `poly`.
   * Chebyshev approximations of `relu` / `silu` / `gelu` / `sigmoid` / `tanh`
     on a chosen interval and degree, via `EvalChebyshevSeries`.
+  * An exact ReLU (`ExactReLU`) whose sign is computed in FHEW through
+    scheme switching, as an option next to the Chebyshev ReLU (see
+    [Exact ReLU](#exact-relu-via-scheme-switching)).
 * **Small transformers.**
   * `TokenDense` is a per-token linear layer.
   * `Attention` is fully homomorphic self-attention: ct×ct QKᵀ and AV, with
@@ -240,6 +246,7 @@ logits = fheml.infer(net, ctx, image)        # image: (1, 28, 28) numpy array
 | `nn.Conv2d` (square kernel, zero padding, groups=1) | `conv2d` |
 | `nn.Linear` | `dense` on vectors; `tokendense` on `(tokens, dim)` inputs |
 | `nn.AvgPool2d`, `nn.AdaptiveAvgPool2d(1)` | `avgpool2d` |
+| `hnn.MaxPool2d(k, stride, range=R)` (square window, no padding) | `maxpool2d` (exact, scheme switching) |
 | `nn.BatchNorm2d` / `nn.BatchNorm1d` | folded into the preceding conv/linear, else `affine` |
 | `nn.Flatten`, `nn.Dropout`, `nn.Identity` | nothing |
 | `hnn.Poly`, `hnn.Square`, `hnn.Chebyshev` | `poly`, `square`, `chebyshev` |
@@ -248,12 +255,16 @@ logits = fheml.infer(net, ctx, image)        # image: (1, 28, 28) numpy array
 | `hnn.LayerNorm(dim, eps, var_min, var_max, degree, newton)` | `layernorm` |
 | `hnn.Bootstrap` | `bootstrap` |
 
-`nn.ReLU`, `nn.LayerNorm` and `nn.Softmax` have no exact encrypted form and
-are rejected with a message naming the replacement (`hnn.Chebyshev`,
-`hnn.LayerNorm`, `hnn.Attention(softmax=...)`). `nn.MaxPool2d` is rejected
-too for now: the library has an exact `MaxPool2d` layer (see below), but at
-15+ levels and a FHEW bootstrap per slot and comparison it is not something
-an exporter should insert silently. `hnn.Chebyshev`, `hnn.LayerNorm` and the
+`nn.LayerNorm` and `nn.Softmax` have no exact encrypted form and are
+rejected with a message naming the replacement (`hnn.LayerNorm`,
+`hnn.Attention(softmax=...)`). `nn.ReLU` is rejected too unless
+`from_torch(..., exact_relu=RANGE)` is given: it then becomes the exact
+scheme-switching `ExactReLU` (see below; `hnn.Chebyshev("relu", ...)` modules
+too); otherwise use `hnn.Chebyshev`. A plain `nn.MaxPool2d` is
+rejected too because the encrypted comparison needs an input bound:
+`hnn.MaxPool2d(k, stride, range=R)` is the same torch layer with that bound
+and exports to the exact `MaxPool2d` (see below), at 15+ levels and a FHEW
+bootstrap per slot and comparison. `hnn.Chebyshev`, `hnn.LayerNorm` and the
 softmax of `hnn.Attention` evaluate the same polynomial approximations in
 torch that run encrypted, so training sees what inference computes (and
 pushes the model to keep its variances and scores inside the intervals). For token inputs the exporter pads
@@ -307,10 +318,11 @@ A `k × k` pool runs `k² − 1` comparisons. Each comparison result is a fresh
 CKKS ciphertext at `FHEContext::compare_depth()` = 12 levels whatever the
 inputs' levels, so the pool output sits at `12 + ceil(log2 k²)` levels and the
 layer reserves one more (a comparison needs its inputs two levels above the
-bottom of the chain): a 2×2 pool is a 15-level layer, a 3×3 pool 17. That is
-why it is not wired into the models, the trainer or the PyTorch exporter yet:
-with bootstrapping budgets of 20–26 levels at ring 2^16 it would take one
-bootstrap per pool. The comparison resolves differences down to about
+bottom of the chain): a 2×2 pool is a 15-level layer, a 3×3 pool 17. With
+bootstrapping budgets of 20–26 levels at ring 2^16 it takes about one
+bootstrap per pool, which is why the example models do not use it.
+`hnn.MaxPool2d` exports it from PyTorch, and `Trainer` backpropagates through
+it with the forward's comparison bits (see [Encrypted training](#encrypted-training)). The comparison resolves differences down to about
 `4·range / 2^(fhew_log_q − 1)`; a smaller difference is decided either way,
 which moves the maximum by at most that much. Values outside `[-range, range]`
 wrap around in the FHEW plaintext space and compare wrongly, so calibrate
@@ -319,9 +331,117 @@ wrap around in the FHEW plaintext space and compare wrongly, so calibrate
 The output stays gapped at the input positions like a strided convolution;
 the slots between outputs hold maxima of other windows (bounded by `range`),
 which the next linear layer ignores. `place_bootstraps` cannot fold a scale
-through the layer yet and inserts a `scale` layer when it has to; the trainer
-has no backward for it; the FIDESlib (GPU) backend does not support scheme
-switching.
+through the layer yet and inserts a `scale` layer when it has to; the FIDESlib
+(GPU) backend does not support scheme switching.
+
+## Exact ReLU via scheme switching
+
+`ExactReLU(range)` computes `max(x, 0)` without a polynomial: the sign
+`[x > 0]` comes from the same CKKS → FHEW → CKKS comparison as max pooling
+(`FHEContext::positive(x, range)`, i.e. `compare(0, x)` with the FHEW scaling
+set for a difference of at most `range`), and the layer returns
+`x · [x > 0]`. It is an option, not the default: the Chebyshev ReLU stays in
+the models because it is two to three orders of magnitude faster (table
+below).
+
+```cpp
+net.emplace<ExactReLU>(/*range=*/4.0);   // inputs must lie in [-range, range]
+net.use_exact_relu();                     // or: swap every Chebyshev relu for one (keeps the interval)
+```
+
+```python
+net = fheml.from_torch(model, shape, exact_relu=4.0)   # nn.ReLU / hnn.Chebyshev("relu") -> ExactReLU
+net.use_exact_relu()                                    # on an existing fheml.Network
+```
+
+`./build/relu_bench [--slots N] [--range R] [--insecure]` measures both against
+the true ReLU on the same inputs in `[-4, 4]` (each variant in its own context
+with just the levels it needs; 4 cores, OpenFHE 1.4.2):
+
+| 128-bit, ring 2^15, 256 slots | levels | per call | setup + keys | max error vs ReLU | error for \|x\| > 0.1 |
+|---|---|---|---|---|---|
+| Chebyshev degree 15 | 6 | 0.40 s | 0.3 s | 1.3e-1 | 7.8e-2 |
+| Chebyshev degree 31 | 7 | 0.66 s | 0.3 s | 6.3e-2 | 2.0e-2 |
+| Chebyshev degree 63 | 8 | 1.05 s | 0.4 s | 3.1e-2 | 4.8e-3 |
+| `ExactReLU` (STD128 FHEW) | 13 (1 past a bootstrap) | 412 s | 80 s, 7.3 GB peak | 4.4e-3 | 4.4e-3 |
+
+At toy parameters (`--insecure`) the exact ReLU takes about 1 s at 16 slots
+and 13 s at 256 slots with an error of about 1e-5; the time grows linearly
+with the slot count (one FHEW bootstrap per slot), the Chebyshev time does
+not.
+
+Error is the maximum over all slots against `max(x, 0)`; the Chebyshev
+error peaks at the kink and shrinks only linearly with the degree, while the
+exact ReLU is limited by CKKS noise everywhere except within the FHEW
+resolution (about `2·range / 2^(fhew_log_q − 1)`) of zero, where either branch
+is off by at most `|x|`.
+
+Depth: the sign is a fresh ciphertext at `compare_depth()` = 12 levels
+whatever the input's level, so from a fresh input the layer is 13 levels
+deep. Past a CKKS bootstrap, whose own depth (18–20) is larger than 12, `x`
+is already the deeper operand and the layer costs **one level**:
+`place_bootstraps` / `fheml.auto_bootstrap` mark every `ExactReLU` that way
+(`after_bootstrap`, saved in the model file) and the planner budgets 1 level
+for it, against 5–6 for a degree-15 Chebyshev ReLU. That makes deep ReLU
+networks need fewer CKKS bootstraps, but each ReLU still costs a FHEW
+bootstrap per slot, which dominates the time.
+
+Accuracy: a model trained with the Chebyshev ReLU loses accuracy when
+switched (`mnist_cnn --model models/mnist_deepcnn.fheml --exact-relu` on 14×14
+inputs, 200 test images: 98.0% → 95.5% in plaintext) because it learned the polynomial; train
+with `nn.ReLU` and export with `exact_relu=` instead
+(`train_torch_mnist.py --arch deepcnn --exact-relu`). Trained that way the
+deep CNN reaches 97.5% (97.6% with the Chebyshev ReLU) and, with
+`--bootstrap`, plans to 9 levels with a single CKKS bootstrap instead of 25
+levels and 8 bootstraps; at toy parameters an encrypted image takes about
+55 s (all from the four ReLUs over 256 slots) and its logits match torch to
+about 8e-3. At 128-bit security the four ReLUs alone would take about
+4 × 412 s ≈ 28 minutes per image, against seconds for the Chebyshev model. The trainer has no
+backward pass for it yet; the FIDESlib backend has no scheme switching.
+
+## Multiplexed packing
+
+A gapped stride-2 output needs `C·H·W` slots where a compact one needs a
+quarter of that, and each further stride-2 stage multiplies the waste by 4. A
+ResNet-20-shaped CIFAR network (16/32/64 channels, two stride-2 stages) needs
+65536 slots gapped, so ring 2^17. Compacting fixes the slots but turns a
+strided conv into a dense mess of diagonals (15858 for `16->32 s=2`).
+`Packing::kMultiplexed` interleaves `m²` channels into the gaps of a stride-`m`
+output, as in Lee et al.'s multiplexed parallel convolutions: same slots as
+compact, offsets still constant per (channel pair, tap). Any linear layer can
+write any layout, so the BSGS plans need nothing new, and a conv after max
+pooling re-packs the pool's gapped output for free. Each strided layer takes
+the cheapest collision-free layout (multiplexed, gapped or compact), weighting
+the BSGS cost by the slots it needs. Details in `docs/DESIGN.md`.
+
+```cpp
+net.set_packing(Packing::kMultiplexed);   // before compile(); default kGapped
+```
+```python
+net.packing = "multiplexed"               # "gapped" | "compact" | "multiplexed"
+```
+
+Measured (OpenFHE 1.4.2, 4 cores; `examples/packing_bench`, `mnist_cnn --packing`):
+
+| | gapped | compact | multiplexed |
+|---|---|---|---|
+| MNIST CNN, 128-bit (ring 2^15), per image | 2.41 s | 4.98 s | **1.80 s** |
+| MNIST CNN, slots / rotation keys | 4096 / 55 | 1024 / 75 | 2048 / **40** |
+| CIFAR stack, slots (ring) | 65536 (2^17) | 16384 (2^15) | **16384 (2^15)** |
+| CIFAR stack, diagonals / rotation keys | 2657 / 136 | 26066 / 405 | 3822 / 146 |
+| CIFAR stack, all linear layers encrypted | 28.0 s | 38.6 s | **8.6 s** |
+
+The CIFAR row times each linear layer on its own (toy parameters, ring = 2 ×
+slots, depth 2, only that layer's keys), so it compares the packings rather
+than giving an end-to-end number; activations and bootstraps also get 4×
+cheaper at ring 2^15 than at 2^17. The MNIST rows are full encrypted
+inference at 128-bit security (3 images, all correct, logit error < 3e-6).
+For the deep MNIST CNN (`mnist_deepcnn`) multiplexing keeps compact's 256
+slots with 202 diagonals instead of 470 and 33 rotation keys instead of 49.
+Multiplexed layouts also go through encrypted training (`test_train`).
+
+Not done: residual blocks on images (the CIFAR stack has no skips), and the
+layout is chosen greedily per layer, not searched over the whole network.
 
 ## LayerNorm and softmax
 
@@ -370,16 +490,35 @@ trainer.decrypt_weights(ctx)                             # key holder: trained w
   layernorm's gamma and beta, and the four projections of attention
   (quadratic or softmax scores, any number of heads), with shared weights
   handled exactly. Gradients flow through square, poly, chebyshev, average
-  pooling, token mean, layernorm, attention, residual and bootstrap layers.
+  and max pooling, token mean, layernorm, attention, residual and bootstrap
+  layers. Max pooling routes each window's gradient to the tap that won,
+  multiplying by the comparison bits its forward pass already computed, so
+  the backward pass adds no scheme switching (`ceil(log2 k²)` levels).
   The softmax and the layer norm's inverse square root are differentiated as
   the functions they approximate (`exp' = exp`, `(1/S)' = -1/S²`), so their
   gradients match the exact ones up to the approximation error.
-* **What does not:** max pooling has no backward. Layers in a frozen prefix
-  only run forward.
+* **What does not:** layers in a frozen prefix only run forward.
 * **Fine-tuning:** `frozen=[...]` keeps layers fixed. Everything before the
   first trainable layer runs as ordinary encrypted inference.
-* **Loss:** squared error against the encrypted target. Softmax
-  cross-entropy would need an encrypted softmax.
+* **Loss:** squared error against the encrypted target (default), or softmax
+  cross-entropy against an encrypted one-hot target:
+  `make_trainer(net, loss=fheml.cross_entropy(lo=-4, hi=4))`. The gradient
+  `softmax(y) - t` is computed under encryption with the attention softmax's
+  polynomials: exp as a Chebyshev series on the logit range `[lo, hi]`, a
+  rotate-and-sum for the denominator, 1/x as a Chebyshev series plus Newton
+  steps. With `subtract_max=True` the largest logit is found with
+  scheme-switching comparisons first (log2 of the output span of them, 4 for
+  10 classes), so exp lives on `[lo - hi, 0]`, the sum on `[1, k]` and nothing
+  needs calibrating. The loss value itself stays with the client, who
+  decrypts the logits anyway (`fheml.cross_entropy_plain`). Cross-entropy
+  costs levels: the gradient sits 17 levels below the logits for degree
+  15 / 31 with two Newton steps (step depth 27 instead of 8 for the test MLP; 20 with a `bootstrap` layer
+  right before the loss, 17 with that and degree 7 / 7 on a calibrated
+  `[sum_lo, sum_hi]`). That is fine with toy parameters, but more than the
+  24 levels of ring 2^16 at 128-bit security without bootstrapping (28 for
+  one update of the MLP at degree 7 / 7) and far more than the ~6 a
+  bootstrap leaves there, so 128-bit cross-entropy training needs ring 2^17
+  or bootstraps inside the softmax (not done yet).
 * **Check:** `fheml.train_plain` runs the same SGD in the clear.
   `tests/test_train.cpp` shows the decrypted weights match it to about 1e-8
   without bootstrapping and 3e-4 with it, and checks the plaintext gradients
@@ -438,7 +577,33 @@ at deeper levels after each update, so the ciphertexts shrink); the
 decrypted weights matched the plaintext SGD run to 3e-8. Composed rotations
 cost 1-3 key switches each instead of one hoisted one, so this is slower
 per sample than the toy run, but it is the first run of the trainer at
-128-bit security.
+128-bit security. (These timings predate the hoisted rotation tree below.)
+
+### Hoisted composed rotations
+
+With a ladder, `rotate_many` evaluates a rotation tree: offsets that share
+ladder steps share the rotated copies, and every copy rotated further is
+decomposed once for all its successors (see
+[DESIGN.md](docs/DESIGN.md#rotation-key-ladder)). `./build/rotation_bench`
+compares it with rotating each offset on its own and with the previous
+`rotate_many` (nearest earlier copy, no hoisting), on the baby steps of the
+`conv_demo` CNN and a 16-token attention. 128-bit, ring 2^15, depth 8, 4
+cores, mean of 3 (ks = key switches, dec = decompositions):
+
+| `rotation_window=1` | independent | nearest copy | hoisted tree |
+| --- | --- | --- | --- |
+| conv 3x3, 9 offsets | 32 ks, 1.15 s | 10 ks, 0.58 s | 10 ks + 6 dec, 0.52 s |
+| strided conv 3x3, 9 offsets | 28 ks, 0.97 s | 9 ks, 0.49 s | 9 ks + 5 dec, 0.49 s |
+| dense head, 7 offsets | 9 ks, 0.29 s | 6 ks, 0.25 s | 6 ks + 3 dec, 0.24 s |
+| attention, 16 token offsets | 32 ks, 0.89 s | 15 ks, 0.46 s | 15 ks + 7 dec, 0.39 s |
+
+A key switch took 56-63 ms, of which the decomposition was 20-22 ms, so a
+tree saves at most about a third over the nearest-copy plan; it saves 0-20%
+of wall time here (with direct keys all three are one hoisted fan-out, 1
+decomposition). Two encrypted training updates (4 images, `rotation_window=1`,
+insecure ring 2^14) went from 48 s / 36 s to 46 s / 32 s, and fine-tuning
+the last layer (whose frozen backward is now hoisted too) from 7.0 s / 5.9 s
+to 5.9 s / 5.3 s.
 
 ## Deep networks
 
@@ -491,6 +656,48 @@ ring buys 55-bit scaling and far better bootstraps at twice the memory.
 The same bootstraps work inside encrypted training: the trainer bootstraps
 the activation on the way forward and the gradient on the way back.
 
+### Training deep networks: bootstrapping inside the step
+
+`place_bootstraps` works layer by layer and only for inference. A training
+step is much deeper than the forward pass (a pre-norm transformer block
+with softmax attention takes 80 levels from the forward pass through the
+backward pass to the weight update), its activations are reused by the backward pass, and the
+deepest pieces (softmax, layer norm) are single layers. With a level budget
+the trainer bootstraps inside the step instead:
+
+```python
+trainer, ctx = fheml.make_trainer(net, level_budget="min", bootstrap_range=32)
+# or: trainer.set_level_budget(12, range=32) before building the context
+```
+
+Before every operation that would take a ciphertext deeper than the budget,
+its operands are bootstrapped: activations on the way forward, gradients on
+the way back, the stored activations the backward pass reuses, and the
+intermediate values inside a layer (between the max tournament, the exp and
+the 1/x of a softmax, around the 1/sqrt of a layer norm, before a weight
+update). The context then only needs the budget plus the bootstrap's own
+levels. `range` bounds the slot values at these bootstraps: they are divided
+by it (a power of two, one level) before and doubled back after (free).
+`min_level_budget` is the deepest indivisible operation (the 1/sqrt series
+of a layer norm, a softmax series, an activation polynomial),
+`sample_bootstraps` counts the bootstraps of the last sample.
+
+Measured in CI (`tests/test_train.cpp`, toy parameters: ring 4096, 55-bit
+scaling, bootstrap level budget {3,3}), one SGD update of 2 samples each,
+decrypted weights against the same update in the clear:
+
+| Network | Step depth without / with budget | Bootstraps per sample | Context depth | Weight error | Time per update |
+| --- | --- | --- | --- | --- | --- |
+| CNN (conv, affine, square, avgpool, dense) | 12 / 2 | 3 | 25 (5 + 20) | 1.4e-4 | about 1 min |
+| Pre-norm transformer block (layer norm + 2-head softmax attention, layer norm + SiLU MLP), 4 tokens | 80 / 12 | 13 | 35 (15 + 20) | 8.2e-5 | about 3.5 min |
+| Softmax attention with the scheme-switching row maximum | 47 / 8 | 15 | 31 (11 + 20) | 6.0e-6 | about 1.3 min |
+| MLP with softmax cross-entropy loss (bootstraps inside the loss's softmax) | 27 / 8 | 4 | 31 (11 + 20) | 2.8e-6 | |
+
+Without the budget the transformer block would need an 80-level step plus
+the bootstrap's 20 levels; at 128-bit security that is far beyond ring 2^17.
+With budget 12 it needs 35 levels, ring 2^16 territory at 128-bit with the
+larger rings' scaling (the toy runs above use 55-bit scaling at ring 4096).
+
 ## Using the library
 
 ```cpp
@@ -526,7 +733,7 @@ still need their own key).
 | Path | Contents |
 | --- | --- |
 | `include/fheml/`, `src/` | the library: backend selection (`backend.h`: OpenFHE or FIDESlib), context, linear transforms, layers, network, encrypted training (`train.h`) |
-| `examples/` | `mnist_cnn` (encrypted MNIST) and `conv_demo` (network built in code) |
+| `examples/` | `mnist_cnn` (encrypted MNIST), `conv_demo` (network built in code), `packing_bench` (gapped vs compact vs multiplexed packing) and `rotation_bench` (hoisted rotation trees vs. plain composed rotations) |
 | `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py` |
 | `python/` | pybind11 bindings and the `fheml` Python package (`fheml.nn` + `fheml.from_torch`: PyTorch export) |
 | `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `train_encrypted_mnist.py` trains on encrypted data |

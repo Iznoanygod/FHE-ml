@@ -5,6 +5,9 @@
 #define FHEML_CONTEXT_H_
 
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -51,6 +54,26 @@ struct ContextOptions {
   // "large precision" switching). Also sets the comparison resolution: a
   // difference of two values is resolved to about 2^(2 - logq) of the range.
   uint32_t fhew_log_q = 25;
+};
+
+// How FHEContext::rotate_many evaluates a set of rotations of one
+// ciphertext: a tree of single-key rotations rooted at the input (node 0).
+// Every node with children is decomposed once and all its children are
+// rotated from that decomposition (hoisting), so composed rotations that
+// share a prefix of ladder steps also share its key switches.
+struct RotationPlan {
+  std::vector<int> parent;      // parent node; -1 for the input
+  std::vector<int32_t> step;    // rotation key from the parent (0 for the input)
+  std::vector<int32_t> offset;  // total rotation from the input, in [0, slots)
+  std::vector<uint32_t> depth;  // key switches from the input
+  std::vector<size_t> out;      // node holding each requested rotation
+
+  // Rotations performed (tree edges).
+  size_t key_switches() const { return parent.empty() ? 0 : parent.size() - 1; }
+  // Digit decompositions performed (nodes with children).
+  size_t decompositions() const;
+  // Longest chain of key switches.
+  uint32_t max_depth() const;
 };
 
 class FHEContext {
@@ -100,6 +123,10 @@ class FHEContext {
   // only the first `count` slots, rounded up to a power of two (one FHEW
   // bootstrap each; the other slots of the result are 0).
   Ctxt compare(const Ctxt& a, const Ctxt& b, double range = 1.0, size_t count = 0) const;
+  // Sign test [x > 0] per slot for |x| <= range: compare(0, x) with the
+  // FHEW scaling set for a difference of at most range (not 2 range), so
+  // small values are resolved twice as finely as by compare().
+  Ctxt positive(const Ctxt& x, double range = 1.0) const;
   // Levels of a compare() result, i.e. what OpenFHE's FHEW-to-CKKS decoding
   // consumes (constant for the parameter sets used here).
   static uint32_t compare_depth() { return 12; }
@@ -108,10 +135,14 @@ class FHEContext {
   // Rotates by k slots (any k): with the key for k directly, otherwise
   // composed from the ladder keys (see ContextOptions::rotation_window).
   Ctxt rotate(const Ctxt& c, int32_t k) const;
-  // rotate(c, k) for every k in ks. With a key per index the rotations share
-  // one hoisted decomposition; composed rotations reuse each other (each
-  // starts from the already rotated copy nearest to it).
+  // rotate(c, k) for every k in ks, evaluated as plan_rotations(ks): with a
+  // key per index all rotations share one hoisted decomposition; composed
+  // rotations share their common ladder steps, start from the already
+  // rotated copy nearest to them, and every copy that is rotated further is
+  // decomposed once for all its successors.
   std::vector<Ctxt> rotate_many(const Ctxt& c, const std::vector<int32_t>& ks) const;
+  // The rotation tree rotate_many(c, ks) evaluates (cached per index list).
+  std::shared_ptr<const RotationPlan> plan_rotations(const std::vector<int32_t>& ks) const;
   bool has_rotation_key(int32_t k) const;
   // Key switches rotate(c, k) performs (0 for k = 0).
   uint32_t rotation_cost(int32_t k) const;
@@ -147,6 +178,11 @@ class FHEContext {
   uint32_t compare_plaintext_mod_ = 0;
   uint32_t total_depth_ = 0;
   uint32_t boot_depth_ = 0;
+  struct PlanCache {
+    std::mutex mu;
+    std::map<std::vector<int32_t>, std::shared_ptr<const RotationPlan>> plans;
+  };
+  std::shared_ptr<PlanCache> plans_ = std::make_shared<PlanCache>();
 };
 
 // Normalises a rotation index to [0, slots).

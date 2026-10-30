@@ -47,6 +47,9 @@ FHEContext::FHEContext(const ContextOptions& opts) : opts_(opts) {
   uint32_t ring = opts_.ring_dim ? opts_.ring_dim : 2 * opts_.slots;
   // Bootstrapping fails on tiny rings even when security is off.
   if (!opts_.ring_dim && opts_.bootstrapping) ring = std::max(ring, 4096u);
+  // Scheme switching encodes FHEW-sized vectors (n = 32 at TOY parameters)
+  // into the CKKS slots: tiny insecure rings are too small for it.
+  if (!opts_.ring_dim && opts_.scheme_switching) ring = std::max(ring, 2048u);
   std::string last_error;
   for (; ring <= (1u << 17); ring *= 2) {
     params.SetRingDim(ring);
@@ -92,6 +95,10 @@ std::vector<int32_t> FHEContext::ladder_rotations(uint32_t slots, uint32_t windo
 }
 
 void FHEContext::keygen(const std::vector<int32_t>& rotations) {
+  {
+    std::lock_guard<std::mutex> lock(plans_->mu);
+    plans_->plans.clear();
+  }
   keys_ = cc_->KeyGen();
   cc_->EvalMultKeyGen(keys_.secretKey);
   std::set<int32_t> uniq;
@@ -170,51 +177,160 @@ Ctxt FHEContext::rotate(const Ctxt& c, int32_t k) const {
   return out;
 }
 
-// With a key per index the rotations share one hoisted decomposition.
-// Otherwise (rotation-key ladder) each rotation is composed from ladder keys,
-// and to save key switches it starts from the already rotated copy closest to
-// it: conv offsets such as 28, 29, 30 differ by one step. Planned first, then
-// evaluated in waves of independent rotations.
+size_t RotationPlan::decompositions() const {
+  std::vector<char> has_child(parent.size(), 0);
+  for (int p : parent)
+    if (p >= 0) has_child[static_cast<size_t>(p)] = 1;
+  return static_cast<size_t>(std::count(has_child.begin(), has_child.end(), 1));
+}
+
+uint32_t RotationPlan::max_depth() const { return depth.empty() ? 0 : *std::max_element(depth.begin(), depth.end()); }
+
+// Greedy: offsets in order of their own cost, each reached from the tree
+// node (input, earlier output or intermediate copy) it is cheapest to reach
+// from, counting new rotations and new decompositions; ties go to the
+// shallower result. A composed path takes its largest ladder steps first, so
+// offsets with the same coarse part (conv rows, attention tokens) share the
+// intermediate copies and fan out from them.
+std::shared_ptr<const RotationPlan> FHEContext::plan_rotations(const std::vector<int32_t>& ks) const {
+  {
+    std::lock_guard<std::mutex> lock(plans_->mu);
+    auto it = plans_->plans.find(ks);
+    if (it != plans_->plans.end()) return it->second;
+  }
+  const int32_t slots = static_cast<int32_t>(opts_.slots);
+  auto plan = std::make_shared<RotationPlan>();
+  RotationPlan& p = *plan;
+  std::vector<int> node_at(opts_.slots, -1);
+  std::vector<char> has_child;
+  auto add = [&](int parent, int32_t step, int32_t off) {
+    const int id = static_cast<int>(p.parent.size());
+    p.parent.push_back(parent);
+    p.step.push_back(step);
+    p.offset.push_back(off);
+    p.depth.push_back(parent < 0 ? 0 : p.depth[static_cast<size_t>(parent)] + 1);
+    has_child.push_back(0);
+    if (parent >= 0) has_child[static_cast<size_t>(parent)] = 1;
+    node_at[static_cast<size_t>(off)] = id;
+    return id;
+  };
+  add(-1, 0, 0);
+  // rotation_cost, with rotations no key reaches priced out.
+  auto cost = [&](int32_t k) -> uint32_t {
+    if (!has_rotation_key(k) && !opts_.rotation_window) return 1u << 20;
+    return rotation_cost(k);
+  };
+
+  std::vector<size_t> order(ks.size());
+  std::vector<uint32_t> own(ks.size());
+  for (size_t i = 0; i < ks.size(); ++i) {
+    order[i] = i;
+    own[i] = cost(ks[i]);
+  }
+  std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return own[a] < own[b]; });
+  p.out.assign(ks.size(), 0);
+  // Single-key steps from node j to offset k: the direct key, or the ladder
+  // digits, largest first.
+  auto path = [&](size_t j, int32_t k) {
+    const int32_t delta = normalize_rotation(int64_t(k) - p.offset[j], opts_.slots);
+    std::vector<int32_t> steps;
+    if (has_rotation_key(delta)) {
+      steps.push_back(delta);
+    } else {
+      steps = ladder_steps(delta, opts_.slots, opts_.rotation_window);
+      auto mag = [&](int32_t r) { return std::min(r, slots - r); };
+      std::stable_sort(steps.begin(), steps.end(), [&](int32_t x, int32_t y) { return mag(x) > mag(y); });
+    }
+    return steps;
+  };
+  // Follows path(j, k) from the last copy along it already in the tree.
+  // Returns the cost of the new rotations and new decompositions (nodes
+  // getting their first child), weighted 2 : 1 as measured with OpenFHE's
+  // HYBRID key switching (decomposition about a third of a key switch). With
+  // `build`, adds the missing nodes.
+  auto walk = [&](size_t j, int32_t k, bool build) {
+    const std::vector<int32_t> steps = path(j, k);
+    std::vector<int32_t> offs(steps.size() + 1, p.offset[j]);
+    size_t t = 0;
+    int start = static_cast<int>(j);
+    for (size_t s = 0; s < steps.size(); ++s) {
+      offs[s + 1] = normalize_rotation(int64_t(offs[s]) + steps[s], opts_.slots);
+      const int at = node_at[static_cast<size_t>(offs[s + 1])];
+      if (at >= 0) {
+        t = s + 1;
+        start = at;
+      }
+    }
+    const size_t len = steps.size() - t;
+    if (!len) return 0u;
+    const uint32_t c = static_cast<uint32_t>(3 * len - 1 + (has_child[static_cast<size_t>(start)] ? 0 : 1));
+    if (build)
+      for (size_t s = t; s < steps.size(); ++s) start = add(start, steps[s], offs[s + 1]);
+    return c;
+  };
+  for (size_t i : order) {
+    const int32_t k = normalize_rotation(ks[i], opts_.slots);
+    if (node_at[static_cast<size_t>(k)] < 0) {
+      size_t from = 0;
+      uint32_t best = walk(0, k, false), best_depth = cost(k);
+      for (size_t j = 1; j < p.parent.size(); ++j) {
+        if (cost(k - p.offset[j]) >= (1u << 20)) continue;
+        const uint32_t c = walk(j, k, false);
+        const uint32_t d = p.depth[j] + cost(k - p.offset[j]);
+        if (c < best || (c == best && d < best_depth)) {
+          from = j;
+          best = c;
+          best_depth = d;
+        }
+      }
+      walk(from, k, true);
+    }
+    p.out[i] = static_cast<size_t>(node_at[static_cast<size_t>(k)]);
+  }
+
+  std::lock_guard<std::mutex> lock(plans_->mu);
+  return plans_->plans.emplace(ks, plan).first->second;
+}
+
+// Evaluated level by level: every node of a level with children is
+// decomposed once (hoisting) and all its children rotated from it, all the
+// level's rotations in one parallel loop. Intermediate copies are released
+// once their children exist.
 std::vector<Ctxt> FHEContext::rotate_many(const Ctxt& x, const std::vector<int32_t>& offs) const {
   const size_t n = offs.size();
-  std::vector<Ctxt> out(n);
   if (std::all_of(offs.begin(), offs.end(), [&](int32_t k) { return has_rotation_key(k); })) {
     std::vector<int32_t> idx(n);
     for (size_t i = 0; i < n; ++i) idx[i] = normalize_rotation(offs[i], opts_.slots);
     return backend::rotate_hoisted(cc_, x, idx, parallel());
   }
-  // Plan: cheapest offsets first, each from the planned offset nearest to it.
-  std::vector<size_t> order(n);
-  for (size_t i = 0; i < n; ++i) order[i] = i;
-  std::stable_sort(order.begin(), order.end(),
-                   [&](size_t a, size_t b) { return rotation_cost(offs[a]) < rotation_cost(offs[b]); });
-  std::vector<int> source(n, -1), wave(n, 0);  // source -1 = x itself
-  std::vector<size_t> planned;
-  for (size_t i : order) {
-    uint32_t best = rotation_cost(offs[i]);
-    for (size_t j : planned) {
-      uint32_t c = rotation_cost(offs[i] - offs[j]);
-      if (c < best || (c == best && source[i] >= 0 && wave[j] < wave[static_cast<size_t>(source[i])])) {
-        best = c;
-        source[i] = static_cast<int>(j);
+  const std::shared_ptr<const RotationPlan> plan = plan_rotations(offs);
+  const RotationPlan& p = *plan;
+  const size_t nodes = p.parent.size();
+  std::vector<char> is_out(nodes, 0);
+  for (size_t o : p.out) is_out[o] = 1;
+  std::vector<std::vector<size_t>> children(nodes);
+  for (size_t v = 1; v < nodes; ++v) children[static_cast<size_t>(p.parent[v])].push_back(v);
+  std::vector<Ctxt> ct(nodes);
+  ct[0] = x;
+  for (uint32_t d = 0; d < p.max_depth(); ++d) {
+    std::vector<size_t> src;
+    std::vector<Ctxt> xs;
+    std::vector<std::vector<int32_t>> steps;
+    for (size_t v = 0; v < nodes; ++v)
+      if (p.depth[v] == d && !children[v].empty()) {
+        src.push_back(v);
+        xs.push_back(ct[v]);
+        steps.emplace_back();
+        for (size_t c : children[v]) steps.back().push_back(p.step[c]);
       }
-    }
-    wave[i] = source[i] < 0 ? 1 : wave[static_cast<size_t>(source[i])] + 1;
-    planned.push_back(i);
-  }
-  const int waves = n ? *std::max_element(wave.begin(), wave.end()) : 0;
-  for (int w = 1; w <= waves; ++w) {
-    std::vector<size_t> now;
-    for (size_t i = 0; i < n; ++i)
-      if (wave[i] == w) now.push_back(i);
-#pragma omp parallel for schedule(dynamic) if (parallel())
-    for (size_t t = 0; t < now.size(); ++t) {
-      const size_t i = now[t];
-      const Ctxt& from = source[i] < 0 ? x : out[static_cast<size_t>(source[i])];
-      const int32_t by = source[i] < 0 ? offs[i] : offs[i] - offs[static_cast<size_t>(source[i])];
-      out[i] = rotate(from, by);
+    const std::vector<std::vector<Ctxt>> rot = backend::rotate_hoisted(cc_, xs, steps, parallel());
+    for (size_t s = 0; s < src.size(); ++s) {
+      for (size_t c = 0; c < children[src[s]].size(); ++c) ct[children[src[s]][c]] = rot[s][c];
+      if (src[s] && !is_out[src[s]]) ct[src[s]] = nullptr;
     }
   }
+  std::vector<Ctxt> out(n);
+  for (size_t i = 0; i < n; ++i) out[i] = ct[p.out[i]];
   return out;
 }
 
@@ -341,6 +457,11 @@ Ctxt FHEContext::compare(const Ctxt& a, const Ctxt& b, double range, size_t coun
   if (!count) n = opts_.slots;
   return cc_->EvalCompareSchemeSwitching(a, b, n, opts_.slots);
 #endif
+}
+
+Ctxt FHEContext::positive(const Ctxt& x, double range) const {
+  if (!(range > 0.0)) throw std::invalid_argument("positive: range must be positive");
+  return compare(cc_->EvalSub(x, x), x, range / 2.0);
 }
 
 std::string FHEContext::describe() const {
