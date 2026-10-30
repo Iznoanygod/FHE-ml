@@ -68,6 +68,17 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("rotation_key_bytes", &FHEContext::rotation_key_bytes)
       .def("has_rotation_key", &FHEContext::has_rotation_key, py::arg("k"))
       .def("rotation_cost", &FHEContext::rotation_cost, py::arg("k"))
+      .def(
+          "rotation_plan",
+          [](const FHEContext& c, const std::vector<int32_t>& ks) {
+            auto p = c.plan_rotations(ks);
+            py::dict d;
+            d["key_switches"] = p->key_switches();
+            d["decompositions"] = p->decompositions();
+            d["max_depth"] = p->max_depth();
+            return d;
+          },
+          py::arg("ks"), "Cost of rotate_many(c, ks): key switches, digit decompositions and depth of its rotation tree.")
       .def_property_readonly("on_gpu", &FHEContext::on_gpu)
       .def("describe", &FHEContext::describe)
       .def_static("ring_dim_for", &FHEContext::ring_dim_for, py::arg("options"));

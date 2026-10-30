@@ -903,6 +903,39 @@ void ladder_tests() {
     check_err("ladder rotations window " + std::to_string(window), err, 1e-6);
     check(cost <= (9 + window - 1) / window, "ladder window " + std::to_string(window) + " cost bound",
           "(max " + std::to_string(cost) + " key switches)");
+
+    // rotate_many: a hoisted rotation tree (3x3 conv taps on a 20-wide
+    // image, attention-like strided offsets, a duplicate and a zero).
+    std::vector<int32_t> offs = {0, 1, 2, 20, 21, 22, 40, 41, 42, -1, -21, 64, 128, 192, 448, 41};
+    auto rot = ctx.rotate_many(c, offs);
+    err = 0;
+    for (size_t r = 0; r < offs.size(); ++r) {
+      auto got = ctx.decrypt(rot[r], o.slots);
+      for (uint32_t i = 0; i < o.slots; ++i)
+        err = std::max(err, std::fabs(got[i] - x[(i + offs[r] + 4 * o.slots) % o.slots]));
+    }
+    check_err("hoisted rotation tree window " + std::to_string(window), err, 1e-6);
+    auto plan = ctx.plan_rotations(offs);
+    size_t independent = 0;
+    for (int32_t k : offs) independent += ctx.rotation_cost(k);
+    check(plan->key_switches() < independent && plan->decompositions() < plan->key_switches(),
+          "hoisted rotation tree window " + std::to_string(window) + " shares work",
+          "(" + std::to_string(plan->key_switches()) + " key switches, " + std::to_string(plan->decompositions()) +
+              " decompositions; " + std::to_string(independent) + " key switches independently)");
+  }
+  {
+    // With a key per index the tree is a star: one decomposition.
+    ContextOptions o;
+    o.mult_depth = 1;
+    o.slots = 512;
+    o.secure = false;
+    o.ring_dim = 2048;
+    FHEContext ctx(o);
+    std::vector<int32_t> offs = {1, 5, 77, -3};
+    ctx.keygen(offs);
+    auto plan = ctx.plan_rotations(offs);
+    check(plan->key_switches() == 4 && plan->decompositions() == 1 && plan->max_depth() == 1,
+          "rotation plan with direct keys is one hoisted fan-out");
   }
 }
 

@@ -1,5 +1,8 @@
 #include "fheml/backend.h"
 
+#include <algorithm>
+#include <utility>
+
 #ifdef FHEML_WITH_FIDESLIB
 #include <cuda_runtime_api.h>
 #endif
@@ -50,6 +53,34 @@ std::vector<Ctxt> rotate_hoisted(const CC& cc, const Ctxt& x, const std::vector<
 #pragma omp parallel for schedule(dynamic) if (parallel)
   for (size_t i = 0; i < indices.size(); ++i)
     out[i] = indices[i] ? cc->EvalFastRotation(x, indices[i], m, digits) : x;
+  return out;
+}
+
+std::vector<std::vector<Ctxt>> rotate_hoisted(const CC& cc, const std::vector<Ctxt>& xs,
+                                              const std::vector<std::vector<int32_t>>& indices, bool parallel) {
+  std::vector<std::vector<Ctxt>> out(xs.size());
+  if (!parallel) {
+    for (size_t s = 0; s < xs.size(); ++s) out[s] = rotate_hoisted(cc, xs[s], indices[s], false);
+    return out;
+  }
+  using Digits = decltype(cc->EvalFastRotationPrecompute(xs[0]));
+  std::vector<Digits> digits(xs.size());
+  std::vector<std::pair<size_t, size_t>> jobs;
+  for (size_t s = 0; s < xs.size(); ++s) {
+    out[s].resize(indices[s].size());
+    for (size_t i = 0; i < indices[s].size(); ++i) jobs.emplace_back(s, i);
+  }
+#pragma omp parallel for schedule(dynamic)
+  for (size_t s = 0; s < xs.size(); ++s)
+    if (std::any_of(indices[s].begin(), indices[s].end(), [](int32_t k) { return k != 0; }))
+      digits[s] = cc->EvalFastRotationPrecompute(xs[s]);
+  const uint32_t m = cc->GetCyclotomicOrder();
+#pragma omp parallel for schedule(dynamic)
+  for (size_t j = 0; j < jobs.size(); ++j) {
+    const size_t s = jobs[j].first, i = jobs[j].second;
+    const int32_t k = indices[s][i];
+    out[s][i] = k ? cc->EvalFastRotation(xs[s], k, m, digits[s]) : xs[s];
+  }
   return out;
 }
 

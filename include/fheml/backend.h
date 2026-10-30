@@ -41,6 +41,10 @@ namespace backend {
 // Index 0 returns x itself. On the GPU this is one batched call; on the CPU
 // the rotations run in parallel when `parallel` is set.
 std::vector<Ctxt> rotate_hoisted(const CC& cc, const Ctxt& x, const std::vector<int32_t>& indices, bool parallel);
+// rotate_hoisted(cc, xs[i], indices[i]) for every i: one decomposition per
+// source, and on the CPU all sources' rotations run as one parallel loop.
+std::vector<std::vector<Ctxt>> rotate_hoisted(const CC& cc, const std::vector<Ctxt>& xs,
+                                              const std::vector<std::vector<int32_t>>& indices, bool parallel);
 
 // a * b, left unrelinearized when the backend allows it (OpenFHE). Sum such
 // products and call relinearize() once.

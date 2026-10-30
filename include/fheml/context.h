@@ -5,6 +5,9 @@
 #define FHEML_CONTEXT_H_
 
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -53,6 +56,26 @@ struct ContextOptions {
   uint32_t fhew_log_q = 25;
 };
 
+// How FHEContext::rotate_many evaluates a set of rotations of one
+// ciphertext: a tree of single-key rotations rooted at the input (node 0).
+// Every node with children is decomposed once and all its children are
+// rotated from that decomposition (hoisting), so composed rotations that
+// share a prefix of ladder steps also share its key switches.
+struct RotationPlan {
+  std::vector<int> parent;      // parent node; -1 for the input
+  std::vector<int32_t> step;    // rotation key from the parent (0 for the input)
+  std::vector<int32_t> offset;  // total rotation from the input, in [0, slots)
+  std::vector<uint32_t> depth;  // key switches from the input
+  std::vector<size_t> out;      // node holding each requested rotation
+
+  // Rotations performed (tree edges).
+  size_t key_switches() const { return parent.empty() ? 0 : parent.size() - 1; }
+  // Digit decompositions performed (nodes with children).
+  size_t decompositions() const;
+  // Longest chain of key switches.
+  uint32_t max_depth() const;
+};
+
 class FHEContext {
  public:
   explicit FHEContext(const ContextOptions& opts);
@@ -93,10 +116,14 @@ class FHEContext {
   // Rotates by k slots (any k): with the key for k directly, otherwise
   // composed from the ladder keys (see ContextOptions::rotation_window).
   Ctxt rotate(const Ctxt& c, int32_t k) const;
-  // rotate(c, k) for every k in ks. With a key per index the rotations share
-  // one hoisted decomposition; composed rotations reuse each other (each
-  // starts from the already rotated copy nearest to it).
+  // rotate(c, k) for every k in ks, evaluated as plan_rotations(ks): with a
+  // key per index all rotations share one hoisted decomposition; composed
+  // rotations share their common ladder steps, start from the already
+  // rotated copy nearest to them, and every copy that is rotated further is
+  // decomposed once for all its successors.
   std::vector<Ctxt> rotate_many(const Ctxt& c, const std::vector<int32_t>& ks) const;
+  // The rotation tree rotate_many(c, ks) evaluates (cached per index list).
+  std::shared_ptr<const RotationPlan> plan_rotations(const std::vector<int32_t>& ks) const;
   bool has_rotation_key(int32_t k) const;
   // Key switches rotate(c, k) performs (0 for k = 0).
   uint32_t rotation_cost(int32_t k) const;
@@ -132,6 +159,11 @@ class FHEContext {
   uint32_t compare_plaintext_mod_ = 0;
   uint32_t total_depth_ = 0;
   uint32_t boot_depth_ = 0;
+  struct PlanCache {
+    std::mutex mu;
+    std::map<std::vector<int32_t>, std::shared_ptr<const RotationPlan>> plans;
+  };
+  std::shared_ptr<PlanCache> plans_ = std::make_shared<PlanCache>();
 };
 
 // Normalises a rotation index to [0, slots).

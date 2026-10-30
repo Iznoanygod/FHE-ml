@@ -577,7 +577,33 @@ at deeper levels after each update, so the ciphertexts shrink); the
 decrypted weights matched the plaintext SGD run to 3e-8. Composed rotations
 cost 1-3 key switches each instead of one hoisted one, so this is slower
 per sample than the toy run, but it is the first run of the trainer at
-128-bit security.
+128-bit security. (These timings predate the hoisted rotation tree below.)
+
+### Hoisted composed rotations
+
+With a ladder, `rotate_many` evaluates a rotation tree: offsets that share
+ladder steps share the rotated copies, and every copy rotated further is
+decomposed once for all its successors (see
+[DESIGN.md](docs/DESIGN.md#rotation-key-ladder)). `./build/rotation_bench`
+compares it with rotating each offset on its own and with the previous
+`rotate_many` (nearest earlier copy, no hoisting), on the baby steps of the
+`conv_demo` CNN and a 16-token attention. 128-bit, ring 2^15, depth 8, 4
+cores, mean of 3 (ks = key switches, dec = decompositions):
+
+| `rotation_window=1` | independent | nearest copy | hoisted tree |
+| --- | --- | --- | --- |
+| conv 3x3, 9 offsets | 32 ks, 1.15 s | 10 ks, 0.58 s | 10 ks + 6 dec, 0.52 s |
+| strided conv 3x3, 9 offsets | 28 ks, 0.97 s | 9 ks, 0.49 s | 9 ks + 5 dec, 0.49 s |
+| dense head, 7 offsets | 9 ks, 0.29 s | 6 ks, 0.25 s | 6 ks + 3 dec, 0.24 s |
+| attention, 16 token offsets | 32 ks, 0.89 s | 15 ks, 0.46 s | 15 ks + 7 dec, 0.39 s |
+
+A key switch took 56-63 ms, of which the decomposition was 20-22 ms, so a
+tree saves at most about a third over the nearest-copy plan; it saves 0-20%
+of wall time here (with direct keys all three are one hoisted fan-out, 1
+decomposition). Two encrypted training updates (4 images, `rotation_window=1`,
+insecure ring 2^14) went from 48 s / 36 s to 46 s / 32 s, and fine-tuning
+the last layer (whose frozen backward is now hoisted too) from 7.0 s / 5.9 s
+to 5.9 s / 5.3 s.
 
 ## Deep networks
 
@@ -665,7 +691,7 @@ still need their own key).
 | Path | Contents |
 | --- | --- |
 | `include/fheml/`, `src/` | the library: backend selection (`backend.h`: OpenFHE or FIDESlib), context, linear transforms, layers, network, encrypted training (`train.h`) |
-| `examples/` | `mnist_cnn` (encrypted MNIST), `conv_demo` (network built in code) and `packing_bench` (gapped vs compact vs multiplexed packing) |
+| `examples/` | `mnist_cnn` (encrypted MNIST), `conv_demo` (network built in code), `packing_bench` (gapped vs compact vs multiplexed packing) and `rotation_bench` (hoisted rotation trees vs. plain composed rotations) |
 | `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py` |
 | `python/` | pybind11 bindings and the `fheml` Python package (`fheml.nn` + `fheml.from_torch`: PyTorch export) |
 | `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `train_encrypted_mnist.py` trains on encrypted data |

@@ -741,11 +741,25 @@ Ctxt linear_backward(const FHEContext& ctx, Node& n, const Ctxt& g, bool need) {
   n.in = nullptr;
   if (!need) return nullptr;
   std::vector<Ctxt> terms(n.offs.size());
+  if (!n.trainable) {
+    // rot_{-o}(g * diag) = rot_{-o}(g) * rot_{-o}(diag): the rotations all
+    // act on g, so they share one hoisted decomposition (or ladder tree),
+    // and the constant diagonals are rotated in the clear.
+    std::vector<int32_t> neg(n.offs.size());
+    for (size_t i = 0; i < n.offs.size(); ++i) neg[i] = -n.offs[i];
+    const std::vector<Ctxt> rot = ctx.rotate_many(g, neg);
+    const size_t slots = ctx.slots();
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
-  for (size_t i = 0; i < n.offs.size(); ++i) {
-    Ctxt t = n.trainable ? cc->EvalMult(n.D[i], g) : mul_plain(ctx, g, n.diag[i]);
-    terms[i] = ctx.rotate(t, -n.offs[i]);
+    for (size_t i = 0; i < n.offs.size(); ++i) {
+      std::vector<double> d(slots);
+      const size_t o = static_cast<size_t>(normalize_rotation(n.offs[i], ctx.slots()));
+      for (size_t j = 0; j < slots; ++j) d[j] = n.diag[i][(j + slots - o) % slots];
+      terms[i] = mul_plain(ctx, rot[i], d);
+    }
+    return sum(ctx, std::move(terms));
   }
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+  for (size_t i = 0; i < n.offs.size(); ++i) terms[i] = ctx.rotate(cc->EvalMult(n.D[i], g), -n.offs[i]);
   return sum(ctx, std::move(terms));
 }
 
