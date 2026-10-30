@@ -8,6 +8,7 @@
 #include <cstring>
 #include <functional>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -129,7 +130,8 @@ void cleartext_tests() {
     Network n(Shape{1, 6, 6});
     n.emplace<Conv2d>(1, 2, 3, 3, 1, 0, rand_vec(18), rand_vec(2));
     n.emplace<PolyActivation>(std::vector<double>{0.1, 0.5, 0.25});
-    n.emplace<Dense>(32, 4, rand_vec(128), rand_vec(4));
+    n.emplace<MaxPool2d>(2, 1, 3.0);
+    n.emplace<Dense>(18, 4, rand_vec(72), rand_vec(4));
     n.emplace<ChebyshevActivation>("relu", -4, 4, 15);
     const char* path = "test_model.fheml";
     n.save(path);
@@ -138,10 +140,33 @@ void cleartext_tests() {
     auto x = rand_vec(36);
     check_err("save/load round trip", max_err(n.forward_plain(x), m.forward_plain(x), 4), 1e-12);
   }
+  {
+    // Max pooling in the clear against a direct computation.
+    Network n(Shape{2, 5, 5});
+    n.emplace<MaxPool2d>(3, 2);
+    auto x = rand_vec(50);
+    auto y = n.forward_plain(x);
+    double err = 0;
+    for (int c = 0; c < 2; ++c)
+      for (int oy = 0; oy < 2; ++oy)
+        for (int ox = 0; ox < 2; ++ox) {
+          double m = -1e9;
+          for (int dy = 0; dy < 3; ++dy)
+            for (int dx = 0; dx < 3; ++dx) m = std::max(m, x[(c * 5 + oy * 2 + dy) * 5 + ox * 2 + dx]);
+          err = std::max(err, std::fabs(m - y[(c * 2 + oy) * 2 + ox]));
+        }
+    check_err("maxpool plain 3x3 stride 2", err, 0.0);
+    check(n.output_shape().size() == 8 && n.depth() == FHEContext::compare_depth() + 5, "maxpool shape and depth",
+          "(depth " + std::to_string(n.depth()) + ")");
+    n.compile();
+    check(n.uses_scheme_switching() && n.context_options(false).scheme_switching, "maxpool enables scheme switching");
+  }
 }
 
-FHEContext make_ctx(uint32_t depth, uint32_t slots, const std::vector<int32_t>& rot, bool boot = false) {
+FHEContext make_ctx(uint32_t depth, uint32_t slots, const std::vector<int32_t>& rot, bool boot = false,
+                    bool switching = false) {
   ContextOptions o;
+  o.scheme_switching = switching;
   o.mult_depth = depth;
   o.slots = slots;
   o.secure = false;
@@ -159,7 +184,8 @@ void check_encrypted(const std::string& name, Network& net, double tol, double i
                      bool encrypted_weights = false) {
   net.compile();
   auto opts = net.context_options(false);
-  FHEContext ctx = make_ctx(opts.mult_depth, opts.slots, net.rotation_indices(), opts.bootstrapping);
+  FHEContext ctx =
+      make_ctx(opts.mult_depth, opts.slots, net.rotation_indices(), opts.bootstrapping, opts.scheme_switching);
   if (encrypted_weights) net.encrypt_weights(ctx, /*drop_plaintext=*/true);  // proves no clear weight is used
   auto x = rand_vec(net.input_shape().size(), -input_range, input_range);
   Ctxt c = ctx.encrypt(x, net.input_level(ctx));
@@ -245,6 +271,71 @@ Network tiny_transformer(int n, int in, int d) {
       .emplace<TokenMean>(n, d)
       .emplace<Dense>(d, 3, rand_vec(3 * d, -0.5, 0.5), rand_vec(3, -0.1, 0.1));
   return net;
+}
+
+// CKKS <-> FHEW scheme switching: the raw comparison and max pooling built
+// on it (TOY FHEW parameters, one FHEW bootstrap per slot and comparison).
+void scheme_switching_tests(bool quick) {
+  if (gpu_backend_built()) {
+    // FIDESlib has no scheme switching: the context must say so.
+    bool threw = false;
+    try {
+      make_ctx(FHEContext::compare_depth() + 1, 16, {}, false, true);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    check(threw, "scheme switching is rejected on the FIDESlib backend");
+    std::printf("  skipping scheme-switching tests (FIDESlib backend)\n");
+    return;
+  }
+  {
+    FHEContext ctx = make_ctx(FHEContext::compare_depth() + 1, 16, {}, false, true);
+    std::printf("  %s\n", ctx.describe().c_str());
+    auto a = rand_vec(16, -2.0, 2.0), b = rand_vec(16, -2.0, 2.0);
+    a[0] = b[0] = 0.5;      // tie: either answer is fine
+    a[1] = 1.0, b[1] = 1.01;  // close
+    a[2] = -1.99, b[2] = 1.99;  // extremes of the range
+    Ctxt ca = ctx.encrypt(a), cb = ctx.encrypt(b);
+    Ctxt sel = ctx.compare(ca, cb, 2.0);
+    auto got = ctx.decrypt(sel, 16);
+    double err = 0;
+    for (size_t i = 1; i < 16; ++i) err = std::max(err, std::fabs(got[i] - (a[i] < b[i] ? 1.0 : 0.0)));
+    check_err("compare a < b", err, 1e-3);
+    check(got[0] > -1e-3 && got[0] < 1 + 1e-3, "compare tie is 0 or 1", "(" + std::to_string(got[0]) + ")");
+    uint32_t used = sel->GetLevel() + (sel->GetNoiseScaleDeg() > 1 ? 1 : 0);
+    check(used == FHEContext::compare_depth(), "compare depth",
+          "(used " + std::to_string(used) + ", compare_depth " + std::to_string(FHEContext::compare_depth()) + ")");
+    // Inputs deep in the chain still compare: the result is fresh.
+    Ctxt deep = ctx.encrypt(a, FHEContext::compare_depth() - 1);
+    Ctxt sel2 = ctx.compare(deep, cb, 2.0);
+    got = ctx.decrypt(sel2, 16);
+    err = 0;
+    for (size_t i = 1; i < 16; ++i) err = std::max(err, std::fabs(got[i] - (a[i] < b[i] ? 1.0 : 0.0)));
+    check_err("compare from a deep input", err, 1e-3);
+    check(sel2->GetLevel() == sel->GetLevel(), "compare result level does not depend on the input level");
+  }
+  {
+    Network n(Shape{2, 4, 4});
+    n.emplace<MaxPool2d>(2, 2);
+    check_encrypted("maxpool 2x2", n, 1e-3);
+  }
+  {
+    // 3x3 window: 8 comparisons over 4 rounds (one odd carry per round).
+    Network n(Shape{1, 5, 5});
+    n.emplace<MaxPool2d>(3, 2, 2.0);
+    check_encrypted("maxpool 3x3 stride 2", n, 1e-3, 2.0);
+  }
+  if (quick) return;
+  {
+    // conv -> maxpool (gapped output) -> relu -> dense: the pooled layout is
+    // absorbed by the dense layer, the activation sees bounded garbage slots.
+    Network n(Shape{1, 6, 6});
+    n.emplace<Conv2d>(1, 2, 3, 3, 1, 1, rand_vec(18, -0.3, 0.3), rand_vec(2, -0.1, 0.1));
+    n.emplace<MaxPool2d>(2, 2, 2.0);
+    n.emplace<ChebyshevActivation>("relu", -2, 2, 15);
+    n.emplace<Dense>(18, 4, rand_vec(72, -0.5, 0.5), rand_vec(4));
+    check_encrypted("conv maxpool relu dense", n, 1e-2);
+  }
 }
 
 void transformer_tests() {
@@ -601,6 +692,7 @@ int main(int argc, char** argv) {
   placement_tests(quick);
   backend_tests();
   encrypted_tests(quick);
+  scheme_switching_tests(quick);
   transformer_tests();
   std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");
   return g_failures ? 1 : 0;

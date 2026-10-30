@@ -63,6 +63,13 @@ FHEContext::FHEContext(const ContextOptions& opts) : opts_(opts) {
   cc_->Enable(fhe::KEYSWITCH);
   cc_->Enable(fhe::LEVELEDSHE);
   cc_->Enable(fhe::ADVANCEDSHE);
+  if (opts_.scheme_switching) {
+#ifdef FHEML_WITH_FIDESLIB
+    throw std::invalid_argument("scheme switching is not available on the FIDESlib backend");
+#else
+    cc_->Enable(fhe::SCHEMESWITCH);
+#endif
+  }
   if (opts_.bootstrapping) {
     cc_->Enable(fhe::FHE);
     cc_->EvalBootstrapSetup(opts_.level_budget, {0, 0}, opts_.slots);
@@ -96,6 +103,24 @@ void FHEContext::keygen(const std::vector<int32_t>& rotations) {
   for (int32_t r : uniq) has_key_[static_cast<size_t>(r)] = 1;
   if (!uniq.empty()) cc_->EvalRotateKeyGen(keys_.secretKey, std::vector<int32_t>(uniq.begin(), uniq.end()));
   if (opts_.bootstrapping) cc_->EvalBootstrapKeyGen(keys_.secretKey, opts_.slots);
+#ifndef FHEML_WITH_FIDESLIB
+  if (opts_.scheme_switching) {
+    // One FHEW context per CKKS context; its secret key is a function of
+    // the CKKS key pair only through the switching keys generated here.
+    lbcrypto::SchSwchParams sp;
+    sp.SetSecurityLevelCKKS(opts_.secure ? lbcrypto::HEStd_128_classic : lbcrypto::HEStd_NotSet);
+    sp.SetSecurityLevelFHEW(opts_.secure ? lbcrypto::STD128 : lbcrypto::TOY);
+    sp.SetCtxtModSizeFHEWLargePrec(opts_.fhew_log_q);
+    sp.SetNumSlotsCKKS(opts_.slots);
+    sp.SetNumValues(opts_.slots);
+    lbcrypto::LWEPrivateKey lwe_sk = cc_->EvalSchemeSwitchingSetup(sp);
+    cc_->EvalSchemeSwitchingKeyGen(keys_, lwe_sk);
+    // Largest FHEW plaintext modulus the sign bootstrap decodes correctly.
+    const uint32_t beta = cc_->GetBinCCForSchemeSwitch()->GetBeta().ConvertToInt();
+    compare_plaintext_mod_ = (1u << opts_.fhew_log_q) / (2 * beta);
+    compare_range_ = 0.0;
+  }
+#endif
 #ifdef FHEML_WITH_FIDESLIB
   // Uploads the context, relinearization, rotation and bootstrapping keys.
   if (on_gpu_) cc_->LoadContext(keys_.publicKey);
@@ -254,6 +279,34 @@ Ctxt FHEContext::bootstrap(const Ctxt& c) const {
   return cc_->EvalBootstrap(c);
 }
 
+Ctxt FHEContext::compare(const Ctxt& a, const Ctxt& b, double range) const {
+  if (!opts_.scheme_switching) throw std::logic_error("scheme switching is not enabled in this context");
+  if (!(range > 0.0)) throw std::invalid_argument("compare: range must be positive");
+#ifdef FHEML_WITH_FIDESLIB
+  (void)a;
+  (void)b;
+  throw std::logic_error("scheme switching is not available on the FIDESlib backend");
+#else
+  // a - b is scaled so that the full range (-2 range, 2 range) maps into the
+  // FHEW plaintext space (-p/2, p/2) with a margin; the sign is read off the
+  // half of the plaintext space the message lands in.
+  if (range != compare_range_) {
+    const double scale_sign = compare_plaintext_mod_ / (4.0 * range * 1.25);
+    cc_->EvalCompareSwitchPrecompute(compare_plaintext_mod_, scale_sign);
+    compare_range_ = range;
+  }
+  // OpenFHE's slots-to-coefficients transform keeps three towers of the
+  // (rescaled) input: the inputs need two levels left.
+  for (const Ctxt& c : {a, b}) {
+    const uint32_t used = c->GetLevel() + (c->GetNoiseScaleDeg() > 1 ? 1 : 0);
+    if (used + 2 > total_depth_)
+      throw std::logic_error("compare: input has " + std::to_string(total_depth_ - std::min(used, total_depth_)) +
+                             " levels left, needs 2");
+  }
+  return cc_->EvalCompareSchemeSwitching(a, b, opts_.slots, opts_.slots);
+#endif
+}
+
 std::string FHEContext::describe() const {
   std::ostringstream os;
   os << "CKKS ring_dim=" << cc_->GetRingDimension() << " slots=" << opts_.slots
@@ -261,6 +314,7 @@ std::string FHEContext::describe() const {
      << " scale_bits=" << opts_.scale_mod_bits << " security=" << (opts_.secure ? "128-bit" : "NOT SET (insecure)")
      << " device=" << (on_gpu_ ? "gpu" : "cpu");
   if (opts_.rotation_window) os << " rotation_window=" << opts_.rotation_window;
+  if (opts_.scheme_switching) os << " scheme_switching=fhew(logq " << opts_.fhew_log_q << ")";
   if (keys_.secretKey)
     os << " rotation_keys=" << rotation_key_count() << " (" << rotation_key_bytes() / (1 << 20) << " MB)";
   return os.str();

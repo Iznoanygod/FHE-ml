@@ -242,8 +242,11 @@ logits = fheml.infer(net, ctx, image)        # image: (1, 28, 28) numpy array
 | `hnn.Attention(dim, tokens, heads=H)`, `hnn.Residual`, `hnn.TokenMean`, `hnn.PosEmbedding` | `attention` (single or multi-head), `residual`, `tokenmean`, per-token bias |
 | `hnn.Bootstrap` | `bootstrap` |
 
-`nn.ReLU`, softmax, LayerNorm and max pooling have no exact encrypted form
-and are rejected with a message naming the replacement. `hnn.Chebyshev`
+`nn.ReLU`, softmax and LayerNorm have no exact encrypted form and are
+rejected with a message naming the replacement. `nn.MaxPool2d` is rejected
+too for now: the library has an exact `MaxPool2d` layer (see below), but at
+15+ levels and a FHEW bootstrap per slot and comparison it is not something
+an exporter should insert silently. `hnn.Chebyshev`
 evaluates the same polynomial approximation in torch that runs encrypted,
 so training sees what inference computes. For token inputs the exporter pads
 each token to the widest per-token layer, which makes those layers much cheaper
@@ -260,6 +263,57 @@ models encrypted. With 128-bit security:
 PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch cnn --n 3
 PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch vit --out models/vit_torch.fheml
 ```
+
+## Max pooling via scheme switching
+
+Max pooling is exact, not approximated: `MaxPool2d(k, stride, range)` compares
+window entries through OpenFHE's CKKS ↔ FHEW scheme switching
+(`cc->Enable(SCHEMESWITCH)`, `EvalCompareSchemeSwitching`). Each tap of the
+window is rotated onto the window's top-left slot, then the taps are reduced
+in a tournament: `max(a, b) = a + [a < b] (b - a)`, where `[a < b]` is
+computed by switching `a - b` to FHEW, evaluating the sign there with one
+FHEW bootstrap per slot and switching back. The layer needs a context built
+with `ContextOptions::scheme_switching` (`Network::context_options()` sets it
+when the network contains one); `keygen()` then also generates the FHEW
+context, its bootstrapping keys and the switching keys. `fheml.MaxPool2d`
+and `ctx.compare(a, b, range)` expose the same thing in Python.
+
+```cpp
+Network net(Shape{2, 4, 4});
+net.emplace<MaxPool2d>(2, 2, /*range=*/1.0);   // inputs must lie in [-range, range]
+net.compile();
+FHEContext ctx(net.context_options(/*secure=*/true));
+ctx.keygen(net.rotation_indices());
+```
+
+What it costs (measured, OpenFHE 1.4.2, 4 cores):
+
+| | TOY FHEW, ring 2048, 16 slots | STD128 FHEW, ring 2^16, 256 slots |
+|---|---|---|
+| key generation | 2 s | 99 s |
+| one comparison (all slots) | 1.8 s | 470–600 s |
+| peak memory | < 1 GB | 11.4 GB |
+| error of the max | ~1e-6 | ~2e-3 |
+
+A `k × k` pool runs `k² − 1` comparisons. Each comparison result is a fresh
+CKKS ciphertext at `FHEContext::compare_depth()` = 12 levels whatever the
+inputs' levels, so the pool output sits at `12 + ceil(log2 k²)` levels and the
+layer reserves one more (a comparison needs its inputs two levels above the
+bottom of the chain): a 2×2 pool is a 15-level layer, a 3×3 pool 17. That is
+why it is not wired into the models, the trainer or the PyTorch exporter yet:
+with bootstrapping budgets of 20–26 levels at ring 2^16 it would take one
+bootstrap per pool. The comparison resolves differences down to about
+`4·range / 2^(fhew_log_q − 1)`; a smaller difference is decided either way,
+which moves the maximum by at most that much. Values outside `[-range, range]`
+wrap around in the FHEW plaintext space and compare wrongly, so calibrate
+`range` like a Chebyshev interval.
+
+The output stays gapped at the input positions like a strided convolution;
+the slots between outputs hold maxima of other windows (bounded by `range`),
+which the next linear layer ignores. `place_bootstraps` cannot fold a scale
+through the layer yet and inserts a `scale` layer when it has to; the trainer
+has no backward for it; the FIDESlib (GPU) backend does not support scheme
+switching.
 
 ## Encrypted training
 
@@ -433,7 +487,7 @@ still need their own key).
 | --- | --- |
 | `include/fheml/`, `src/` | the library: backend selection (`backend.h`: OpenFHE or FIDESlib), context, linear transforms, layers, network, encrypted training (`train.h`) |
 | `examples/` | `mnist_cnn` (encrypted MNIST) and `conv_demo` (network built in code) |
-| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py` |
+| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py` |
 | `python/` | pybind11 bindings and the `fheml` Python package (`fheml.nn` + `fheml.from_torch`: PyTorch export) |
 | `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `train_encrypted_mnist.py` trains on encrypted data |
 | `tools/train_mnist.py`, `tools/train_transformer.py` | HE-friendly CNN / transformer training and export (numpy) |

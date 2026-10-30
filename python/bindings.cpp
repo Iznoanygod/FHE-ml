@@ -44,6 +44,8 @@ PYBIND11_MODULE(_fheml, m) {
       .def_readwrite("bootstrapping", &ContextOptions::bootstrapping)
       .def_readwrite("level_budget", &ContextOptions::level_budget)
       .def_readwrite("rotation_window", &ContextOptions::rotation_window)
+      .def_readwrite("scheme_switching", &ContextOptions::scheme_switching)
+      .def_readwrite("fhew_log_q", &ContextOptions::fhew_log_q)
       .def_readwrite("key_switch_digits", &ContextOptions::key_switch_digits)
       .def_readwrite("use_gpu", &ContextOptions::use_gpu)
       .def_readwrite("gpu_devices", &ContextOptions::gpu_devices);
@@ -91,6 +93,9 @@ PYBIND11_MODULE(_fheml, m) {
            py::arg("bias") = Vec{});
   py::class_<AvgPool2d, LinearLayer, std::shared_ptr<AvgPool2d>>(m, "AvgPool2d")
       .def(py::init<int, int>(), py::arg("k"), py::arg("stride"));
+  py::class_<MaxPool2d, Layer, std::shared_ptr<MaxPool2d>>(m, "MaxPool2d")
+      .def(py::init<int, int, double>(), py::arg("k"), py::arg("stride"), py::arg("range") = 1.0,
+           "Exact max pooling through CKKS<->FHEW scheme switching; inputs must lie in [-range, range].");
   py::class_<ChannelAffine, LinearLayer, std::shared_ptr<ChannelAffine>>(m, "ChannelAffine")
       .def(py::init<Vec, Vec>(), py::arg("scale"), py::arg("shift"));
   py::class_<Scale, LinearLayer, std::shared_ptr<Scale>>(m, "Scale").def(py::init<Vec>(), py::arg("factors"));
@@ -134,6 +139,7 @@ PYBIND11_MODULE(_fheml, m) {
                   py::arg("max_ring") = 1u << 16)
       .def_property_readonly("depth_between_bootstraps", &Network::depth_between_bootstraps)
       .def_property_readonly("uses_bootstrapping", &Network::uses_bootstrapping)
+      .def_property_readonly("uses_scheme_switching", &Network::uses_scheme_switching)
       .def("compile", &Network::compile, py::arg("slots") = 0, py::call_guard<py::gil_scoped_release>())
       .def("set_gapped_layouts", &Network::set_gapped_layouts)
       .def("set_cache_plaintexts", &Network::set_cache_plaintexts)

@@ -164,7 +164,10 @@ class _Exporter:
         if isinstance(m, (nn.ReLU, nn.GELU, nn.SiLU, nn.Sigmoid, nn.Tanh, nn.LeakyReLU)):
             raise ValueError(f"nn.{name} has no exact encrypted form: use fheml.nn.Chebyshev"
                              f"('{name.lower()}', a, b, degree) or a trained fheml.nn.Poly")
-        if isinstance(m, (nn.LayerNorm, nn.Softmax, nn.MultiheadAttention, nn.MaxPool2d)):
+        if isinstance(m, nn.MaxPool2d):
+            raise ValueError("nn.MaxPool2d is not exported: fheml.MaxPool2d (exact, via CKKS<->FHEW scheme "
+                             "switching) costs 15+ levels, add it to the fheml network by hand or use nn.AvgPool2d")
+        if isinstance(m, (nn.LayerNorm, nn.Softmax, nn.MultiheadAttention)):
             hint = " (fheml.nn.Attention(dim, tokens, heads=h) is the polynomial multi-head form)" \
                 if isinstance(m, nn.MultiheadAttention) else ""
             raise ValueError(f"nn.{name} is not supported under encryption (see docs/DESIGN.md#transformers){hint}")
