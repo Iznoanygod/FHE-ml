@@ -67,7 +67,7 @@ Odd sizes (7×7 → 4×4 with padding) can't interleave without collisions and
 fall back to gapped or compact. `kGapped` stays the default; `kCompact` is
 `set_gapped_layouts(false)`.
 
-Measured (`packing_bench`, `mnist_cnn --packing`): see the README section
+Measured numbers (`packing_bench`, `mnist_cnn --packing`) are in the README section
 "Multiplexed packing".
 
 ## Linear layers → one BSGS transform

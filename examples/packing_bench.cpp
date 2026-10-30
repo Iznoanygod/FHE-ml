@@ -3,14 +3,16 @@
 // of every linear layer and, with --encrypted, the time of each linear layer
 // under encryption at the ring dimension its packing needs.
 //
-//   packing_bench [--encrypted] [--net NAME]
+//   packing_bench [--encrypted] [--net NAME] [--packing gapped|compact|multiplexed]
 //
 // Networks: mnist_cnn and mnist_deepcnn (models/), and "cifar", a
 // ResNet-20-shaped plain conv stack on 3x32x32 (16/32/64 channels, two
 // stride-2 stages, global average pooling; random weights, no skips).
 // Encrypted timings use insecure toy parameters (ring = 2 * slots) with only
 // the layer's own rotation keys, one layer at a time, so they compare the
-// packings rather than give deployable numbers.
+// packings rather than give deployable numbers. OpenFHE keeps every context
+// (and its keys) alive until exit, so time the big networks one packing per
+// run (--packing).
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -101,10 +103,12 @@ double time_layer(const LinearLayer& l, uint32_t slots, double* err) {
   return s;
 }
 
+std::vector<Packing> g_packings = {Packing::kGapped, Packing::kCompact, Packing::kMultiplexed};
+
 void bench(const std::string& name, bool encrypted) {
   std::printf("== %s\n", name.c_str());
   std::printf("%-12s %6s %6s %8s %8s %8s %9s\n", "packing", "slots", "ring", "diags", "rots", "keys", encrypted ? "lin. s" : "");
-  for (Packing p : {Packing::kGapped, Packing::kCompact, Packing::kMultiplexed}) {
+  for (Packing p : g_packings) {
     Network n = make(name);
     n.set_packing(p);
     n.compile();
@@ -146,11 +150,16 @@ void bench(const std::string& name, bool encrypted) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
   bool encrypted = false;
   std::vector<std::string> nets = {"mnist_cnn", "mnist_deepcnn", "cifar"};
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--encrypted") == 0) encrypted = true;
     else if (std::strcmp(argv[i], "--net") == 0 && i + 1 < argc) nets = {argv[++i]};
+    else if (std::strcmp(argv[i], "--packing") == 0 && i + 1 < argc) {
+      std::string p = argv[++i];
+      g_packings = {p == "compact" ? Packing::kCompact : p == "multiplexed" ? Packing::kMultiplexed : Packing::kGapped};
+    }
   }
   for (const auto& n : nets) bench(n, encrypted);
   return 0;

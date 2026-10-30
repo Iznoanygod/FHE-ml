@@ -19,6 +19,9 @@ That code is kept in [`legacy/`](legacy/) for reference.
 * **Strided layers keep their outputs "gapped".** The outputs stay where the
   input pixels were instead of being compacted. That keeps a strided
   convolution at `k*k*(Ci+Co-1)` diagonals; the next layer absorbs the gaps.
+  With `Packing::kMultiplexed` the gaps hold other channels instead
+  (multiplexed packing, Lee et al. ICML'22): compact slot counts with few
+  diagonals.
 * **Dense heads use the Gazelle hybrid method.** Partial sums are folded into
   at most `2R-1` diagonals, plus `log2(S/R)` rotate-and-sum steps.
   * The MNIST `845->64` layer needs 126 diagonals instead of 908.
@@ -323,6 +326,50 @@ through the layer yet and inserts a `scale` layer when it has to; the trainer
 has no backward for it; the FIDESlib (GPU) backend does not support scheme
 switching.
 
+## Multiplexed packing
+
+A gapped stride-2 output needs `C·H·W` slots where a compact one needs a
+quarter of that, and each further stride-2 stage multiplies the waste by 4. A
+ResNet-20-shaped CIFAR network (16/32/64 channels, two stride-2 stages) needs
+65536 slots gapped, so ring 2^17. Compacting fixes the slots but turns a
+strided conv into a dense mess of diagonals (15858 for `16->32 s=2`).
+`Packing::kMultiplexed` interleaves `m²` channels into the gaps of a stride-`m`
+output, as in Lee et al.'s multiplexed parallel convolutions: same slots as
+compact, offsets still constant per (channel pair, tap). Any linear layer can
+write any layout, so the BSGS plans need nothing new, and a conv after max
+pooling re-packs the pool's gapped output for free. Each strided layer takes
+the cheapest collision-free layout (multiplexed, gapped or compact), weighting
+the BSGS cost by the slots it needs. Details in `docs/DESIGN.md`.
+
+```cpp
+net.set_packing(Packing::kMultiplexed);   // before compile(); default kGapped
+```
+```python
+net.packing = "multiplexed"               # "gapped" | "compact" | "multiplexed"
+```
+
+Measured (OpenFHE 1.4.2, 4 cores; `examples/packing_bench`, `mnist_cnn --packing`):
+
+| | gapped | compact | multiplexed |
+|---|---|---|---|
+| MNIST CNN, 128-bit (ring 2^15), per image | 2.41 s | 4.98 s | **1.80 s** |
+| MNIST CNN, slots / rotation keys | 4096 / 55 | 1024 / 75 | 2048 / **40** |
+| CIFAR stack, slots (ring) | 65536 (2^17) | 16384 (2^15) | **16384 (2^15)** |
+| CIFAR stack, diagonals / rotation keys | 2657 / 136 | 26066 / 405 | 3822 / 146 |
+| CIFAR stack, all linear layers encrypted | 28.0 s | 38.6 s | **8.6 s** |
+
+The CIFAR row times each linear layer on its own (toy parameters, ring = 2 ×
+slots, depth 2, only that layer's keys), so it compares the packings rather
+than giving an end-to-end number; activations and bootstraps also get 4×
+cheaper at ring 2^15 than at 2^17. The MNIST rows are full encrypted
+inference at 128-bit security (3 images, all correct, logit error < 3e-6).
+For the deep MNIST CNN (`mnist_deepcnn`) multiplexing keeps compact's 256
+slots with 202 diagonals instead of 470 and 33 rotation keys instead of 49.
+Multiplexed layouts also go through encrypted training (`test_train`).
+
+Not done: residual blocks on images (the CIFAR stack has no skips), and the
+layout is chosen greedily per layer, not searched over the whole network.
+
 ## LayerNorm and softmax
 
 Both are polynomial, with intervals to calibrate like a Chebyshev
@@ -526,7 +573,7 @@ still need their own key).
 | Path | Contents |
 | --- | --- |
 | `include/fheml/`, `src/` | the library: backend selection (`backend.h`: OpenFHE or FIDESlib), context, linear transforms, layers, network, encrypted training (`train.h`) |
-| `examples/` | `mnist_cnn` (encrypted MNIST) and `conv_demo` (network built in code) |
+| `examples/` | `mnist_cnn` (encrypted MNIST), `conv_demo` (network built in code) and `packing_bench` (gapped vs compact vs multiplexed packing) |
 | `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py` |
 | `python/` | pybind11 bindings and the `fheml` Python package (`fheml.nn` + `fheml.from_torch`: PyTorch export) |
 | `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `train_encrypted_mnist.py` trains on encrypted data |
