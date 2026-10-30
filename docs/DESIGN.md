@@ -106,10 +106,19 @@ cryptography.
 | `poly` degree 2 | `x·(c2·x + c1) + c0` | 2 (1 if c2 = 1) |
 | `poly` degree d > 2 | `EvalPoly` | `poly_depth(d)` |
 | `chebyshev f a b d` | `EvalChebyshevSeries` | `poly_depth(d)` (+1 unless [a,b] = [-1,1]) |
+| `exactrelu R s` | `EvalCompareSchemeSwitching(0, x)` (FHEW sign), `x · sign` | 13; 1 past a bootstrap |
 
 The plaintext reference evaluates the *same* approximation
 (`EvalChebyshevFunctionPtxt`). Encrypted-vs-plaintext error therefore measures
 only the CKKS noise. The approximation error is a training-time concern.
+
+`exactrelu` has no approximation: its reference is `max(x, 0)`. Its sign
+comes back from FHEW as a fresh ciphertext 12 levels deep regardless of the
+input, so its cost in levels depends on where it sits: 13 from a fresh
+input, 1 when the input is already deeper than 12, which always holds past a
+CKKS bootstrap (18–20 levels). The additive depth model expresses this with a
+per-layer flag (`after_bootstrap`) that `place_bootstraps` sets, and the
+layer checks at run time that its input really is that deep.
 
 ## Transformers
 
@@ -475,7 +484,8 @@ All of the following are tested under encryption:
   block) and softmax attention, with and without the scheme-switching
   maximum subtraction.
 - Fused linear layers.
-- The square, polynomial and Chebyshev activations.
+- The square, polynomial and Chebyshev activations, and the exact
+  scheme-switching ReLU (checked against `max(x, 0)`, also past bootstraps).
 - Bootstrapping in the middle of a network, placed by hand or by
   `place_bootstraps` (with scale folding and interval folding).
 - Rotations composed from a key ladder, for inference and training.

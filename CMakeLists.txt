@@ -68,6 +68,8 @@ target_link_libraries(mnist_cnn fheml)
 
 add_executable(conv_demo examples/conv_demo.cpp)
 target_link_libraries(conv_demo fheml)
+add_executable(relu_bench examples/relu_bench.cpp)
+target_link_libraries(relu_bench fheml)
 
 add_executable(packing_bench examples/packing_bench.cpp)
 target_link_libraries(packing_bench fheml)

@@ -14,7 +14,7 @@ torch.manual_seed(0)
 rng = np.random.default_rng(0)
 
 
-def run(name, model, shape, tol=1e-3):
+def run(name, model, shape, tol=1e-3, **export):
     model = model.double().eval()
     with torch.no_grad():
         for m in model.modules():  # non-trivial batch-norm statistics
@@ -23,7 +23,7 @@ def run(name, model, shape, tol=1e-3):
                 m.running_var.uniform_(0.5, 1.5)
                 m.weight.uniform_(0.5, 1.5)
                 m.bias.uniform_(-0.2, 0.2)
-    net = fheml.from_torch(model, shape)  # also checks plaintext vs torch
+    net = fheml.from_torch(model, shape, **export)  # also checks plaintext vs torch
     net.compile()
     print(f"--- {name}\n{net.summary()}")
     ctx = fheml.make_context(net, secure=False)
@@ -51,6 +51,17 @@ pooled = nn.Sequential(nn.Conv2d(1, 2, 3, padding=1), hnn.MaxPool2d(2, range=2.0
 with torch.no_grad():
     pooled[0].weight.mul_(0.5)
 run("max pool", pooled, (1, 4, 4))
+
+# Plain nn.ReLU exports as the exact scheme-switching ReLU: the encrypted
+# result matches torch's true ReLU, not a polynomial.
+relu_mlp = nn.Sequential(nn.Linear(6, 8), nn.ReLU(), nn.Linear(8, 3))
+net = run("exact relu", relu_mlp, (6,), exact_relu=4.0)
+assert [l.type for l in net.layers] == ["dense", "exactrelu", "dense"]
+try:
+    fheml.from_torch(relu_mlp, (6,))
+    raise AssertionError("nn.ReLU without exact_relu must be rejected")
+except ValueError as e:
+    assert "exact_relu" in str(e)
 
 n, d, h = 4, 8, 16
 vit = nn.Sequential(

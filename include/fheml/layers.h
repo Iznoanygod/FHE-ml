@@ -458,6 +458,46 @@ class ChebyshevActivation : public Layer {
   std::vector<double> coeffs_;
 };
 
+// Exact ReLU through CKKS -> FHEW -> CKKS scheme switching, an alternative to
+// ChebyshevActivation("relu", ...): the sign [x > 0] is computed in FHEW
+// (FHEContext::positive) and y = out_scale * x * [x > 0]. Unlike a Chebyshev
+// approximation there is no error away from zero and no smoothing near it;
+// values with |x| below the FHEW resolution (about 2 range / 2^(fhew_log_q - 1))
+// may take either branch, which changes y by at most that much. Inputs must
+// satisfy |x| <= range (larger values wrap around and pick the wrong sign).
+//
+// The sign comes back as a fresh ciphertext at FHEContext::compare_depth()
+// levels whatever x's level, so the layer costs compare_depth() + 1 levels
+// from a fresh input but only one level once x is deeper than that, which
+// is always the case past a CKKS bootstrap (whose own depth is 18-20):
+// set_after_bootstrap(true), which Network::place_bootstraps() does, makes
+// depth() 1. It runs one FHEW bootstrap per slot, far slower than a
+// polynomial (seconds at toy parameters, minutes at 128-bit security), see
+// the README.
+class ExactReLU : public Layer {
+ public:
+  explicit ExactReLU(double range = 1.0, double out_scale = 1.0, bool after_bootstrap = false);
+  std::string type() const override { return "exactrelu"; }
+  std::string describe() const override;
+  Shape configure(const Shape& in) override { return in_ = out_ = in; }
+  std::vector<double> forward_plain(const std::vector<double>& x) const override;
+  Ctxt forward(const FHEContext& ctx, const Ctxt& x) const override;
+  uint32_t depth() const override { return after_bootstrap_ ? 1 : FHEContext::compare_depth() + 1; }
+  bool uses_scheme_switching() const override { return true; }
+  // Inputs are at least compare_depth() + 1 levels deep (checked in forward).
+  void set_after_bootstrap(bool on) { after_bootstrap_ = on; }
+  bool after_bootstrap() const { return after_bootstrap_; }
+  void save(std::ostream& os) const override;
+  // Afterwards the layer computes out * relu(in * x) (in > 0).
+  void rescale(double in, double out);
+  double range() const { return range_; }
+  double out_scale() const { return out_scale_; }
+
+ private:
+  double range_, out_scale_;
+  bool after_bootstrap_;
+};
+
 // Refreshes the ciphertext's levels with CKKS bootstrapping. Slot values must
 // lie roughly in [-1, 1]; scale the preceding linear layer accordingly.
 class Bootstrap : public Layer {
