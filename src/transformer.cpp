@@ -584,8 +584,7 @@ Ctxt Attention::forward(const FHEContext& ctx, const Ctxt& x) const {
   const CC& cc = ctx.cc();
   if (ctx.slots() != slots_) throw std::invalid_argument("attention: slot count mismatch with context");
   const int32_t nd = n_ * stride_;
-  // Keys exist for indices normalised to [0, slots) (see FHEContext::keygen).
-  auto rot = [&](const Ctxt& c, int32_t r) { return cc->EvalRotate(c, normalize_rotation(r, slots_)); };
+  auto rot = [&](const Ctxt& c, int32_t r) { return ctx.rotate(c, r); };
   Ctxt q = proj_[0]->forward(ctx, x);
   Ctxt k = proj_[1]->forward(ctx, x);
   Ctxt v = proj_[2]->forward(ctx, x);
@@ -595,8 +594,8 @@ Ctxt Attention::forward(const FHEContext& ctx, const Ctxt& x) const {
   cc->EvalAddInPlace(v, rot(v, -nd));
   std::vector<int32_t> offs(n_);
   for (int s = 0; s < n_; ++s) offs[s] = s * stride_;
-  const std::vector<Ctxt> kr = backend::rotate_hoisted(cc, k, offs, ctx.parallel());
-  const std::vector<Ctxt> vr = backend::rotate_hoisted(cc, v, offs, ctx.parallel());
+  const std::vector<Ctxt> kr = ctx.rotate_many(k, offs);
+  const std::vector<Ctxt> vr = ctx.rotate_many(v, offs);
 
   // score[i][h] = q_i . k_{i+s} over head h, accumulated into slot
   // i*B + h*dh by summing a dh-wide window (slots i*B+d .. i*B+B-1 are

@@ -342,17 +342,41 @@ that.
 written in balanced base `2^w`, one key switch per non-zero digit (at most
 `ceil(log2(slots) / w)`; signed digits make `-1` as cheap as `+1`).
 `FHEContext::rotate_many(x, ks)` rotates one ciphertext by many offsets: with
-direct keys it hoists them; otherwise it orders the offsets by cost and
-derives each from the already rotated copy nearest to it, so the conv
-offsets `28, 29, 30` cost one key switch each after the first.
+direct keys it hoists them (one digit decomposition, then one key-switch
+inner product per offset). With a ladder it evaluates a **hoisted rotation
+tree** (`FHEContext::plan_rotations`): every node is a rotated copy of `x`,
+every edge one ladder key, and every node with children is decomposed once
+for all of them. The planner adds the offsets cheapest first, each from the
+tree node (input, earlier offset or intermediate copy) that is cheapest to
+extend, counting a new key switch as 2 and a new decomposition as 1
+(measured: the decomposition is about a third of an OpenFHE HYBRID key
+switch, 19 of 55 ms at ring 2^15). Composed paths take their largest digit
+first, so offsets with a common coarse part (conv rows `±W`, attention
+tokens `s·B`) share the copy at that part and fan out from it. The tree is
+evaluated level by level, each level's decompositions and rotations as one
+parallel loop (one batched FIDESlib call per node on the GPU); plans are
+cached per offset list.
+
+Every place that rotates one ciphertext by several offsets goes through
+`rotate_many`: BSGS baby steps (conv, pooling, dense), max pooling taps,
+attention's key/value token rotations (which used per-index keys directly
+before), and the trainer's linear forward/backward. A frozen layer's
+backward `Σ_i rot_{-o_i}(g ⊙ diag_i)` is now evaluated as
+`Σ_i rot_{-o_i}(g) ⊙ rot_{-o_i}(diag_i)`, so its rotations all act on `g`
+and are hoisted, with the constant diagonals rotated in the clear. What
+stays unhoisted are chains where each rotation acts on the previous result
+(rotate-and-sum in LayerNorm, attention windows and folded dense heads,
+BSGS giant steps), which hoisting cannot share. `examples/rotation_bench`
+measures all of this; see the README.
 
 - `Trainer` and `LinearTransform::eval` rotate through the context, so both
   training and inference work with a ladder; `rotation_indices(true)` on a
   `Trainer` or `Network` lists the rotations that still need their own key
   (attention, the trainer's frozen prefix).
-- A composed rotation cannot be hoisted, so each costs 1-3 full key
-  switches instead of one hoisted one. The trade is memory for time; at ring
-  2^16 the memory is what decides whether a run fits at all.
+- A composed rotation still costs 1-3 key switches instead of one hoisted
+  one; the tree shares the decompositions and common prefixes but not the
+  digits themselves. The trade is memory for time; at ring 2^16 the memory
+  is what decides whether a run fits at all.
 
 ### Automatic bootstrap placement
 
@@ -480,8 +504,7 @@ All of the following are tested under encryption:
    (see the README). Next: tracing arbitrary `forward` code with `torch.fx`,
    and a range penalty during training so Chebyshev activations stay inside
    their interval.
-8. **Encrypted training.** An encrypted softmax for cross-entropy. Hoisting for composed rotations (one
-   decomposition per ladder digit).
+8. **Encrypted training.** An encrypted softmax for cross-entropy.
 9. **Performance.**
    - Benchmark the FIDESlib GPU backend on a real GPU (see below), and batch
      the remaining single-ciphertext calls (giant steps, rotate-and-sum) for it.
