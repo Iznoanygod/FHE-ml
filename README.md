@@ -547,6 +547,7 @@ decrypted weights against the same update in the clear:
 | CNN (conv, affine, square, avgpool, dense) | 12 / 2 | 3 | 25 (5 + 20) | 1.4e-4 | about 1 min |
 | Pre-norm transformer block (layer norm + 2-head softmax attention, layer norm + SiLU MLP), 4 tokens | 80 / 12 | 13 | 35 (15 + 20) | 8.2e-5 | about 3.5 min |
 | Softmax attention with the scheme-switching row maximum | 47 / 8 | 15 | 31 (11 + 20) | 6.0e-6 | about 1.3 min |
+| MLP with softmax cross-entropy loss (bootstraps inside the loss's softmax) | 27 / 8 | 4 | 31 (11 + 20) | 2.8e-6 | |
 
 Without the budget the transformer block would need an 80-level step plus
 the bootstrap's 20 levels; at 128-bit security that is far beyond ring 2^17.
