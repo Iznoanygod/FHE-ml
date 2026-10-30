@@ -23,7 +23,7 @@ import torch
 from torch import nn
 
 __all__ = ["Poly", "Square", "Chebyshev", "Attention", "LayerNorm", "Residual", "TokenMean", "PosEmbedding",
-           "Bootstrap", "chebyshev_coefficients"]
+           "Bootstrap", "MaxPool2d", "chebyshev_coefficients"]
 
 
 class Poly(nn.Module):
@@ -45,6 +45,20 @@ class Poly(nn.Module):
 
     def extra_repr(self):
         return f"coeffs={[round(float(c), 4) for c in self.coeffs]}"
+
+
+class MaxPool2d(nn.MaxPool2d):
+    """nn.MaxPool2d(k, stride) that exports to the exact encrypted max pool
+    (CKKS <-> FHEW scheme switching). ``range`` bounds |x| at its input: the
+    encrypted comparison wraps around beyond it. Plain ``nn.MaxPool2d``
+    exports too when ``from_torch(..., maxpool_range=R)`` is given."""
+
+    def __init__(self, kernel_size, stride=None, range=1.0):
+        super().__init__(kernel_size, stride)
+        self.range = float(range)
+
+    def extra_repr(self):
+        return super().extra_repr() + f", range={self.range}"
 
 
 class Square(nn.Module):
@@ -136,8 +150,11 @@ class LayerNorm(nn.Module):
         self.register_buffer("c", _series_buffer(lambda v: 1.0 / np.sqrt(v + self.eps), var_min, var_max, degree))
 
     def inv_sqrt(self, var):
-        """1/sqrt(var + eps) as the layer approximates it."""
-        r = _chebyshev_eval(self.c, self.var_min, self.var_max, var)
+        """1/sqrt(var + eps) as the layer approximates it. While training, the
+        series sees the variance clamped to its interval (a stray value would
+        otherwise blow it up); check the ranges on data before encrypting."""
+        v = var.clamp(self.var_min, self.var_max) if self.training else var
+        r = _chebyshev_eval(self.c, self.var_min, self.var_max, v)
         for _ in range(self.newton):
             r = 1.5 * r - 0.5 * (var + self.eps) * r * r * r
         return r
@@ -238,9 +255,15 @@ class Attention(nn.Module):
         else:
             if self.softmax["subtract_max"]:
                 s = s - s.max(-1, keepdim=True).values
+            # While training the series see their arguments clamped to their
+            # intervals (outside them they diverge); check the ranges on data
+            # before encrypting (fheml.Network.forward_plain does not clamp).
+            if self.training:
+                s = s.clamp(self.exp_lo, self.exp_hi)
             e = _chebyshev_eval(self.exp_c, self.exp_lo, self.exp_hi, s)
             total = e.sum(-1, keepdim=True)
-            y = _chebyshev_eval(self.inv_c, self.sum_lo, self.sum_hi, total)
+            t = total.clamp(self.sum_lo, self.sum_hi) if self.training else total
+            y = _chebyshev_eval(self.inv_c, self.sum_lo, self.sum_hi, t)
             for _ in range(self.softmax["newton"]):
                 y = y * (2 - total * y)
             a = e * y

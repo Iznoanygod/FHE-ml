@@ -76,6 +76,42 @@ class Layer {
   // Needs ContextOptions::scheme_switching (FHEContext::compare()).
   virtual bool uses_scheme_switching() const { return false; }
 
+  // Bootstrapped networks (see Network::place_bootstraps). Levels are
+  // counted from the output level of a bootstrap; a stretch between
+  // bootstraps may consume `budget` levels (FHEContext::stretch_budget()).
+  // level_after(d, budget) is the level of this layer's output for an input
+  // at level d, or kNoFit when the layer cannot run from there (a bootstrap
+  // must go before it); level_peak() the highest level any of its
+  // ciphertexts reaches.
+  static constexpr uint32_t kNoFit = 0xffffffffu;
+  virtual uint32_t level_after(uint32_t d, uint32_t budget) const {
+    return d + depth() <= budget ? d + depth() : kNoFit;
+  }
+  virtual uint32_t level_peak(uint32_t d, uint32_t budget) const { return level_after(d, budget); }
+  // Set by the network: on = every input of this layer sits at or below a
+  // bootstrap's output level (which lets max pooling count fewer levels).
+  virtual void set_bootstrapped(bool on) { (void)on; }
+  // Layers too deep for one stretch (layer norm, softmax attention) can
+  // bootstrap internally: they then refresh their intermediate values
+  // whenever the context's stretch budget runs out (see their comments).
+  virtual bool can_self_bootstrap() const { return false; }
+  virtual void set_self_bootstrapping(bool on) {
+    if (on) throw std::logic_error(type() + ": cannot bootstrap internally");
+  }
+  virtual bool self_bootstrapping() const { return false; }
+  // Bootstraps one forward() runs for an input at level d (0 for most layers).
+  virtual uint32_t internal_bootstraps(uint32_t d, uint32_t budget) const {
+    (void)d;
+    (void)budget;
+    return 0;
+  }
+  // Measures, from plaintext inputs, the value ranges a self-bootstrapping
+  // layer scales its refreshed ciphertexts by (times headroom).
+  virtual void calibrate(const std::vector<std::vector<double>>& inputs, double headroom) {
+    (void)inputs;
+    (void)headroom;
+  }
+
   // One-line header followed by the parameters (see network.h for the format).
   virtual void save(std::ostream& os) const = 0;
 
@@ -227,9 +263,12 @@ class AvgPool2d : public LinearLayer {
 // fresh ciphertext at FHEContext::compare_depth() levels, so the output is
 // compare_depth() + ceil(log2(k^2)) levels deep; the layer reserves one
 // level more because a comparison needs its inputs two levels above the
-// bottom of the chain. It runs k^2 - 1 comparisons, each one FHEW bootstrap
+// bottom of the chain. In a bootstrapped network the inputs sit at or below
+// a bootstrap's output level (18-20), already below the comparison results'
+// 12, so each round costs one level: the depth is ceil(log2(k^2)) there. It runs k^2 - 1 comparisons, each one FHEW bootstrap
 // per slot (about 2 s per comparison at TOY parameters with 16 slots, 8-10
-// minutes at STD128 with 256 slots on 4 cores).
+// minutes at STD128 with 256 slots on 4 cores). Only the slots up to the
+// last input are compared.
 //
 // `range` bounds the inputs: |x| <= range (the comparison wraps around
 // otherwise and picks the wrong value). Differences smaller than about
@@ -252,10 +291,16 @@ class MaxPool2d : public Layer {
   uint32_t depth() const override;
   std::vector<int32_t> rotation_indices() const override;
   bool uses_scheme_switching() const override { return true; }
+  void set_bootstrapped(bool on) override { bootstrapped_ = on; }
   void save(std::ostream& os) const override;
   int k() const { return k_; }
   int stride() const { return stride_; }
   double range() const { return range_; }
+  // Inputs arriving multiplied by c > 0 (Network::place_bootstraps).
+  void set_range(double r) {
+    if (!(r > 0.0)) throw std::invalid_argument("maxpool2d: range must be positive");
+    range_ = r;
+  }
   // Comparison rounds of the tournament: ceil(log2(k^2)).
   uint32_t rounds() const;
 
@@ -264,6 +309,7 @@ class MaxPool2d : public Layer {
   std::vector<int32_t> offsets() const;
   int k_, stride_;
   double range_;
+  bool bootstrapped_ = false;
 };
 
 // Per-channel affine map (inference-time batch norm): y = scale[c] * x + shift[c].

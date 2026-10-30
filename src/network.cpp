@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <map>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -123,6 +124,17 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
       is.clear();
       is.seekg(pos);
     }
+    // Optional "selfboot X_BOUND O_BOUND" (bootstraps internally).
+    bool self = false;
+    double xb = 0.0, ob = 0.0;
+    pos = is.tellg();
+    if (is >> next && next == "selfboot") {
+      is >> xb >> ob;
+      self = true;
+    } else {
+      is.clear();
+      is.seekg(pos);
+    }
     std::vector<double> w[4], b[4];
     for (auto& wi : w) wi = read_vec(is, static_cast<size_t>(d) * d, "attention weights");
     if (hb)
@@ -130,15 +142,32 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
     auto score = read_vec(is, 3u * heads, "attention score polynomial");
     auto att = std::make_shared<Attention>(n, d, w[0], w[1], w[2], w[3], b[0], b[1], b[2], b[3], score, heads);
     if (softmax) att->set_softmax(sm);
+    att->set_self_bootstrapping(self);
+    att->set_bounds(xb, ob);
     layer = att;
   } else if (tok == "layernorm") {
     int n, d;
     double eps, vmin, vmax;
     uint32_t degree, newton;
     is >> n >> d >> eps >> vmin >> vmax >> degree >> newton;
+    // Optional "selfboot BOUND" (bootstraps internally, see LayerNorm).
+    double bound = 0.0;
+    bool self = false;
+    std::string next;
+    auto pos = is.tellg();
+    if (is >> next && next == "selfboot") {
+      is >> bound;
+      self = true;
+    } else {
+      is.clear();
+      is.seekg(pos);
+    }
     auto g = read_vec(is, d, "layernorm gamma");
     auto b = read_vec(is, d, "layernorm beta");
-    layer = std::make_shared<LayerNorm>(n, d, std::move(g), std::move(b), eps, vmin, vmax, degree, newton);
+    auto ln = std::make_shared<LayerNorm>(n, d, std::move(g), std::move(b), eps, vmin, vmax, degree, newton);
+    ln->set_self_bootstrapping(self);
+    ln->set_input_bound(bound);
+    layer = ln;
   } else if (tok == "residual") {
     size_t k;
     is >> k;
@@ -163,7 +192,13 @@ Network Network::load(const std::string& path) {
   Shape in;
   if (!(is >> tok >> in.c >> in.h >> in.w) || tok != "input") throw std::runtime_error("model file: missing input");
   Network net(in);
-  while (is >> tok && tok != "end") net.add(read_layer(tok, is));
+  while (is >> tok && tok != "end") {
+    if (tok == "budget") {  // stretch budget of place_bootstraps()
+      is >> net.budget_;
+      continue;
+    }
+    net.add(read_layer(tok, is));
+  }
   return net;
 }
 
@@ -171,6 +206,7 @@ void Network::save(const std::string& path) const {
   std::ofstream os(path);
   if (!os) throw std::runtime_error("cannot write model file " + path);
   os << "fheml 1\ninput " << input_.c << " " << input_.h << " " << input_.w << "\n";
+  if (budget_) os << "budget " << budget_ << "\n";
   for (const auto& l : layers_) l->save(os);
   os << "end\n";
 }
@@ -181,6 +217,8 @@ Network& Network::add(std::shared_ptr<Layer> layer) {
   layer->configure(in);
   layer->configure_layout(lin, gapped_);
   layers_.push_back(std::move(layer));
+  const bool b = uses_bootstrapping();
+  for (auto& l : layers_) l->set_bootstrapped(b);
   slots_ = 0;
   return *this;
 }
@@ -192,6 +230,8 @@ Shape Network::configure() {
     s = l->configure(s);
     lay = l->configure_layout(lay, gapped_);
   }
+  const bool b = uses_bootstrapping();
+  for (auto& l : layers_) l->set_bootstrapped(b);
   slots_ = 0;
   return s;
 }
@@ -258,7 +298,8 @@ Fold fold_kind(const Layer& l) {
   if (dynamic_cast<const PolyActivation*>(&l) || dynamic_cast<const ChebyshevActivation*>(&l) ||
       dynamic_cast<const Scale*>(&l) || dynamic_cast<const FusedLinear*>(&l) || dynamic_cast<const LayerNorm*>(&l))
     return Fold::kAbsorb;
-  if (l.is_bootstrap()) return Fold::kPass;
+  // max(c x) = c max(x) for c > 0: the scale passes, the range follows it.
+  if (l.is_bootstrap() || dynamic_cast<const MaxPool2d*>(&l)) return Fold::kPass;
   if (auto* lin = dynamic_cast<const LinearLayer*>(&l)) {
     if (lin->trainable()) return Fold::kAbsorb;
     return lin->bias().empty() ? Fold::kPass : Fold::kBlock;
@@ -304,6 +345,7 @@ void scale_output_chain(std::vector<std::shared_ptr<Layer>>& layers, double f) {
       case Fold::kSquare: f = std::sqrt(f); continue;
       case Fold::kPass:
         if (layers[k]->is_bootstrap()) throw std::logic_error("place_bootstraps: fold reached a bootstrap");
+        if (auto* mp = dynamic_cast<MaxPool2d*>(layers[k].get())) mp->set_range(mp->range() * f);
         continue;
       case Fold::kBlock: throw std::logic_error("place_bootstraps: fold blocked by " + layers[k]->type());
     }
@@ -333,101 +375,131 @@ std::shared_ptr<Layer> make_scale(const Shape& s, double f) {
   return std::make_shared<Scale>(std::vector<double>(static_cast<size_t>(s.c), f));
 }
 
-}  // namespace
 
-size_t Network::place_bootstraps(uint32_t budget, const std::vector<std::vector<double>>& calibration,
-                                 double headroom) {
-  if (budget == 0) throw std::invalid_argument("place_bootstraps: budget must be at least one level");
-  if (!(headroom > 0)) throw std::invalid_argument("place_bootstraps: headroom must be positive");
-  configure();
-  const size_t n = layers_.size();
-  for (const auto& l : layers_)
-    if (l->depth() > budget)
-      throw std::invalid_argument("place_bootstraps: layer " + l->describe() + " alone needs " +
-                                  std::to_string(l->depth()) + " levels, more than the budget");
+// Bootstrap placement for one chain of layers (the network, or a residual
+// block's body), starting at stretch level d0. Walks the layers with the
+// running level d, tracking whether a bootstrap's scale is still being
+// carried (not yet absorbed). A bootstrap goes before layer i when i would
+// not fit (Layer::level_after). If the scale entering it cannot be folded
+// back, a Scale layer (one level) precedes it; when that does not fit
+// either, the bootstrap moves to the latest earlier position that works. A
+// residual block that does not fit gets bootstraps inside its body (planned
+// recursively from its input level) before one is put in front of it. Pure:
+// apply_chain() makes the changes.
+struct ChainPlan {
+  std::vector<char> boot_before, pre_scale;
+  std::map<size_t, ChainPlan> bodies;  // residual blocks with bootstraps inside
+  uint32_t d_end = 0;
+};
 
-  // Plaintext ranges: range[i] = max |output of layer i - 1| (range[0]: input).
-  std::vector<double> range(n + 1, 0.0);
-  for (const auto& x0 : calibration) {
-    std::vector<double> x = x0;
-    for (size_t i = 0; i <= n; ++i) {
-      for (double v : x) range[i] = std::max(range[i], std::fabs(v));
-      if (i < n) x = layers_[i]->forward_plain(x);
-    }
-  }
-
-  // Plan: walk the layers with the running depth d, tracking whether a
-  // bootstrap's scale is still being carried (not yet absorbed). A bootstrap
-  // goes before layer i when i would overflow the budget. If the scale
-  // entering it cannot be folded back, a Scale layer (one level) precedes
-  // it; when that does not fit either, the bootstrap moves one layer earlier.
-  std::vector<char> boot_before(n + 1, 0), pre_scale(n + 1, 0);
+ChainPlan plan_chain(const std::vector<std::shared_ptr<Layer>>& layers, uint32_t budget, uint32_t d0) {
+  const size_t n = layers.size();
+  ChainPlan plan;
+  plan.boot_before.assign(n + 1, 0);
+  plan.pre_scale.assign(n + 1, 0);
   std::vector<uint32_t> d_at(n + 1, 0);
   std::vector<char> carry_at(n + 1, 0);
   std::vector<Fold> kind(n);
-  for (size_t i = 0; i < n; ++i) kind[i] = fold_kind(*layers_[i]);
-  uint32_t d = 0;
+  for (size_t i = 0; i < n; ++i) kind[i] = fold_kind(*layers[i]);
+  // Level after layer i entered at level e, planning a residual body when
+  // needed (kNoFit when nothing works).
+  auto after = [&](size_t i, uint32_t e) {
+    uint32_t a = layers[i]->level_after(e, budget);
+    plan.bodies.erase(i);
+    if (a != Layer::kNoFit) return a;
+    auto* r = dynamic_cast<const Residual*>(layers[i].get());
+    if (!r) return a;
+    try {
+      ChainPlan body = plan_chain(r->body(), budget, e);
+      a = std::max(e, body.d_end);
+      plan.bodies[i] = std::move(body);
+    } catch (const std::invalid_argument&) {
+    }
+    return a;
+  };
+  uint32_t d = d0;
   bool carrying = false;
   size_t i = 0;
   size_t forced = n + 1;  // a position the back-off decided on
   while (i <= n) {
     d_at[i] = d;
     carry_at[i] = carrying;
-    const uint32_t dep = i < n ? layers_[i]->depth() : 0;
     const Fold k = i < n ? kind[i] : Fold::kBlock;  // the output must come out unscaled
-    const bool is_boot = i < n && layers_[i]->is_bootstrap();
+    const bool is_boot = i < n && layers[i]->is_bootstrap();
     uint32_t extra = (carrying && k == Fold::kBlock) ? 1 : 0;  // Scale layer restoring the carry
-    const bool overflow = !is_boot && d + extra + dep > budget && (i < n || carrying);
+    uint32_t next = is_boot ? 0 : i < n ? after(i, d + extra) : d + extra;
+    const bool overflow = !is_boot && (next == Layer::kNoFit || next > budget) && (i < n || carrying);
     if (overflow || forced == i) {
       forced = n + 1;
-      const bool fold = i > 0 && can_scale_output(layers_, i - 1, boot_before);
+      const bool fold = i > 0 && can_scale_output(layers, i - 1, plan.boot_before);
       const uint32_t pre = fold ? 0 : 1;
       if (d + pre > budget) {
         // Back off: the latest earlier position in this stretch where the
         // bootstrap (and its Scale layer, if any) still fits.
         size_t j = i;
         for (size_t p = i; p-- > 0 && j == i;) {
-          if (layers_[p]->is_bootstrap() || boot_before[p]) break;  // start of the stretch
-          const uint32_t pre_p = (p > 0 && can_scale_output(layers_, p - 1, boot_before)) ? 0 : 1;
+          if (layers[p]->is_bootstrap() || plan.boot_before[p]) break;  // start of the stretch
+          const uint32_t pre_p = (p > 0 && can_scale_output(layers, p - 1, plan.boot_before)) ? 0 : 1;
           if (p > 0 && d_at[p] + pre_p <= budget) j = p;
         }
         if (j == i)
-          throw std::invalid_argument("place_bootstraps: the layers up to " + layers_[std::min(i, n - 1)]->describe() +
+          throw std::invalid_argument("place_bootstraps: the layers up to " + layers[std::min(i, n - 1)]->describe() +
                                       " do not fit in " + std::to_string(budget) + " levels with their scaling");
-        std::fill(boot_before.begin() + static_cast<long>(j), boot_before.end(), 0);
-        std::fill(pre_scale.begin() + static_cast<long>(j), pre_scale.end(), 0);
+        std::fill(plan.boot_before.begin() + static_cast<long>(j), plan.boot_before.end(), 0);
+        std::fill(plan.pre_scale.begin() + static_cast<long>(j), plan.pre_scale.end(), 0);
+        for (auto it = plan.bodies.begin(); it != plan.bodies.end();)
+          it = it->first >= j ? plan.bodies.erase(it) : std::next(it);
         d = d_at[j];
         carrying = carry_at[j];
         i = j;
         forced = j;
         continue;
       }
-      boot_before[i] = 1;
-      pre_scale[i] = !fold;
-      d = 0;
+      plan.boot_before[i] = 1;
+      plan.pre_scale[i] = !fold;
       carrying = true;
       extra = (k == Fold::kBlock) ? 1 : 0;
+      next = i < n ? after(i, extra) : extra;
+      if (next == Layer::kNoFit || next > budget)
+        throw std::invalid_argument("place_bootstraps: layer " + layers[std::min(i, n - 1)]->describe() +
+                                    " does not fit in " + std::to_string(budget) + " levels");
     }
-    if (is_boot) {
-      d = 0;
-    } else {
-      d += extra + dep;
-      if (k == Fold::kAbsorb || k == Fold::kBlock) carrying = false;
-    }
+    d = next;
+    if (!is_boot && i < n && (k == Fold::kAbsorb || k == Fold::kBlock)) carrying = false;
     ++i;
   }
+  plan.d_end = d;
+  return plan;
+}
 
-  // Apply the plan.
+// Applies a ChainPlan to layers; xs are calibration inputs of the chain.
+size_t apply_chain(std::vector<std::shared_ptr<Layer>>& layers, const Shape& input, const ChainPlan& plan,
+                   const std::vector<std::vector<double>>& xs, double headroom) {
+  const size_t n = layers.size();
+  // Plaintext ranges: range[i] = max |input of layer i| (range[n]: output),
+  // and the inputs of residual blocks planned inside.
+  std::vector<double> range(n + 1, 0.0);
+  std::map<size_t, std::vector<std::vector<double>>> body_xs;
+  for (const auto& x0 : xs) {
+    std::vector<double> x = x0;
+    for (size_t i = 0; i <= n; ++i) {
+      for (double v : x) range[i] = std::max(range[i], std::fabs(v));
+      if (i < n && plan.bodies.count(i)) body_xs[i].push_back(x);
+      if (i < n) x = layers[i]->forward_plain(x);
+    }
+  }
+  std::vector<Fold> kind(n);
+  for (size_t i = 0; i < n; ++i) kind[i] = fold_kind(*layers[i]);
   std::vector<std::shared_ptr<Layer>> out;
   double carry = 1.0;  // factor currently on the signal relative to the calibration run
   size_t inserted = 0;
   for (size_t j = 0; j <= n; ++j) {
-    const Shape shape = j == 0 ? input_ : layers_[j - 1]->out_shape();
-    if (boot_before[j]) {
+    const Shape shape = j == 0 ? input : layers[j - 1]->out_shape();
+    if (plan.boot_before[j]) {
       // Values already within [-1, 1] need no scaling.
       const double m = range[j] * std::fabs(carry);
       const double s = m > 1.0 ? headroom * m : 1.0;
-      if (pre_scale[j])
+      if (plan.pre_scale[j])
         out.push_back(make_scale(shape, 1.0 / s));
       else
         scale_output_chain(out, 1.0 / s);
@@ -439,7 +511,7 @@ size_t Network::place_bootstraps(uint32_t budget, const std::vector<std::vector<
       if (carry != 1.0) out.push_back(make_scale(shape, 1.0 / carry));
       break;
     }
-    std::shared_ptr<Layer> l = layers_[j];
+    std::shared_ptr<Layer> l = layers[j];
     if (carry != 1.0) {
       switch (kind[j]) {
         case Fold::kAbsorb:
@@ -447,17 +519,79 @@ size_t Network::place_bootstraps(uint32_t budget, const std::vector<std::vector<
           carry = 1.0;
           break;
         case Fold::kSquare: carry *= carry; break;
-        case Fold::kPass: break;
+        case Fold::kPass:
+          if (auto* mp = dynamic_cast<MaxPool2d*>(l.get())) mp->set_range(mp->range() * carry);
+          break;
         case Fold::kBlock:
           out.push_back(make_scale(shape, 1.0 / carry));
           carry = 1.0;
           break;
       }
     }
+    if (auto it = plan.bodies.find(j); it != plan.bodies.end()) {
+      std::vector<std::shared_ptr<Layer>> body = dynamic_cast<Residual&>(*l).body();
+      inserted += apply_chain(body, shape, it->second, body_xs[j], headroom);
+      l = std::make_shared<Residual>(std::move(body));
+      l->configure(shape);
+    }
     out.push_back(l);
   }
-  layers_ = std::move(out);
+  layers = std::move(out);
+  return inserted;
+}
+
+// Self-bootstrapping: switches it on where a layer supports it, and
+// calibrates such layers (their refreshed values are scaled by these
+// bounds) from the plaintext inputs reaching them.
+void enable_self_bootstrapping(const std::vector<std::shared_ptr<Layer>>& layers) {
+  for (const auto& l : layers) {
+    if (auto* r = dynamic_cast<const Residual*>(l.get())) enable_self_bootstrapping(r->body());
+    if (l->can_self_bootstrap()) l->set_self_bootstrapping(true);
+  }
+}
+
+void calibrate_chain(const std::vector<std::shared_ptr<Layer>>& layers, std::vector<std::vector<double>> xs,
+                     double headroom) {
+  for (const auto& l : layers) {
+    if (auto* r = dynamic_cast<const Residual*>(l.get())) calibrate_chain(r->body(), xs, headroom);
+    if (l->self_bootstrapping() && !dynamic_cast<const Residual*>(l.get())) l->calibrate(xs, headroom);
+    for (auto& x : xs) x = l->forward_plain(x);
+  }
+}
+
+// Whether the network bootstraps anywhere (also inside layers or blocks).
+bool any_bootstrap(const std::vector<std::shared_ptr<Layer>>& layers) {
+  return std::any_of(layers.begin(), layers.end(), [](const std::shared_ptr<Layer>& l) {
+    return l->is_bootstrap() || l->self_bootstrapping();
+  });
+}
+
+void set_bootstrapped(const std::vector<std::shared_ptr<Layer>>& layers, bool on) {
+  for (const auto& l : layers) l->set_bootstrapped(on);
+}
+
+}  // namespace
+
+size_t Network::place_bootstraps(uint32_t budget, const std::vector<std::vector<double>>& calibration,
+                                 double headroom) {
+  if (budget == 0) throw std::invalid_argument("place_bootstraps: budget must be at least one level");
+  if (!(headroom > 0)) throw std::invalid_argument("place_bootstraps: headroom must be positive");
   configure();
+  enable_self_bootstrapping(layers_);
+  set_bootstrapped(layers_, true);  // the plan assumes a bootstrapped network
+  calibrate_chain(layers_, calibration, headroom);
+  ChainPlan plan;
+  try {
+    plan = plan_chain(layers_, budget, 0);
+  } catch (...) {
+    configure();
+    throw;
+  }
+  const size_t inserted = apply_chain(layers_, input_, plan, calibration, headroom);
+  budget_ = budget;
+  configure();
+  // The scales folded in above changed the ranges the layers see.
+  calibrate_chain(layers_, calibration, headroom);
   return inserted;
 }
 
@@ -541,7 +675,43 @@ uint32_t Network::depth() const {
   return d;
 }
 
+namespace {
+
+// Stretch levels of a chain entered at level d (Layer::kNoFit when it does
+// not fit `budget`); peak = the highest level reached.
+uint32_t walk(const std::vector<std::shared_ptr<Layer>>& layers, uint32_t budget, uint32_t d, uint32_t& peak) {
+  for (const auto& l : layers) {
+    if (l->is_bootstrap()) {
+      d = 0;
+      continue;
+    }
+    const uint32_t p = l->level_peak(d, budget);
+    d = l->level_after(d, budget);
+    if (d == Layer::kNoFit || p == Layer::kNoFit) return Layer::kNoFit;
+    peak = std::max(peak, p);
+  }
+  return d;
+}
+
+// Bootstrapping happens inside a layer or a residual block, not only in
+// top-level Bootstrap layers.
+bool bootstraps_inside(const std::shared_ptr<Layer>& l) { return !l->is_bootstrap() && l->self_bootstrapping(); }
+
+}  // namespace
+
 uint32_t Network::depth_between_bootstraps() const {
+  if (std::any_of(layers_.begin(), layers_.end(), bootstraps_inside)) {
+    // Layers that bootstrap internally plan with the context's budget, so
+    // the one place_bootstraps() used is kept; otherwise the smallest that
+    // fits.
+    uint32_t peak = 0;
+    if (budget_ && walk(layers_, budget_, 0, peak) != Layer::kNoFit) return budget_;
+    for (uint32_t b = 1; b < 64; ++b) {
+      peak = 0;
+      if (walk(layers_, b, 0, peak) != Layer::kNoFit && peak <= b) return b;
+    }
+    throw std::logic_error("network does not fit any bootstrapping budget");
+  }
   uint32_t best = 0, cur = 0;
   for (const auto& l : layers_) {
     if (l->is_bootstrap()) {
@@ -558,6 +728,9 @@ uint32_t Network::depth_before_first_bootstrap() const {
   uint32_t d = 0;
   for (const auto& l : layers_) {
     if (l->is_bootstrap()) break;
+    // A layer bootstrapping internally plans from the levels it is given:
+    // start the input at a bootstrap's output level.
+    if (bootstraps_inside(l)) return depth_between_bootstraps();
     d += l->depth();
   }
   return d;
@@ -582,7 +755,24 @@ bool Network::uses_scheme_switching() const {
 }
 
 bool Network::uses_bootstrapping() const {
-  return std::any_of(layers_.begin(), layers_.end(), [](const std::shared_ptr<Layer>& l) { return l->is_bootstrap(); });
+  return std::any_of(layers_.begin(), layers_.end(),
+                     [](const std::shared_ptr<Layer>& l) { return l->is_bootstrap() || l->self_bootstrapping(); });
+}
+
+uint32_t Network::internal_bootstraps() const {
+  if (!uses_bootstrapping()) return 0;
+  const uint32_t b = depth_between_bootstraps();
+  uint32_t d = 0, n = 0;
+  for (const auto& l : layers_) {
+    if (l->is_bootstrap()) {
+      d = 0;
+      continue;
+    }
+    n += l->internal_bootstraps(d, b);
+    d = l->level_after(d, b);
+    if (d == Layer::kNoFit) break;
+  }
+  return n;
 }
 
 namespace {
@@ -665,7 +855,10 @@ std::string Network::summary() const {
     os << "  [" << i << "] " << layers_[i]->describe() << "  -> " << layers_[i]->out_shape().str() << "  (depth "
        << layers_[i]->depth() << ")\n";
   os << "total depth " << depth();
-  if (uses_bootstrapping()) os << ", max between bootstraps " << depth_between_bootstraps();
+  if (uses_bootstrapping()) {
+    os << ", max between bootstraps " << depth_between_bootstraps();
+    if (const uint32_t k = internal_bootstraps()) os << ", " << k << " bootstraps inside layers";
+  }
   if (slots_) os << ", slots " << slots_;
   return os.str();
 }

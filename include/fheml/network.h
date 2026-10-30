@@ -22,6 +22,11 @@
 //                                                 (3 per head with "heads H")
 //   residual K                                    followed by K layers (y = body(x) + x)
 //   end
+//
+// Optional: "budget B" (any line before "end": the stretch budget
+// place_bootstraps used), "selfboot X" after a layernorm's parameters and
+// "selfboot X O" after an attention's softmax parameters (the layer
+// bootstraps internally, with these value bounds).
 #ifndef FHEML_NETWORK_H_
 #define FHEML_NETWORK_H_
 
@@ -85,8 +90,13 @@ class Network {
   // through squares and bias-free linear layers); where that is impossible
   // (residual, attention) a fixed Scale layer is inserted, which costs one
   // level. Without calibration inputs the values are assumed to be in range
-  // already. Existing Bootstrap layers are kept. Returns the number of
-  // bootstraps inserted; the network must be compiled again.
+  // already. Existing Bootstrap layers are kept. Layers deeper than the
+  // budget bootstrap internally (LayerNorm, softmax Attention: see
+  // Layer::set_self_bootstrapping), calibrated from the same inputs, and
+  // residual blocks that do not fit get bootstraps inside their bodies.
+  // Max pooling counts ceil(log2(k^2)) levels here instead of 15 (see
+  // MaxPool2d). Returns the number of Bootstrap layers inserted; the network
+  // must be compiled again.
   size_t place_bootstraps(uint32_t budget, const std::vector<std::vector<double>>& calibration = {},
                           double headroom = 1.5);
   // Folds the interval map of every Chebyshev activation (one level) into the
@@ -105,6 +115,9 @@ class Network {
   uint32_t depth() const;
   uint32_t depth_between_bootstraps() const;
   bool uses_bootstrapping() const;
+  // Bootstraps run inside layers (self-bootstrapping layer norm and
+  // attention) per inference, on top of the Bootstrap layers.
+  uint32_t internal_bootstraps() const;
   // True when a layer compares through CKKS <-> FHEW scheme switching
   // (MaxPool2d); context_options() then enables it.
   bool uses_scheme_switching() const;
@@ -144,6 +157,7 @@ class Network {
   std::vector<std::shared_ptr<Layer>> layers_;
   uint32_t slots_ = 0;
   bool gapped_ = true;
+  uint32_t budget_ = 0;  // stretch budget from place_bootstraps (0 = none)
 };
 
 }  // namespace fheml

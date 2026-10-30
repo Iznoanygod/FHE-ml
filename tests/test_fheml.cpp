@@ -827,6 +827,114 @@ void placement_tests(bool quick) {
   }
 }
 
+// Layers deeper than a bootstrapping stretch: layer norm and softmax
+// attention bootstrap internally, the planner puts bootstraps inside
+// residual blocks, max pooling costs one level per round after a bootstrap.
+void self_bootstrap_tests(bool quick) {
+  const int n = 4, in = 8, d = 8;
+  SoftmaxOptions o;
+  o.lo = -1.5;
+  o.hi = 1.5;
+  o.exp_degree = 15;
+  o.inv_degree = 15;
+  o.newton = 2;
+  const auto w0 = rand_vec(in * d, -0.4, 0.4), b0 = rand_vec(n * d, -0.2, 0.2);
+  const auto w1 = rand_vec(2 * d * d, -0.3, 0.3), b1 = rand_vec(2 * d, -0.1, 0.1), w2 = rand_vec(2 * d * d, -0.3, 0.3),
+             b2 = rand_vec(d, -0.1, 0.1), wh = rand_vec(3 * d, -0.5, 0.5), bh = rand_vec(3, -0.1, 0.1);
+  const auto g1 = rand_vec(d, 0.5, 1.5), be1 = rand_vec(d, -0.2, 0.2), g2 = rand_vec(d, 0.5, 1.5),
+             be2 = rand_vec(d, -0.2, 0.2);
+  auto att = softmax_attention(n, d, o);
+  auto make = [&] {
+    auto a = std::make_shared<Attention>(n, d, att->weights(0), att->weights(1), att->weights(2), att->weights(3),
+                                         att->bias(0), att->bias(1), att->bias(2), att->bias(3),
+                                         std::vector<double>{0.0, 0.0, 1.0}, 2);
+    a->set_softmax(o);
+    Network net(Shape{n, 1, in});
+    net.emplace<TokenDense>(n, in, d, w0, b0)
+        .add(std::make_shared<Residual>(std::vector<std::shared_ptr<Layer>>{
+            std::make_shared<LayerNorm>(n, d, g1, be1, 0.05, 0.0, 3.0, 15, 1), a}))
+        .add(std::make_shared<Residual>(std::vector<std::shared_ptr<Layer>>{
+            std::make_shared<LayerNorm>(n, d, g2, be2, 0.05, 0.0, 3.0, 15, 1),
+            std::make_shared<TokenDense>(n, d, 2 * d, w1, b1),
+            std::make_shared<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25}),
+            std::make_shared<TokenDense>(n, 2 * d, d, w2, b2)}))
+        .emplace<TokenMean>(n, d)
+        .emplace<Dense>(d, 3, wh, bh);
+    return net;
+  };
+  std::vector<std::vector<double>> calib;
+  for (int i = 0; i < 8; ++i) calib.push_back(rand_vec(n * in));
+  Network ref = make();
+  ref.compile();
+  for (uint32_t budget : {5u, 8u}) {
+    const std::string tag = "budget " + std::to_string(budget);
+    Network net = make();
+    size_t k = net.place_bootstraps(budget, calib);
+    net.compile();
+    double err = 0;
+    for (const auto& x : calib) err = std::max(err, max_err(ref.forward_plain(x), net.forward_plain(x), 3));
+    check_err("self-bootstrapping transformer " + tag + " keeps the function", err, 1e-9);
+    check(net.uses_bootstrapping() && net.internal_bootstraps() > 0 && net.depth_between_bootstraps() == budget,
+          "self-bootstrapping transformer " + tag + " plan",
+          "(" + std::to_string(k) + " bootstrap layers, " + std::to_string(net.internal_bootstraps()) + " inside)");
+    std::printf("  %s\n", net.summary().c_str());
+    net.save("/tmp/fheml_selfboot_test.fheml");
+    Network back = Network::load("/tmp/fheml_selfboot_test.fheml");
+    back.compile();
+    check(back.depth_between_bootstraps() == budget && back.internal_bootstraps() == net.internal_bootstraps(),
+          "self-bootstrapping transformer " + tag + " save/load keeps the plan");
+    if (quick && budget != 5) continue;
+    auto opts = net.context_options(false);
+    opts.ring_dim = 4096;
+    FHEContext ctx(opts);
+    ctx.keygen(net.rotation_indices());
+    auto x = rand_vec(n * in);
+    // Every layer's output level is the planned one.
+    uint32_t want = 0;
+    bool levels_ok = true;
+    std::string detail;
+    Ctxt y = net.forward(ctx, ctx.encrypt(x, net.input_level(ctx)), [&](size_t i, const Layer& l, const Ctxt& c, double) {
+      want = l.is_bootstrap() ? 0 : l.level_after(want, budget);
+      if (ctx.stretch_level(c) != want) {
+        levels_ok = false;
+        detail += " layer " + std::to_string(i) + ": " + std::to_string(ctx.stretch_level(c)) + " vs " +
+                  std::to_string(want);
+      }
+    });
+    check(levels_ok, "self-bootstrapping transformer " + tag + " levels as planned", detail);
+    check_err("encrypted self-bootstrapping transformer " + tag, max_err(ref.forward_plain(x), net.decrypt_output(ctx, y), 3),
+              2e-2);
+  }
+  if (gpu_backend_built()) return;
+  {
+    // conv -> square -> maxpool -> dense at budget 3: the pool costs its two
+    // rounds after a bootstrap (15 levels without one).
+    const auto wc = rand_vec(18, -0.5, 0.5), bc = rand_vec(2, -0.1, 0.1), wd = rand_vec(3 * 32, -0.4, 0.4);
+    auto make_cnn = [&] {
+      Network m(Shape{1, 8, 8});
+      m.emplace<Conv2d>(1, 2, 3, 3, 1, 1, wc, bc).emplace<Square>().emplace<MaxPool2d>(2, 2, 4.0).emplace<Dense>(32, 3, wd,
+                                                                                                         std::vector<double>{});
+      return m;
+    };
+    std::vector<std::vector<double>> cal;
+    for (int i = 0; i < 6; ++i) cal.push_back(rand_vec(64));
+    Network m = make_cnn(), mref = make_cnn();
+    mref.compile();
+    m.place_bootstraps(3, cal);
+    m.compile();
+    check(m.layers().size() == 5 && m.depth_between_bootstraps() <= 3, "maxpool counts its rounds after a bootstrap",
+          "(" + m.summary() + ")");
+    if (quick) return;
+    auto opts = m.context_options(false);
+    opts.ring_dim = 4096;
+    FHEContext ctx(opts);
+    ctx.keygen(m.rotation_indices());
+    auto x = rand_vec(64);
+    auto got = m.decrypt_output(ctx, m.forward(ctx, ctx.encrypt(x, m.input_level(ctx))));
+    check_err("encrypted bootstrapped maxpool cnn", max_err(mref.forward_plain(x), got, 3), 2e-2);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -840,6 +948,7 @@ int main(int argc, char** argv) {
   scheme_switching_tests(quick);
   transformer_tests();
   softmax_tests(quick);
+  self_bootstrap_tests(quick);
   std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");
   return g_failures ? 1 : 0;
 }

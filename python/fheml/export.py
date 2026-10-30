@@ -43,8 +43,9 @@ class _Exporter:
     """Walks the module tree tracking the activation shape and emits a list of
     layer specs (plain tuples), so later passes can fold or pad weights."""
 
-    def __init__(self):
+    def __init__(self, maxpool_range=None):
         self.max_token_width = 0
+        self.maxpool_range = maxpool_range
 
     def run(self, modules, state):
         out = []
@@ -171,8 +172,19 @@ class _Exporter:
             raise ValueError(f"nn.{name} has no exact encrypted form: use fheml.nn.Chebyshev"
                              f"('{name.lower()}', a, b, degree) or a trained fheml.nn.Poly")
         if isinstance(m, nn.MaxPool2d):
-            raise ValueError("nn.MaxPool2d is not exported: fheml.MaxPool2d (exact, via CKKS<->FHEW scheme "
-                             "switching) costs 15+ levels, add it to the fheml network by hand or use nn.AvgPool2d")
+            self.need(kind, "image", name)
+            rng = m.range if isinstance(m, hnn.MaxPool2d) else self.maxpool_range
+            if rng is None:
+                raise ValueError("nn.MaxPool2d: pass from_torch(..., maxpool_range=R) with R >= max |input|, or use "
+                                 "fheml.nn.MaxPool2d(k, stride, range) (exact max via CKKS<->FHEW scheme switching)")
+            if _pair(m.padding, "MaxPool2d padding") != 0 or _pair(m.dilation, "MaxPool2d dilation") != 1 \
+                    or m.ceil_mode or m.return_indices:
+                raise ValueError("nn.MaxPool2d: padding, dilation, ceil_mode and return_indices are unsupported")
+            k = _pair(m.kernel_size, "MaxPool2d kernel size")
+            s = _pair(m.stride if m.stride is not None else k, "MaxPool2d stride")
+            c, h, w = state[1:]
+            out.append(("maxpool2d", k, s, float(rng)))
+            return ("image", c, (h - k) // s + 1, (w - k) // s + 1)
         if isinstance(m, nn.LayerNorm):
             raise ValueError("nn.LayerNorm has no exact encrypted form: use fheml.nn.LayerNorm(dim, eps, var_min, "
                              "var_max, degree) on token sequences (a polynomial 1/sqrt on a calibrated variance range)")
@@ -228,6 +240,8 @@ def _build(s):
         return _fheml.Conv2d(*s[1:7], _flat(s[7]), _flat(s[8]))
     if k == "avgpool2d":
         return _fheml.AvgPool2d(*s[1:])
+    if k == "maxpool2d":
+        return _fheml.MaxPool2d(*s[1:])
     if k == "affine":
         return _fheml.ChannelAffine(_flat(s[1]), _flat(s[2]))
     if k == "dense":
@@ -261,7 +275,7 @@ def _build(s):
     raise AssertionError(k)
 
 
-def from_torch(model, input_shape, token_width="auto", check=True):
+def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range=None):
     """Converts a trained torch model to an ``fheml.Network`` (not yet compiled).
 
     token_width: for token inputs, zero-pad each input token to this width
@@ -270,6 +284,8 @@ def from_torch(model, input_shape, token_width="auto", check=True):
       helpers ``fheml.infer``/``encrypt``/``plain`` pad inputs automatically.
     check: compare the fheml plaintext reference with the torch model on a
       random input and raise if they disagree.
+    maxpool_range: input bound R of every plain nn.MaxPool2d (exported as the
+      exact scheme-switching max pool; fheml.nn.MaxPool2d carries its own).
     """
     shape = tuple(int(v) for v in input_shape)
     if len(shape) == 3:
@@ -281,7 +297,7 @@ def from_torch(model, input_shape, token_width="auto", check=True):
     else:
         raise ValueError("input_shape must be (C, H, W), (tokens, dim) or (features,)")
 
-    ex = _Exporter()
+    ex = _Exporter(maxpool_range)
     modules = model if isinstance(model, nn.Sequential) else [model]
     with torch.no_grad():
         specs, _ = ex.run(modules, state)

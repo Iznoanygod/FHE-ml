@@ -72,6 +72,23 @@ class FHEContext {
   std::vector<double> decrypt(const Ctxt& c, size_t n) const;
 
   Ctxt bootstrap(const Ctxt& c) const;
+  // Bootstraps values bounded by |x| <= bound (any bound): they are divided
+  // by a power of two s >= bound first, which costs one level, and
+  // multiplied back by s afterwards with additions, which costs none. So c
+  // needs two levels left; the result sits at a bootstrap's output level.
+  // A non-empty mask (per slot) is applied in the same product, clearing
+  // slots whose values are not bounded.
+  Ctxt refresh(const Ctxt& c, double bound, const std::vector<double>& mask = {}) const;
+  // Levels c has consumed (after its pending rescale) and has left.
+  static uint32_t level(const Ctxt& c);
+  uint32_t levels_left(const Ctxt& c) const;
+  // Levels between bootstraps: a bootstrap's output can consume
+  // stretch_budget() levels and still be bootstrapped (OpenFHE needs one
+  // level left at the input). stretch_level(c) counts c's levels from a
+  // bootstrap's output level. Layers that bootstrap internally (LayerNorm,
+  // softmax attention) plan with these.
+  uint32_t stretch_budget() const { return opts_.bootstrapping ? opts_.mult_depth - 1 : 0; }
+  uint32_t stretch_level(const Ctxt& c) const;
 
   // Encrypted comparison through FHEW (needs ContextOptions::scheme_switching):
   // slot i of the result is 1 where a_i < b_i and 0 otherwise, for values
@@ -79,8 +96,10 @@ class FHEContext {
   // plaintext space and compare wrongly). Switches a - b to FHEW, evaluates
   // the sign there with one FHEW bootstrap per slot and switches back. The
   // result is a fresh CKKS ciphertext at level compare_depth() whatever the
-  // inputs' levels, which only need two levels left.
-  Ctxt compare(const Ctxt& a, const Ctxt& b, double range = 1.0) const;
+  // inputs' levels, which only need two levels left. count > 0 compares
+  // only the first `count` slots, rounded up to a power of two (one FHEW
+  // bootstrap each; the other slots of the result are 0).
+  Ctxt compare(const Ctxt& a, const Ctxt& b, double range = 1.0, size_t count = 0) const;
   // Levels of a compare() result, i.e. what OpenFHE's FHEW-to-CKKS decoding
   // consumes (constant for the parameter sets used here).
   static uint32_t compare_depth() { return 12; }

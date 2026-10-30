@@ -378,7 +378,7 @@ uint32_t MaxPool2d::rounds() const {
 }
 
 // +1: the last round's comparison needs its inputs two levels above the bottom.
-uint32_t MaxPool2d::depth() const { return FHEContext::compare_depth() + rounds() + 1; }
+uint32_t MaxPool2d::depth() const { return bootstrapped_ ? rounds() : FHEContext::compare_depth() + rounds() + 1; }
 
 std::vector<int32_t> MaxPool2d::rotation_indices() const {
   std::vector<int32_t> offs = offsets();
@@ -416,7 +416,7 @@ Ctxt MaxPool2d::forward(const FHEContext& ctx, const Ctxt& x) const {
     for (size_t i = 0; i < pairs; ++i) {
       const Ctxt& a = vals[2 * i];
       const Ctxt& b = vals[2 * i + 1];
-      Ctxt sel = ctx.compare(a, b, range_);  // [a < b]
+      Ctxt sel = ctx.compare(a, b, range_, in_layout_.span(in_));  // [a < b]
       next[i] = cc->EvalAdd(a, cc->EvalMult(sel, cc->EvalSub(b, a)));
     }
     if (vals.size() % 2) next.back() = vals.back();

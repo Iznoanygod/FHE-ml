@@ -1,6 +1,7 @@
 #include "fheml/context.h"
 
 #include <algorithm>
+#include <cmath>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -279,12 +280,43 @@ Ctxt FHEContext::bootstrap(const Ctxt& c) const {
   return cc_->EvalBootstrap(c);
 }
 
-Ctxt FHEContext::compare(const Ctxt& a, const Ctxt& b, double range) const {
+uint32_t FHEContext::level(const Ctxt& c) { return c->GetLevel() + (c->GetNoiseScaleDeg() > 1 ? 1 : 0); }
+
+uint32_t FHEContext::levels_left(const Ctxt& c) const {
+  const uint32_t l = level(c);
+  return l < total_depth_ ? total_depth_ - l : 0;
+}
+
+uint32_t FHEContext::stretch_level(const Ctxt& c) const {
+  const uint32_t l = level(c);
+  return l > boot_depth_ ? l - boot_depth_ : 0;
+}
+
+Ctxt FHEContext::refresh(const Ctxt& c, double bound, const std::vector<double>& mask) const {
+  if (!(bound > 0.0)) throw std::invalid_argument("refresh: bound must be positive");
+  int k = 0;
+  while (std::ldexp(1.0, k) < bound) ++k;
+  Ctxt scaled;
+  if (mask.empty()) {
+    scaled = cc_->EvalMult(c, std::ldexp(1.0, -k));
+  } else {
+    std::vector<double> m(mask);
+    for (double& v : m) v = std::ldexp(v, -k);
+    Ptxt p = encode(m, level(c));
+    scaled = cc_->EvalMult(c, p);
+  }
+  Ctxt r = bootstrap(scaled);
+  for (int i = 0; i < k; ++i) r = cc_->EvalAdd(r, r);
+  return r;
+}
+
+Ctxt FHEContext::compare(const Ctxt& a, const Ctxt& b, double range, size_t count) const {
   if (!opts_.scheme_switching) throw std::logic_error("scheme switching is not enabled in this context");
   if (!(range > 0.0)) throw std::invalid_argument("compare: range must be positive");
 #ifdef FHEML_WITH_FIDESLIB
   (void)a;
   (void)b;
+  (void)count;
   throw std::logic_error("scheme switching is not available on the FIDESlib backend");
 #else
   // a - b is scaled so that the full range (-2 range, 2 range) maps into the
@@ -303,7 +335,11 @@ Ctxt FHEContext::compare(const Ctxt& a, const Ctxt& b, double range) const {
       throw std::logic_error("compare: input has " + std::to_string(total_depth_ - std::min(used, total_depth_)) +
                              " levels left, needs 2");
   }
-  return cc_->EvalCompareSchemeSwitching(a, b, opts_.slots, opts_.slots);
+  // OpenFHE's slots-to-coefficients matrix needs a power-of-two count.
+  uint32_t n = 1;
+  while (n < count && n < opts_.slots) n *= 2;
+  if (!count) n = opts_.slots;
+  return cc_->EvalCompareSchemeSwitching(a, b, n, opts_.slots);
 #endif
 }
 
