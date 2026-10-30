@@ -240,6 +240,7 @@ logits = fheml.infer(net, ctx, image)        # image: (1, 28, 28) numpy array
 | `nn.Conv2d` (square kernel, zero padding, groups=1) | `conv2d` |
 | `nn.Linear` | `dense` on vectors; `tokendense` on `(tokens, dim)` inputs |
 | `nn.AvgPool2d`, `nn.AdaptiveAvgPool2d(1)` | `avgpool2d` |
+| `hnn.MaxPool2d(k, stride, range=R)` (square window, no padding) | `maxpool2d` (exact, scheme switching) |
 | `nn.BatchNorm2d` / `nn.BatchNorm1d` | folded into the preceding conv/linear, else `affine` |
 | `nn.Flatten`, `nn.Dropout`, `nn.Identity` | nothing |
 | `hnn.Poly`, `hnn.Square`, `hnn.Chebyshev` | `poly`, `square`, `chebyshev` |
@@ -250,10 +251,11 @@ logits = fheml.infer(net, ctx, image)        # image: (1, 28, 28) numpy array
 
 `nn.ReLU`, `nn.LayerNorm` and `nn.Softmax` have no exact encrypted form and
 are rejected with a message naming the replacement (`hnn.Chebyshev`,
-`hnn.LayerNorm`, `hnn.Attention(softmax=...)`). `nn.MaxPool2d` is rejected
-too for now: the library has an exact `MaxPool2d` layer (see below), but at
-15+ levels and a FHEW bootstrap per slot and comparison it is not something
-an exporter should insert silently. `hnn.Chebyshev`, `hnn.LayerNorm` and the
+`hnn.LayerNorm`, `hnn.Attention(softmax=...)`). A plain `nn.MaxPool2d` is
+rejected too because the encrypted comparison needs an input bound:
+`hnn.MaxPool2d(k, stride, range=R)` is the same torch layer with that bound
+and exports to the exact `MaxPool2d` (see below), at 15+ levels and a FHEW
+bootstrap per slot and comparison. `hnn.Chebyshev`, `hnn.LayerNorm` and the
 softmax of `hnn.Attention` evaluate the same polynomial approximations in
 torch that run encrypted, so training sees what inference computes (and
 pushes the model to keep its variances and scores inside the intervals). For token inputs the exporter pads
@@ -307,10 +309,11 @@ A `k × k` pool runs `k² − 1` comparisons. Each comparison result is a fresh
 CKKS ciphertext at `FHEContext::compare_depth()` = 12 levels whatever the
 inputs' levels, so the pool output sits at `12 + ceil(log2 k²)` levels and the
 layer reserves one more (a comparison needs its inputs two levels above the
-bottom of the chain): a 2×2 pool is a 15-level layer, a 3×3 pool 17. That is
-why it is not wired into the models, the trainer or the PyTorch exporter yet:
-with bootstrapping budgets of 20–26 levels at ring 2^16 it would take one
-bootstrap per pool. The comparison resolves differences down to about
+bottom of the chain): a 2×2 pool is a 15-level layer, a 3×3 pool 17. With
+bootstrapping budgets of 20–26 levels at ring 2^16 it takes about one
+bootstrap per pool, which is why the example models do not use it.
+`hnn.MaxPool2d` exports it from PyTorch, and `Trainer` backpropagates through
+it with the forward's comparison bits (see [Encrypted training](#encrypted-training)). The comparison resolves differences down to about
 `4·range / 2^(fhew_log_q − 1)`; a smaller difference is decided either way,
 which moves the maximum by at most that much. Values outside `[-range, range]`
 wrap around in the FHEW plaintext space and compare wrongly, so calibrate
@@ -319,9 +322,8 @@ wrap around in the FHEW plaintext space and compare wrongly, so calibrate
 The output stays gapped at the input positions like a strided convolution;
 the slots between outputs hold maxima of other windows (bounded by `range`),
 which the next linear layer ignores. `place_bootstraps` cannot fold a scale
-through the layer yet and inserts a `scale` layer when it has to; the trainer
-has no backward for it; the FIDESlib (GPU) backend does not support scheme
-switching.
+through the layer yet and inserts a `scale` layer when it has to; the FIDESlib
+(GPU) backend does not support scheme switching.
 
 ## LayerNorm and softmax
 
@@ -370,12 +372,14 @@ trainer.decrypt_weights(ctx)                             # key holder: trained w
   layernorm's gamma and beta, and the four projections of attention
   (quadratic or softmax scores, any number of heads), with shared weights
   handled exactly. Gradients flow through square, poly, chebyshev, average
-  pooling, token mean, layernorm, attention, residual and bootstrap layers.
+  and max pooling, token mean, layernorm, attention, residual and bootstrap
+  layers. Max pooling routes each window's gradient to the tap that won,
+  multiplying by the comparison bits its forward pass already computed, so
+  the backward pass adds no scheme switching (`ceil(log2 k²)` levels).
   The softmax and the layer norm's inverse square root are differentiated as
   the functions they approximate (`exp' = exp`, `(1/S)' = -1/S²`), so their
   gradients match the exact ones up to the approximation error.
-* **What does not:** max pooling has no backward. Layers in a frozen prefix
-  only run forward.
+* **What does not:** layers in a frozen prefix only run forward.
 * **Fine-tuning:** `frozen=[...]` keeps layers fixed. Everything before the
   first trainable layer runs as ordinary encrypted inference.
 * **Loss:** squared error against the encrypted target. Softmax
