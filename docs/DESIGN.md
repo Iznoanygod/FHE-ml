@@ -488,9 +488,12 @@ depends on `budget + bootstrap depth` only, not on the network's depth.
   layers at no cost: weights and biases of a linear layer, `poly`
   coefficients, the evaluation interval of a `chebyshev` layer, through
   `square` (as a square root) and through bias-free linear layers (pooling,
-  token mean). Where no layer can take it (a residual block, attention, the
-  network output) a fixed `scale` layer is inserted, which costs one level
-  that the planner budgets; the planner moves a bootstrap earlier when that
+  token mean, max pooling's gather), attention (W_q, W_k, W_v take an
+  input scale, W_o an output scale) and residual blocks whose body starts
+  and ends with such a layer (skip and body scale alike). Where no layer
+  can take it (the network output, a scale carried into a residual block) a
+  fixed `scale` layer is inserted, which costs one level that the planner
+  budgets; the planner moves a bootstrap earlier when that
   level does not fit, and reports a budget that cannot hold a layer and its
   scale layers instead of overflowing.
 - **Interval folding.** `Network::fold_activation_intervals()` moves the
@@ -503,6 +506,18 @@ depends on `budget + bootstrap depth` only, not on the network's depth.
 - **Inside layers.** Layers that cannot fit a stretch bootstrap themselves
   (see "Bootstrapping inside LayerNorm and softmax attention"), and residual
   bodies are planned recursively. Max pooling absorbs a scale in its gather.
+- **Last layer.** No bootstrap follows the network's last layer, so it may
+  end one level past the budget: the spare level `EvalBootstrap` needs at
+  its input is free there.
+- **Precision.** A bootstrap's error is absolute: about 1e-3 at 50-bit
+  scaling and first modulus 57 (toy ring 4096, {3,3}), 5e-3 at ring 2^14.
+  Layers that bootstrap internally divide values by their interval bounds
+  first, so a wide interval multiplies that error. Two remedies:
+  `ContextOptions::bootstrap_iterations = 2` (OpenFHE's iterative
+  bootstrapping: the residual error of a first bootstrap is bootstrapped
+  again, 1.2e-3 -> 4e-6 measured at ring 4096, for twice the time and one
+  more level), and narrow intervals, which `fheml.nn.range_loss()` lets a
+  model learn to stay inside while training.
 - **Budget.** `Network::max_bootstrap_budget(options, max_ring)` gives the
   largest stretch that keeps the bootstrapping context at `max_ring`. With
   uniform ternary secrets the bootstrap itself costs 20 levels (level budget
