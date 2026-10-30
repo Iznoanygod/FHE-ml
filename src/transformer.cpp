@@ -225,7 +225,8 @@ Ctxt LayerNorm::forward(const FHEContext& ctx, const Ctxt& x) const {
     Ctxt s = cc->EvalAdd(in, ctx.rotate(in, 1));
     for (int t = 2; t < d_; t *= 2) cc->EvalAddInPlace(s, ctx.rotate(s, t));
     const uint32_t lvl = s->GetLevel() + (s->GetNoiseScaleDeg() > 1 ? 1 : 0);
-    Ctxt m = cc->EvalMult(s, ctx.encode(mask_, lvl));
+    Ptxt mask = ctx.encode(mask_, lvl);  // FIDESlib takes plaintexts by mutable reference
+    Ctxt m = cc->EvalMult(s, mask);
     for (int t = 1; t < d_; t *= 2) cc->EvalAddInPlace(m, ctx.rotate(m, -t));
     return m;
   };
@@ -252,7 +253,8 @@ Ctxt LayerNorm::forward(const FHEContext& ctx, const Ctxt& x) const {
   }
   Ctxt centred = cc->EvalSub(x, mean);
   const uint32_t lvl = centred->GetLevel() + (centred->GetNoiseScaleDeg() > 1 ? 1 : 0);
-  Ctxt y = cc->EvalMult(cc->EvalMult(centred, ctx.encode(gamma_slots_, lvl)), r);
+  Ptxt gamma = ctx.encode(gamma_slots_, lvl);
+  Ctxt y = cc->EvalMult(cc->EvalMult(centred, gamma), r);
   Ptxt beta = ctx.encode(beta_slots_, y->GetLevel(), y->GetNoiseScaleDeg());
   return cc->EvalAdd(y, beta);
 }
@@ -600,7 +602,8 @@ Ctxt Attention::forward(const FHEContext& ctx, const Ctxt& x) const {
       std::vector<double> c = exp_coeffs_;
       Ctxt e = cc->EvalChebyshevSeries(p[s], c, exp_lo(), exp_hi());
       const uint32_t lvl = e->GetLevel() + (e->GetNoiseScaleDeg() > 1 ? 1 : 0);
-      a = cc->EvalMult(e, ctx.encode(mask_head_, lvl));
+      Ptxt mask = ctx.encode(mask_head_, lvl);
+      a = cc->EvalMult(e, mask);
     } else {
       // a = mask * (c2 p^2 + c1 p + c0): 2 levels, zero outside slots i*B+h*dh.
       const uint32_t lvl = p[s]->GetLevel() + (p[s]->GetNoiseScaleDeg() > 1 ? 1 : 0);
