@@ -103,8 +103,8 @@ RANGE_WEIGHT = 1.0
 # interval spends the bootstrap's ~10-20 bits of precision on headroom. The
 # row-sum interval [0.5, 100] is far inside the worst case [n e^lo, n e^hi]
 # and the range loss keeps the sums there.
-SOFTMAX = dict(lo=-4.0, hi=4.0, exp_degree=15, inv_degree=15, newton=2, sum_lo=0.5, sum_hi=100.0)
-LN = dict(eps=0.05, var_min=0.0, var_max=4.0, degree=15, newton=1)
+SOFTMAX = dict(lo=-4.0, hi=4.0, exp_degree=7, inv_degree=7, newton=2, sum_lo=0.5, sum_hi=100.0)
+LN = dict(eps=0.05, var_min=0.0, var_max=4.0, degree=7, newton=1)
 
 
 def lnvit(tokens):

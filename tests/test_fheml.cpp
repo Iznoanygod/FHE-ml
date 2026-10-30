@@ -1078,8 +1078,9 @@ void placement_tests(bool quick) {
     std::vector<std::vector<double>> cal;
     for (int i = 0; i < 6; ++i) cal.push_back(rand_vec(15, -2.0, 2.0));
     Network n = make_res(), r2 = make_res();
-    // Budget 4 cannot hold a residual block (3) plus the Scale layers around
-    // it; the planner must say so instead of looping or overflowing.
+    // Budget 4 cannot hold a residual block (3) plus the Scale layer that
+    // restores a carried scale; the planner must say so instead of looping
+    // or overflowing.
     bool threw = false;
     try {
       Network n4 = make_res();
@@ -1092,7 +1093,10 @@ void placement_tests(bool quick) {
     n.compile();
     size_t scales = 0;
     for (const auto& l : n.layers()) scales += l->type() == "scale";
-    check(k >= 1 && scales >= 1, "place_bootstraps residual inserts scale layers",
+    // The bodies start with a trainable layer and end in one, so the scale
+    // before a bootstrap folds through the blocks; only a scale carried into
+    // a block needs a Scale layer.
+    check(k >= 1, "place_bootstraps residual inserts bootstraps",
           "(" + std::to_string(k) + " bootstraps, " + std::to_string(scales) + " scale layers)");
     check(n.depth_between_bootstraps() <= 5, "place_bootstraps residual respects the budget");
     check_err("place_bootstraps residual keeps the function", max_err(r2.forward_plain(cal[0]), n.forward_plain(cal[0]), 2), 1e-9);
@@ -1167,7 +1171,8 @@ void self_bootstrap_tests(bool quick) {
     bool levels_ok = true;
     std::string detail;
     Ctxt y = net.forward(ctx, ctx.encrypt(x, net.input_level(ctx)), [&](size_t i, const Layer& l, const Ctxt& c, double) {
-      want = l.is_bootstrap() ? 0 : l.level_after(want, budget);
+      // The last layer may use the spare level no bootstrap needs after it.
+      want = l.is_bootstrap() ? 0 : l.level_after(want, i + 1 == net.layers().size() ? budget + 1 : budget);
       if (ctx.stretch_level(c) != want) {
         levels_ok = false;
         detail += " layer " + std::to_string(i) + ": " + std::to_string(ctx.stretch_level(c)) + " vs " +
@@ -1181,8 +1186,9 @@ void self_bootstrap_tests(bool quick) {
   if (gpu_backend_built()) return;
   {
     // conv -> square -> maxpool -> dense at budget 3: the pool costs its gather
-    // and two rounds after a bootstrap (16 levels without one), so the dense
-    // layer needs another; the pool's gather takes the bootstrap's scale.
+    // and two rounds after a bootstrap (16 levels without one), its gather
+    // takes the bootstrap's scale, and the dense layer, the last one, uses
+    // the spare level no further bootstrap needs.
     const auto wc = rand_vec(18, -0.5, 0.5), bc = rand_vec(2, -0.1, 0.1), wd = rand_vec(3 * 32, -0.4, 0.4);
     auto make_cnn = [&] {
       Network m(Shape{1, 8, 8});
@@ -1196,7 +1202,7 @@ void self_bootstrap_tests(bool quick) {
     mref.compile();
     m.place_bootstraps(3, cal);
     m.compile();
-    check(m.layers().size() == 6 && m.depth_between_bootstraps() <= 3, "maxpool counts its rounds after a bootstrap",
+    check(m.layers().size() == 5 && m.depth_between_bootstraps() <= 3, "maxpool counts its rounds after a bootstrap",
           "(" + m.summary() + ")");
     if (quick) return;
     auto opts = m.context_options(false);
