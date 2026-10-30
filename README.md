@@ -382,8 +382,25 @@ trainer.decrypt_weights(ctx)                             # key holder: trained w
 * **What does not:** layers in a frozen prefix only run forward.
 * **Fine-tuning:** `frozen=[...]` keeps layers fixed. Everything before the
   first trainable layer runs as ordinary encrypted inference.
-* **Loss:** squared error against the encrypted target. Softmax
-  cross-entropy would need an encrypted softmax.
+* **Loss:** squared error against the encrypted target (default), or softmax
+  cross-entropy against an encrypted one-hot target:
+  `make_trainer(net, loss=fheml.cross_entropy(lo=-4, hi=4))`. The gradient
+  `softmax(y) - t` is computed under encryption with the attention softmax's
+  polynomials: exp as a Chebyshev series on the logit range `[lo, hi]`, a
+  rotate-and-sum for the denominator, 1/x as a Chebyshev series plus Newton
+  steps. With `subtract_max=True` the largest logit is found with
+  scheme-switching comparisons first (log2 of the output span of them, 4 for
+  10 classes), so exp lives on `[lo - hi, 0]`, the sum on `[1, k]` and nothing
+  needs calibrating. The loss value itself stays with the client, who
+  decrypts the logits anyway (`fheml.cross_entropy_plain`). Cross-entropy
+  costs levels: the gradient sits 17 levels below the logits for degree
+  15 / 31 with two Newton steps (step depth 27 instead of 8 for the test MLP; 20 with a `bootstrap` layer
+  right before the loss, 17 with that and degree 7 / 7 on a calibrated
+  `[sum_lo, sum_hi]`). That is fine with toy parameters, but more than the
+  24 levels of ring 2^16 at 128-bit security without bootstrapping (28 for
+  one update of the MLP at degree 7 / 7) and far more than the ~6 a
+  bootstrap leaves there, so 128-bit cross-entropy training needs ring 2^17
+  or bootstraps inside the softmax (not done yet).
 * **Check:** `fheml.train_plain` runs the same SGD in the clear.
   `tests/test_train.cpp` shows the decrypted weights match it to about 1e-8
   without bootstrapping and 3e-4 with it, and checks the plaintext gradients

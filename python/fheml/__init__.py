@@ -23,12 +23,14 @@ from ._fheml import (  # noqa: F401
     ContextOptions,
     Layer,
     LinearLayer,
+    Loss,
     Network,
     Residual,
     Scale,
     Shape,
     Square,
     Trainer,
+    cross_entropy_plain,
     gpu_backend_built,
     gpu_device_count,
 )
@@ -64,6 +66,26 @@ TokenDense = _accepting_numpy(_fheml.TokenDense)
 TokenMean = _fheml.TokenMean
 LayerNorm = _accepting_numpy(_fheml.LayerNorm)
 SoftmaxOptions = _fheml.SoftmaxOptions
+
+
+def cross_entropy(**softmax):
+    """Softmax cross-entropy training loss (targets one-hot).
+
+    Keyword arguments set SoftmaxOptions fields: ``lo``/``hi`` bound the
+    logits (exp is approximated there), ``exp_degree``, ``inv_degree``,
+    ``newton``, ``sum_lo``/``sum_hi`` (the 1/x interval; default
+    k e^lo .. k e^hi), ``subtract_max`` (largest logit subtracted through
+    scheme-switching comparisons; then exp lives on [lo - hi, 0]).
+    """
+    o = SoftmaxOptions()
+    for k, v in softmax.items():
+        setattr(o, k, v)
+    return Loss.cross_entropy(o)
+
+
+def softmax(loss, y):
+    """The softmax a cross-entropy ``Trainer`` evaluates under encryption."""
+    return np.asarray(_fheml.softmax_plain(loss, _flat(y)))
 
 
 def _flat(a):
@@ -141,15 +163,17 @@ def make_training_context(trainer, secure=True, bootstrapping=True, updates=1, r
 
 
 def make_trainer(net, frozen=(), secure=True, bootstrapping=True, updates=1, full_slots=True, slots=None,
-                 rotation_window=None, **overrides):
+                 rotation_window=None, loss=None, **overrides):
     """Encrypted-training setup: returns ``(trainer, ctx)``.
 
     full_slots recompiles ``net`` to use every slot of the ring (free per
     operation), so one bootstrap refreshes many weight ciphertexts at once;
     ``slots`` caps that (bootstrapping keys grow with the slot count: at ring
     2^16 about 45 keys for 256 slots, 96 for 4096). See
-    make_training_context for rotation_window.
+    make_training_context for rotation_window. ``loss``: a ``Loss``
+    (default mean squared error; see ``cross_entropy``).
     """
+    loss = loss or Loss.mse()
     if rotation_window is None:
         rotation_window = 1 if secure else 0
 
@@ -159,13 +183,13 @@ def make_trainer(net, frozen=(), secure=True, bootstrapping=True, updates=1, ful
             setattr(opts, k, v)
         return opts
 
-    trainer = Trainer(net, list(frozen))
+    trainer = Trainer(net, list(frozen), loss)
     opts = options(trainer)
     if full_slots or slots:
         want = slots or Context.ring_dim_for(opts) // 2
         if want != net.slots and want >= net.required_slots():
             net.compile(want)
-            trainer = Trainer(net, list(frozen))
+            trainer = Trainer(net, list(frozen), loss)
             opts = options(trainer)
     ctx = Context(opts)
     ctx.keygen(trainer.rotation_indices(rotation_window > 0))
@@ -187,9 +211,10 @@ def train_step(trainer, ctx, xs, targets, lr):
     return np.asarray(outs)
 
 
-def train_plain(net, xs, targets, lr, frozen=()):
+def train_plain(net, xs, targets, lr, frozen=(), loss=None):
     """Plaintext reference of ``Trainer``: one SGD update on a batch."""
-    _fheml.train_plain(net, [_flat(x) for x in xs], [_flat(t) for t in targets], lr, list(frozen))
+    _fheml.train_plain(net, [_flat(x) for x in xs], [_flat(t) for t in targets], lr, list(frozen),
+                       loss or Loss.mse())
 
 
 def auto_bootstrap(net, calibration, budget=None, level_budget=(2, 2), max_ring=1 << 16, headroom=1.5,
