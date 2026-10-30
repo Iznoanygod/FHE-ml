@@ -74,15 +74,15 @@ def deepcnn(exact_relu=False):
         nn.Linear(32, 10))
 
 
-def poolcnn(channels=8, stride=2):
+def poolcnn(channels=4, stride=2):
     # conv -> exact 2x2 max pool -> square-ish polynomial -> dense head. The
     # pool gathers its four taps into blocks of M slots (M = the pooled size
     # rounded up to a power of two) and compares 2M then M slots, one FHEW
-    # bootstrap each: with the default 8 channels at stride 2 (8x7x7 ->
-    # 8x3x3, M = 128) that is 384, and the network fits 512 slots;
-    # poolcnn-s1 (4 channels at stride 1, 4x14x14 -> 4x7x7, M = 256) is more
-    # accurate but needs 1024 slots, whose 128-bit scheme-switching keys do
-    # not fit in 14 GB. The pool costs 15 levels (12 for the FHEW-to-CKKS
+    # bootstrap each: with the default 4 channels at stride 2 (4x7x7 ->
+    # 4x3x3, M = 64) that is 192, and the network fits 256 slots, the most
+    # whose 128-bit scheme-switching and rotation keys fit in 14 GB.
+    # poolcnn-s1 (stride 1, 4x14x14 -> 4x7x7, M = 256) is more accurate but
+    # needs 1024 slots. The pool costs 15 levels (12 for the FHEW-to-CKKS
     # decoding of each comparison), 22 in all: it fits ring 2^16 without
     # bootstrapping. The pool's inputs must stay in [-POOL_RANGE, POOL_RANGE]
     # (the comparison wraps around beyond it).
