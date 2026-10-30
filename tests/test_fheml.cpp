@@ -8,6 +8,7 @@
 #include <cstring>
 #include <functional>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -275,6 +276,18 @@ Network tiny_transformer(int n, int in, int d) {
 // CKKS <-> FHEW scheme switching: the raw comparison and max pooling built
 // on it (TOY FHEW parameters, one FHEW bootstrap per slot and comparison).
 void scheme_switching_tests(bool quick) {
+  if (gpu_backend_built()) {
+    // FIDESlib has no scheme switching: the context must say so.
+    bool threw = false;
+    try {
+      make_ctx(FHEContext::compare_depth() + 1, 16, {}, false, true);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    check(threw, "scheme switching is rejected on the FIDESlib backend");
+    std::printf("  skipping scheme-switching tests (FIDESlib backend)\n");
+    return;
+  }
   {
     FHEContext ctx = make_ctx(FHEContext::compare_depth() + 1, 16, {}, false, true);
     std::printf("  %s\n", ctx.describe().c_str());
