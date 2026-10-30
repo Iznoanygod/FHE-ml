@@ -470,8 +470,91 @@ exponentials are bounded by 1 and the sums lie in `[1, n]` with nothing to
 calibrate; it costs n − 1 comparisons (each a FHEW bootstrap per slot) and
 about 12 + log2(n) extra levels, which is beyond one bootstrapping budget at
 ring 2^16. Both train under encryption (see below) and export from
-`fheml.nn.LayerNorm` / `fheml.nn.Attention(softmax=...)`; the example models
-do not use them yet.
+`fheml.nn.LayerNorm` / `fheml.nn.Attention(softmax=...)`.
+
+### Bootstrapping inside LayerNorm and softmax
+
+At ring 2^16 one bootstrapping stretch holds 3 to 5 levels, while a LayerNorm
+needs about 12 and softmax attention more than 20. With bootstrapping on,
+`place_bootstraps` plans refreshes *inside* these layers: each layer gets
+the stretch level it starts at and the budget, and puts a bare bootstrap
+wherever its next step would overrun (the input, the variance, the scores,
+the row sums and the reciprocal). The scales that bring each refreshed value
+into [-1, 1] are folded into the series coefficients and Newton constants,
+so the refreshes cost no extra levels. Model files record the plan
+(`selfboot` per layer and a `budget` line). See
+`docs/DESIGN.md#bootstrapping-inside-layernorm-and-softmax-attention`.
+
+Two more things make deep transformers fit:
+
+* **Range loss.** `fheml.nn.range_loss(model)` penalises LayerNorm
+  variances, attention scores and softmax row sums that leave their
+  intervals. Add it to the training loss so the calibrated intervals stay
+  narrow. A narrow interval matters because bootstrap error is absolute
+  (see below), and a wide `1/x` interval magnifies it.
+* **Iterative bootstrapping.** With `bootstrap_iterations=2`, OpenFHE
+  bootstraps the error of the first bootstrap again, at the cost of one more
+  level. At ring 4096 this cuts the error of a bootstrap from 1.2e-3 to
+  4e-6 (`tests/test_fheml.cpp`). The precision of one bootstrap is measured
+  at key generation, or set with `bootstrap_precision`.
+
+## Example models
+
+`examples/python/train_torch_mnist.py` trains these models in PyTorch,
+exports them, checks the plaintext fheml model on 2000 test images, and
+runs `--n` images encrypted (`--profile` times each layer, `--json` appends
+a result record). Inputs are 14x14 MNIST.
+
+**poolcnn: max pooling.** This model is conv 1->4 3x3 stride 2, then exact
+MaxPool2d 2x2 by scheme switching, x², dense 36->32, x², dense 32->10. It
+has 22 levels and no bootstrapping.
+
+```sh
+PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch poolcnn --window 1 --digits 2 --profile --n 1
+```
+
+**lnvit: LayerNorm, softmax, multi-head attention.** This is a vision
+transformer with 4 tokens of 7x7 patches and d = 16. It has one pre-norm
+block with 2-head softmax attention and one pre-norm MLP block, followed by
+a mean-pool head. It is 47 levels deep with every refresh planned:
+
+```sh
+PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch lnvit --bootstrap --level-budget 3 --digits 4 --boot-iterations 2 --insecure --n 5
+```
+
+Measured on 4 cores:
+
+| | poolcnn, 128-bit | poolcnn-s1, toy | lnvit, toy |
+| --- | --- | --- | --- |
+| Accuracy (torch, 10k test images) | 89.6% | 97.4% | 95.6% |
+| fheml plaintext (first 2000) | 87.0% (torch on the same images: 87.0%) | 96.6% | 94.0% (torch: 93.9%) |
+| Ring, slots | 2^16, 256 | 2048, 1024 | 4096, 512 |
+| Depth | 22, no bootstraps | 22 | 47: 3 bootstraps between layers, 12 inside LayerNorm and attention |
+| Setup | 104 s, 60 rotation keys (3.8 GB) | 3 s | 3 s |
+| Time per image | 362 s (MaxPool 347 s, conv 12 s) | 36 s | 22 s |
+| Peak memory | 12.9 GB | 1.9 GB | 2.0 GB |
+| Encrypted vs torch logits | 1.3e-3, same class | 4e-5, 2/2 same class | 3e-2 to 1.2e-1, 5/5 same class |
+
+`poolcnn-s1` is the same model with a stride-1 convolution (4x14x14 into
+the pool, 1024 slots). Toy columns use insecure parameters. They show
+correctness and the operation count, not 128-bit timings.
+
+poolcnn at 128-bit needs `--digits 2` and 256 slots: compare keys plus a
+512-slot comparison go over the container's 14 GB. Almost all of its time
+is the 3 comparison rounds: one FHEW bootstrap per compared slot.
+
+lnvit at 128-bit security (ring 2^16, level budget {3,3},
+`key_switch_digits=4`, two bootstrap iterations) fits in memory: 63 rotation
+keys (8.3 GB), 61 s setup, 13.4 GB peak. Its logits fail to decode, though.
+At these parameters one bootstrap is accurate to only about 1e-2 (see
+[Deep networks](#deep-networks)). Iterative bootstrapping adds just 4 bits,
+because the first bootstrap's error must stay inside the second one's input
+range. Fifteen refreshes, some feeding a `1/x` over [0.5, 100], amplify that
+error past what CKKS can decode. Running lnvit securely needs ring 2^17
+(55-bit scaling), which is more memory than this container has. The toy
+column at ring 4096 works because one bootstrap there is accurate to
+1.2e-3, ten times better. So the remaining gap at 128 bits is bootstrap
+precision, not depth or the planner.
 
 ## Encrypted training
 

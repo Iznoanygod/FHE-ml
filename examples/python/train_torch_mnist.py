@@ -201,6 +201,8 @@ def main():
                     help="layout of strided conv outputs (default: compact for deepcnn, gapped otherwise)")
     ap.add_argument("--boot-iterations", type=int, default=1, choices=(1, 2),
                     help="2 = iterative bootstrapping: about twice the bits of precision for twice the time")
+    ap.add_argument("--boot-precision", type=int, default=0,
+                    help="bits of precision of one bootstrap for --boot-iterations 2 (default: measured at keygen)")
     ap.add_argument("--data", default="data")
     ap.add_argument("--epochs", type=int, help="default: 3 (cnn), 15 (vit)")
     ap.add_argument("--out", help="also save the exported model here (.fheml)")
@@ -285,7 +287,7 @@ def main():
 
     t = time.time()
     overrides = {"level_budget": level_budget, "key_switch_digits": args.digits,
-                 "bootstrap_iterations": args.boot_iterations}
+                 "bootstrap_iterations": args.boot_iterations, "bootstrap_precision": args.boot_precision}
     if args.ring or (args.insecure and net.uses_bootstrapping):
         overrides["ring_dim"] = args.ring or 4096
     ctx = fheml.make_context(net, secure=not args.insecure, rotation_window=args.window, **overrides)
