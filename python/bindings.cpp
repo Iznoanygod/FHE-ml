@@ -114,6 +114,14 @@ PYBIND11_MODULE(_fheml, m) {
            py::arg("degree"))
       .def(py::init<std::string, double, double, uint32_t, double, double, double>(), py::arg("fn"), py::arg("a"),
            py::arg("b"), py::arg("degree"), py::arg("eval_a"), py::arg("eval_b"), py::arg("out_scale") = 1.0);
+  py::class_<ExactReLU, Layer, std::shared_ptr<ExactReLU>>(m, "ExactReLU")
+      .def(py::init<double, double, bool>(), py::arg("range") = 1.0, py::arg("out_scale") = 1.0,
+           py::arg("after_bootstrap") = false,
+           "Exact ReLU: sign through CKKS<->FHEW scheme switching; inputs must lie in [-range, range]. "
+           "after_bootstrap: inputs are past a CKKS bootstrap, the layer then costs one level "
+           "(set by place_bootstraps).")
+      .def_property_readonly("range", &ExactReLU::range)
+      .def_property("after_bootstrap", &ExactReLU::after_bootstrap, &ExactReLU::set_after_bootstrap);
   py::class_<Bootstrap, Layer, std::shared_ptr<Bootstrap>>(m, "Bootstrap").def(py::init<>());
   py::class_<Residual, Layer, std::shared_ptr<Residual>>(m, "Residual")
       .def(py::init<std::vector<LayerPtr>>(), py::arg("body"));
@@ -154,6 +162,8 @@ PYBIND11_MODULE(_fheml, m) {
           "add", [](Network& n, LayerPtr l) -> Network& { return n.add(std::move(l)); }, py::arg("layer"),
           py::return_value_policy::reference_internal)
       .def("fuse_linear", &Network::fuse_linear)
+      .def("use_exact_relu", &Network::use_exact_relu, py::arg("range") = 0.0,
+           "Replace Chebyshev relu activations by scheme-switching ExactReLU; returns how many.")
       .def("place_bootstraps", &Network::place_bootstraps, py::arg("budget"),
            py::arg("calibration") = std::vector<std::vector<double>>{}, py::arg("headroom") = 1.5,
            "Insert bootstraps so no stretch exceeds `budget` levels; compile() again afterwards.")

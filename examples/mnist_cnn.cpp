@@ -1,12 +1,14 @@
 // Encrypted MNIST inference with a CNN trained by tools/train_mnist.py.
 //
 //   mnist_cnn [--model F] [--samples F] [--encrypted N] [--insecure] [--fuse] [--cache]
-//             [--encrypt-weights]
+//             [--encrypt-weights] [--exact-relu]
 //
 //   --encrypt-weights  encrypt the conv/dense weights and biases too
 //                      (ciphertext x ciphertext products)
 //   --fuse   merge adjacent linear layers (none in the default model)
 //   --cache  keep encoded weights between samples (faster after the first)
+//   --exact-relu  replace Chebyshev ReLUs by the exact scheme-switching ReLU
+//                 (one FHEW bootstrap per slot each: slow)
 //
 // Runs the plaintext reference on every sample, then N samples under CKKS,
 // reporting per-layer timings, agreement with the reference and logit error.
@@ -58,7 +60,7 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
 int main(int argc, char** argv) {
   std::string model_path = "models/mnist_cnn.fheml", samples_path = "models/mnist_test_samples.txt";
   size_t n_enc = 5;
-  bool secure = true, fuse = false, cache = false, enc_weights = false;
+  bool secure = true, fuse = false, cache = false, enc_weights = false, exact_relu = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--model" && i + 1 < argc) model_path = argv[++i];
@@ -68,8 +70,9 @@ int main(int argc, char** argv) {
     else if (a == "--fuse") fuse = true;
     else if (a == "--cache") cache = true;
     else if (a == "--encrypt-weights") enc_weights = true;
+    else if (a == "--exact-relu") exact_relu = true;
     else {
-      std::fprintf(stderr, "usage: %s [--model F] [--samples F] [--encrypted N] [--insecure] [--fuse] [--cache] [--encrypt-weights]\n", argv[0]);
+      std::fprintf(stderr, "usage: %s [--model F] [--samples F] [--encrypted N] [--insecure] [--fuse] [--cache] [--encrypt-weights] [--exact-relu]\n", argv[0]);
       return 2;
     }
   }
@@ -77,6 +80,7 @@ int main(int argc, char** argv) {
   Network net = Network::load(model_path);
   auto samples = load_samples(samples_path);
   if (fuse) net.fuse_linear();
+  if (exact_relu) std::printf("exact relu: replaced %zu Chebyshev relus\n", net.use_exact_relu());
   net.compile();
   net.set_cache_plaintexts(cache);
   std::printf("%s\n\n", net.summary().c_str());

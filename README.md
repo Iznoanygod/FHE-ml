@@ -27,6 +27,9 @@ That code is kept in [`legacy/`](legacy/) for reference.
   * Trained polynomials `poly`.
   * Chebyshev approximations of `relu` / `silu` / `gelu` / `sigmoid` / `tanh`
     on a chosen interval and degree, via `EvalChebyshevSeries`.
+  * An exact ReLU (`ExactReLU`) whose sign is computed in FHEW through
+    scheme switching, as an option next to the Chebyshev ReLU (see
+    [Exact ReLU](#exact-relu-via-scheme-switching)).
 * **Small transformers.**
   * `TokenDense` is a per-token linear layer.
   * `Attention` is fully homomorphic self-attention: ct×ct QKᵀ and AV, with
@@ -249,9 +252,12 @@ logits = fheml.infer(net, ctx, image)        # image: (1, 28, 28) numpy array
 | `hnn.LayerNorm(dim, eps, var_min, var_max, degree, newton)` | `layernorm` |
 | `hnn.Bootstrap` | `bootstrap` |
 
-`nn.ReLU`, `nn.LayerNorm` and `nn.Softmax` have no exact encrypted form and
-are rejected with a message naming the replacement (`hnn.Chebyshev`,
-`hnn.LayerNorm`, `hnn.Attention(softmax=...)`). A plain `nn.MaxPool2d` is
+`nn.LayerNorm` and `nn.Softmax` have no exact encrypted form and are
+rejected with a message naming the replacement (`hnn.LayerNorm`,
+`hnn.Attention(softmax=...)`). `nn.ReLU` is rejected too unless
+`from_torch(..., exact_relu=RANGE)` is given: it then becomes the exact
+scheme-switching `ExactReLU` (see below; `hnn.Chebyshev("relu", ...)` modules
+too); otherwise use `hnn.Chebyshev`. A plain `nn.MaxPool2d` is
 rejected too because the encrypted comparison needs an input bound:
 `hnn.MaxPool2d(k, stride, range=R)` is the same torch layer with that bound
 and exports to the exact `MaxPool2d` (see below), at 15+ levels and a FHEW
@@ -324,6 +330,71 @@ the slots between outputs hold maxima of other windows (bounded by `range`),
 which the next linear layer ignores. `place_bootstraps` cannot fold a scale
 through the layer yet and inserts a `scale` layer when it has to; the FIDESlib
 (GPU) backend does not support scheme switching.
+
+## Exact ReLU via scheme switching
+
+`ExactReLU(range)` computes `max(x, 0)` without a polynomial: the sign
+`[x > 0]` comes from the same CKKS → FHEW → CKKS comparison as max pooling
+(`FHEContext::positive(x, range)`, i.e. `compare(0, x)` with the FHEW scaling
+set for a difference of at most `range`), and the layer returns
+`x · [x > 0]`. It is an option, not the default: the Chebyshev ReLU stays in
+the models because it is two to three orders of magnitude faster (table
+below).
+
+```cpp
+net.emplace<ExactReLU>(/*range=*/4.0);   // inputs must lie in [-range, range]
+net.use_exact_relu();                     // or: swap every Chebyshev relu for one (keeps the interval)
+```
+
+```python
+net = fheml.from_torch(model, shape, exact_relu=4.0)   # nn.ReLU / hnn.Chebyshev("relu") -> ExactReLU
+net.use_exact_relu()                                    # on an existing fheml.Network
+```
+
+`./build/relu_bench [--slots N] [--range R] [--insecure]` measures both against
+the true ReLU on the same inputs in `[-4, 4]` (each variant in its own context
+with just the levels it needs; 4 cores, OpenFHE 1.4.2):
+
+| 128-bit, ring 2^15, 256 slots | levels | per call | setup + keys | max error vs ReLU | error for \|x\| > 0.1 |
+|---|---|---|---|---|---|
+| Chebyshev degree 15 | 6 | 0.40 s | 0.3 s | 1.3e-1 | 7.8e-2 |
+| Chebyshev degree 31 | 7 | 0.66 s | 0.3 s | 6.3e-2 | 2.0e-2 |
+| Chebyshev degree 63 | 8 | 1.05 s | 0.4 s | 3.1e-2 | 4.8e-3 |
+| `ExactReLU` (STD128 FHEW) | 13 (1 past a bootstrap) | 412 s | 80 s, 7.3 GB peak | 4.4e-3 | 4.4e-3 |
+
+At toy parameters (`--insecure`) the exact ReLU takes about 1 s at 16 slots
+and 13 s at 256 slots with an error of about 1e-5; the time grows linearly
+with the slot count (one FHEW bootstrap per slot), the Chebyshev time does
+not.
+
+Error is the maximum over all slots against `max(x, 0)`; the Chebyshev
+error peaks at the kink and shrinks only linearly with the degree, while the
+exact ReLU is limited by CKKS noise everywhere except within the FHEW
+resolution (about `2·range / 2^(fhew_log_q − 1)`) of zero, where either branch
+is off by at most `|x|`.
+
+Depth: the sign is a fresh ciphertext at `compare_depth()` = 12 levels
+whatever the input's level, so from a fresh input the layer is 13 levels
+deep. Past a CKKS bootstrap, whose own depth (18–20) is larger than 12, `x`
+is already the deeper operand and the layer costs **one level**:
+`place_bootstraps` / `fheml.auto_bootstrap` mark every `ExactReLU` that way
+(`after_bootstrap`, saved in the model file) and the planner budgets 1 level
+for it, against 5–6 for a degree-15 Chebyshev ReLU. That makes deep ReLU
+networks need fewer CKKS bootstraps, but each ReLU still costs a FHEW
+bootstrap per slot, which dominates the time.
+
+Accuracy: a model trained with the Chebyshev ReLU loses accuracy when
+switched (`mnist_cnn --model models/mnist_deepcnn.fheml --exact-relu` on 14×14
+inputs, 200 test images: 98.0% → 95.5% in plaintext) because it learned the polynomial; train
+with `nn.ReLU` and export with `exact_relu=` instead
+(`train_torch_mnist.py --arch deepcnn --exact-relu`). Trained that way the
+deep CNN reaches 97.5% (97.6% with the Chebyshev ReLU) and, with
+`--bootstrap`, plans to 9 levels with a single CKKS bootstrap instead of 25
+levels and 8 bootstraps; at toy parameters an encrypted image takes about
+55 s (all from the four ReLUs over 256 slots) and its logits match torch to
+about 8e-3. At 128-bit security the four ReLUs alone would take about
+4 × 412 s ≈ 28 minutes per image, against seconds for the Chebyshev model. The trainer has no
+backward pass for it yet; the FIDESlib backend has no scheme switching.
 
 ## LayerNorm and softmax
 

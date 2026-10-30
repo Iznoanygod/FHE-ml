@@ -161,6 +161,40 @@ void cleartext_tests() {
     n.compile();
     check(n.uses_scheme_switching() && n.context_options(false).scheme_switching, "maxpool enables scheme switching");
   }
+
+  {
+    // Exact ReLU in the clear, its rescale (what bootstrap placement folds in),
+    // replacing Chebyshev relus (with an interval map) and a save/load trip.
+    Network n(Shape{1, 1, 8});
+    n.emplace<ChebyshevActivation>("relu", -3, 3, 15, -1.5, 1.5, 2.0);  // 2 relu(2 x) on [-1.5, 1.5]
+    n.emplace<ChebyshevActivation>("relu", -1, 3, 15);                   // asymmetric, no map: exact replacement
+    n.emplace<ChebyshevActivation>("relu", 0, 2, 15, -1, 1, 1.0);       // relu(x + 1): has an offset, kept
+    n.emplace<ChebyshevActivation>("sigmoid", -2, 2, 15);
+    check(n.use_exact_relu() == 2, "use_exact_relu replaces only offset-free relus");
+    auto* r = dynamic_cast<const ExactReLU*>(n.layers()[0].get());
+    check(r && r->range() == 1.5 && r->out_scale() == 4.0, "use_exact_relu keeps the interval and scales",
+          r ? "(range " + std::to_string(r->range()) + ", out " + std::to_string(r->out_scale()) + ")" : "");
+    check(n.layers()[2]->type() == "chebyshev" && n.uses_scheme_switching(), "offset relu kept, switching on");
+    ExactReLU e(2.0);
+    e.configure(Shape{1, 1, 8});
+    auto x = rand_vec(8, -2, 2);
+    auto y = e.forward_plain(x);
+    double err = 0;
+    for (size_t i = 0; i < 8; ++i) err = std::max(err, std::fabs(y[i] - std::max(x[i], 0.0)));
+    check_err("exactrelu plain vs max(x, 0)", err, 0.0);
+    e.rescale(0.5, 3.0);  // 3 relu(x / 2) = 1.5 relu(x), inputs may now be twice as large
+    y = e.forward_plain(x);
+    err = 0;
+    for (size_t i = 0; i < 8; ++i) err = std::max(err, std::fabs(y[i] - 1.5 * std::max(x[i], 0.0)));
+    check(err < 1e-15 && e.range() == 4.0, "exactrelu rescale");
+    check(e.depth() == FHEContext::compare_depth() + 1, "exactrelu depth");
+    const char* path = "test_exactrelu.fheml";
+    n.save(path);
+    Network m = Network::load(path);
+    std::remove(path);
+    x = rand_vec(8, -1.5, 1.5);
+    check_err("exactrelu save/load", max_err(n.forward_plain(x), m.forward_plain(x), 8), 1e-12);
+  }
 }
 
 FHEContext make_ctx(uint32_t depth, uint32_t slots, const std::vector<int32_t>& rot, bool boot = false,
@@ -324,6 +358,83 @@ void scheme_switching_tests(bool quick) {
     Network n(Shape{1, 5, 5});
     n.emplace<MaxPool2d>(3, 2, 2.0);
     check_encrypted("maxpool 3x3 stride 2", n, 1e-3, 2.0);
+  }
+  {
+    // Exact ReLU against true max(x, 0) (not against a polynomial), next to
+    // the Chebyshev ReLU it replaces, on the same encrypted input.
+    const double range = 4.0;
+    auto x = rand_vec(16, -range, range);
+    x[0] = 0.0, x[1] = 1e-3, x[2] = -1e-3, x[3] = range * 0.999, x[4] = -range * 0.999;
+    std::vector<double> relu(16);
+    for (size_t i = 0; i < 16; ++i) relu[i] = std::max(x[i], 0.0);
+    // The FHEW sign is only resolved down to about 2 range / 2^(fhew_log_q - 1);
+    // below that either branch is right to within |x|.
+    const double tol = 1e-3;
+    FHEContext ctx = make_ctx(FHEContext::compare_depth() + 1, 16, {}, false, true);
+    ExactReLU layer(range);
+    Ctxt c = ctx.encrypt(x);
+    auto got = ctx.decrypt(layer.forward(ctx, c), 16);
+    check_err("exactrelu vs true relu", max_err(got, relu, 16), tol);
+    // Output scale folded in (place_bootstraps / use_exact_relu use it).
+    ExactReLU scaled(range, 0.25);
+    got = ctx.decrypt(scaled.forward(ctx, c), 16);
+    double err = 0;
+    for (size_t i = 0; i < 16; ++i) err = std::max(err, std::fabs(got[i] - 0.25 * relu[i]));
+    check_err("exactrelu with output scale vs 0.25 relu", err, tol);
+    // A deep input still works and only costs one more level.
+    Ctxt deep = ctx.encrypt(x, FHEContext::compare_depth() - 1);
+    Ctxt yd = layer.forward(ctx, deep);
+    got = ctx.decrypt(yd, 16);
+    check_err("exactrelu from a deep input vs true relu", max_err(got, relu, 16), tol);
+    check(yd->GetLevel() + (yd->GetNoiseScaleDeg() > 1 ? 1 : 0) == FHEContext::compare_depth() + 1,
+          "exactrelu output level is compare_depth() + 1");
+    // For comparison: Chebyshev ReLUs on the same interval against true relu.
+    for (uint32_t deg : {15u, 31u, 63u}) {
+      ChebyshevActivation cheb("relu", -range, range, deg);
+      FHEContext cc = make_ctx(cheb.depth(), 16, {});
+      auto gc = cc.decrypt(cheb.forward(cc, cc.encrypt(x)), 16);
+      std::printf("  chebyshev relu degree %u on [-%g, %g]: max err vs true relu %.2e (exactrelu %.2e)\n", deg, range,
+                  range, max_err(gc, relu, 16), max_err(ctx.decrypt(layer.forward(ctx, c), 16), relu, 16));
+    }
+  }
+  {
+    // A Chebyshev-ReLU network switched over with use_exact_relu: its
+    // plaintext reference becomes the true ReLU and the encrypted output
+    // matches it.
+    Network n(Shape{1, 4, 4});
+    n.emplace<Conv2d>(1, 2, 3, 3, 1, 1, rand_vec(18, -0.3, 0.3), rand_vec(2, -0.1, 0.1));
+    n.emplace<ChebyshevActivation>("relu", -2, 2, 15);
+    n.emplace<Dense>(32, 4, rand_vec(128, -0.5, 0.5), rand_vec(4));
+    check(n.use_exact_relu() == 1 && n.layers()[1]->type() == "exactrelu", "use_exact_relu replaces the relu");
+    check_encrypted("conv exactrelu dense", n, 1e-3);
+  }
+  {
+    // With bootstraps placed, every exact ReLU sits past one and costs a
+    // single level: two of them plus three dense layers fit a budget of 3.
+    Network n(Shape{1, 1, 8});
+    n.emplace<Dense>(8, 8, rand_vec(64, -0.6, 0.6), rand_vec(8, -0.2, 0.2));
+    n.emplace<ExactReLU>(4.0);
+    n.emplace<Dense>(8, 8, rand_vec(64, -0.6, 0.6), rand_vec(8, -0.2, 0.2));
+    n.emplace<ExactReLU>(4.0);
+    n.emplace<Dense>(8, 4, rand_vec(32, -0.6, 0.6), rand_vec(4, -0.2, 0.2));
+    std::vector<std::vector<double>> calib;
+    for (int i = 0; i < 8; ++i) calib.push_back(rand_vec(8));
+    auto x = rand_vec(8);
+    auto before = n.forward_plain(x);
+    size_t k = n.place_bootstraps(3, calib);
+    size_t deep = 0;
+    for (const auto& l : n.layers())
+      if (auto* r = dynamic_cast<const ExactReLU*>(l.get())) deep += r->after_bootstrap() && r->depth() == 1;
+    check(k > 0 && deep == 2 && n.depth_between_bootstraps() <= 3, "exactrelu past bootstraps costs one level",
+          "(" + std::to_string(k) + " bootstraps, depth between " + std::to_string(n.depth_between_bootstraps()) + ")");
+    check_err("exactrelu placement keeps the function", max_err(before, n.forward_plain(x), 4), 1e-9);
+    check_encrypted("dense exactrelu x2 with bootstraps", n, 1e-2);
+    // Without bootstraps the layers go back to their full depth.
+    Network m(Shape{1, 1, 8});
+    m.emplace<Dense>(8, 8, rand_vec(64, -0.6, 0.6), std::vector<double>{});
+    m.emplace<ExactReLU>(4.0);
+    check(m.place_bootstraps(20) == 0 && m.depth() == FHEContext::compare_depth() + 2,
+          "exactrelu keeps its full depth when no bootstrap is placed");
   }
   if (quick) return;
   {

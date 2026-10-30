@@ -46,6 +46,9 @@ FHEContext::FHEContext(const ContextOptions& opts) : opts_(opts) {
   uint32_t ring = opts_.ring_dim ? opts_.ring_dim : 2 * opts_.slots;
   // Bootstrapping fails on tiny rings even when security is off.
   if (!opts_.ring_dim && opts_.bootstrapping) ring = std::max(ring, 4096u);
+  // Scheme switching encodes FHEW-sized vectors (n = 32 at TOY parameters)
+  // into the CKKS slots: tiny insecure rings are too small for it.
+  if (!opts_.ring_dim && opts_.scheme_switching) ring = std::max(ring, 2048u);
   std::string last_error;
   for (; ring <= (1u << 17); ring *= 2) {
     params.SetRingDim(ring);
@@ -305,6 +308,11 @@ Ctxt FHEContext::compare(const Ctxt& a, const Ctxt& b, double range) const {
   }
   return cc_->EvalCompareSchemeSwitching(a, b, opts_.slots, opts_.slots);
 #endif
+}
+
+Ctxt FHEContext::positive(const Ctxt& x, double range) const {
+  if (!(range > 0.0)) throw std::invalid_argument("positive: range must be positive");
+  return compare(cc_->EvalSub(x, x), x, range / 2.0);
 }
 
 std::string FHEContext::describe() const {

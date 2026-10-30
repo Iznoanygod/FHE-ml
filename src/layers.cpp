@@ -684,6 +684,57 @@ void ChebyshevActivation::save(std::ostream& os) const {
   os << "\n";
 }
 
+// --------------------------------------------------------------- ExactReLU
+
+ExactReLU::ExactReLU(double range, double out_scale, bool after_bootstrap)
+    : range_(range), out_scale_(out_scale), after_bootstrap_(after_bootstrap) {
+  if (!(range > 0.0)) throw std::invalid_argument("exactrelu: range must be positive");
+}
+
+std::string ExactReLU::describe() const {
+  std::ostringstream os;
+  os << "exactrelu (scheme switching) on [" << -range_ << ", " << range_ << "]";
+  if (out_scale_ != 1.0) os << " x " << out_scale_;
+  if (after_bootstrap_) os << ", past a bootstrap";
+  return os.str();
+}
+
+std::vector<double> ExactReLU::forward_plain(const std::vector<double>& x) const {
+  std::vector<double> y(x.size());
+  for (size_t i = 0; i < x.size(); ++i) y[i] = out_scale_ * std::max(x[i], 0.0);
+  return y;
+}
+
+// y = (out_scale x) [x > 0]. The sign is at compare_depth() whatever x's
+// level, so the product lands one level below the deeper of the two. Past a
+// bootstrap x is the deeper one and the output scale goes on the sign
+// instead, keeping the layer at one level.
+Ctxt ExactReLU::forward(const FHEContext& ctx, const Ctxt& x) const {
+  if (!ctx.scheme_switching())
+    throw std::logic_error("exactrelu needs a context with ContextOptions::scheme_switching");
+  const CC& cc = ctx.cc();
+  const uint32_t used = x->GetLevel() + (x->GetNoiseScaleDeg() > 1 ? 1 : 0);
+  if (after_bootstrap_ && used < FHEContext::compare_depth() + 1)
+    throw std::logic_error("exactrelu: planned for inputs past a bootstrap (" +
+                           std::to_string(FHEContext::compare_depth() + 1) + "+ levels deep), got one " +
+                           std::to_string(used) + " levels deep");
+  Ctxt sel = ctx.positive(x, range_);
+  if (out_scale_ == 1.0) return cc->EvalMult(x, sel);
+  if (after_bootstrap_) return cc->EvalMult(x, cc->EvalMult(sel, out_scale_));
+  return cc->EvalMult(cc->EvalMult(x, out_scale_), sel);
+}
+
+void ExactReLU::rescale(double in, double out) {
+  if (!(in > 0.0)) throw std::invalid_argument("exactrelu: input scale must be positive");
+  out_scale_ *= out * in;
+  range_ /= in;
+}
+
+void ExactReLU::save(std::ostream& os) const {
+  os << std::setprecision(std::numeric_limits<double>::max_digits10) << "exactrelu " << range_ << " " << out_scale_
+     << " " << (after_bootstrap_ ? 1 : 0) << "\n";
+}
+
 void Bootstrap::save(std::ostream& os) const { os << "bootstrap\n"; }
 
 }  // namespace fheml
