@@ -212,34 +212,49 @@ struct Batch {
   std::vector<std::vector<double>> xs, ts;
 };
 
-Batch batch(const Network& n, size_t count, unsigned seed) {
+// Cross-entropy batches get one-hot targets.
+Batch batch(const Network& n, size_t count, unsigned seed, bool onehot = false) {
   Rng r(seed);
   Batch b;
+  const size_t k = n.output_shape().size();
   for (size_t i = 0; i < count; ++i) {
     b.xs.push_back(r.vec(n.input_shape().size(), 1.0));
-    b.ts.push_back(r.vec(n.output_shape().size(), 1.0));
+    b.ts.push_back(r.vec(k, 1.0));
+    if (onehot) {
+      std::vector<double>& t = b.ts.back();
+      const size_t c = static_cast<size_t>((t[0] + 1.0) * 0.5 * static_cast<double>(k)) % k;
+      std::fill(t.begin(), t.end(), 0.0);
+      t[c] = 1.0;
+    }
   }
   return b;
 }
 
 // --------------------------------------------------------- gradient checks
 
-double loss(const Network& net, const Batch& b) {
+// Cross-entropy with the exact softmax: train_plain's gradient uses the
+// polynomial one, so the check also bounds the approximation error.
+double loss(const Network& net, const Batch& b, const Loss& kind) {
   double l = 0;
   for (size_t s = 0; s < b.xs.size(); ++s) {
     auto y = net.forward_plain(b.xs[s]);
+    if (kind.kind == Loss::kCrossEntropy) {
+      l += cross_entropy_plain(y, b.ts[s]);
+      continue;
+    }
     for (size_t i = 0; i < y.size(); ++i) l += 0.5 * (y[i] - b.ts[s][i]) * (y[i] - b.ts[s][i]);
   }
   return l / static_cast<double>(b.xs.size());
 }
 
-void gradient_check(const std::string& name, const Builder& make, const std::vector<size_t>& frozen = {}) {
+void gradient_check(const std::string& name, const Builder& make, const std::vector<size_t>& frozen = {},
+                    const Loss& kind = Loss{}) {
   Network net = make();
   net.compile();
-  Batch b = batch(net, 3, 7);
+  Batch b = batch(net, 3, 7, kind.kind == Loss::kCrossEntropy);
   // One SGD step with lr = 1 moves the parameters by -grad.
   std::vector<double> p0 = all_params(net);
-  train_plain(net, b.xs, b.ts, 1.0, frozen);
+  train_plain(net, b.xs, b.ts, 1.0, frozen, kind);
   std::vector<double> p1 = all_params(net);
 
   Network ref = make();
@@ -256,10 +271,10 @@ void gradient_check(const std::string& name, const Builder& make, const std::vec
         const double eps = 1e-5, v = p[i];
         p[i] = v + eps;
         l->set_params(p);
-        double up = loss(ref, b);
+        double up = loss(ref, b, kind);
         p[i] = v - eps;
         l->set_params(p);
-        double down = loss(ref, b);
+        double down = loss(ref, b, kind);
         p[i] = v;
         l->set_params(p);
         double num = is_frozen ? 0.0 : (up - down) / (2 * eps);
@@ -283,13 +298,15 @@ FHEContext training_context(const Trainer& tr, bool boot, uint32_t updates, uint
 }
 
 void encrypted_check(const std::string& name, const Builder& make, size_t updates, bool boot, double tol,
-                     const std::vector<size_t>& frozen = {}, double lr = 0.5, uint32_t window = 0) {
+                     const std::vector<size_t>& frozen = {}, double lr = 0.5, uint32_t window = 0,
+                     const Loss& kind = Loss{}) {
+  const bool onehot = kind.kind == Loss::kCrossEntropy;
   Network plain = make();
   plain.compile();
   Network enc = make();
   // Bootstrapping: use all 2048 slots of the ring so weights are packed.
   enc.compile(boot ? 2048 : 0);
-  Trainer tr(enc, frozen);
+  Trainer tr(enc, frozen, kind);
   FHEContext ctx = training_context(tr, boot, static_cast<uint32_t>(updates), window);
   std::printf("  %s\n  %s\n", tr.summary().c_str(), ctx.describe().c_str());
   if (window) {
@@ -301,8 +318,8 @@ void encrypted_check(const std::string& name, const Builder& make, size_t update
 
   std::vector<double> before = all_params(plain);
   for (size_t u = 0; u < updates; ++u) {
-    Batch b = batch(plain, 2, 100 + static_cast<unsigned>(u));
-    train_plain(plain, b.xs, b.ts, lr, frozen);
+    Batch b = batch(plain, 2, 100 + static_cast<unsigned>(u), onehot);
+    train_plain(plain, b.xs, b.ts, lr, frozen, kind);
     for (size_t s = 0; s < b.xs.size(); ++s) tr.accumulate(ctx, tr.encrypt_input(ctx, b.xs[s]), tr.encrypt_target(ctx, b.ts[s]));
     tr.update(ctx, lr);
     if (!boot)
@@ -325,6 +342,61 @@ void encrypted_check(const std::string& name, const Builder& make, size_t update
     Layer* c = enc.layers()[frozen[0]].get();
     check(max_diff(a->params(), c->params()) == 0.0, name + " frozen layer unchanged");
   }
+}
+
+// Softmax cross-entropy: logits of the test networks stay within [-2, 2].
+Loss cross_entropy(bool subtract_max) {
+  SoftmaxOptions o;
+  o.lo = -2.0;
+  o.hi = 2.0;
+  o.exp_degree = 15;
+  o.inv_degree = 31;
+  o.newton = subtract_max ? 1 : 2;
+  o.subtract_max = subtract_max;
+  return Loss::cross_entropy(o);
+}
+
+// A ten-class head (gapped by a strided conv in front), for the max tree
+// over a wider window than the three-output mlp.
+Network classifier(unsigned seed) {
+  Rng r(seed);
+  Network n(Shape{1, 6, 6});
+  n.emplace<Conv2d>(1, 2, 3, 3, 2, 1, r.vec(18, 0.4), r.vec(2, 0.1))
+      .emplace<Square>()
+      .emplace<Dense>(18, 10, r.vec(180, 0.3), r.vec(10, 0.1));
+  return n;
+}
+
+void cross_entropy_tests(bool quick) {
+  // The polynomial softmax against the exact one.
+  for (int sm = 0; sm < 2; ++sm) {
+    Rng r(31);
+    double err = 0.0;
+    for (int i = 0; i < 20; ++i) {
+      std::vector<double> y = r.vec(10, 2.0), p = softmax_plain(cross_entropy(sm != 0), y);
+      double m = *std::max_element(y.begin(), y.end()), S = 0.0;
+      for (double v : y) S += std::exp(v - m);
+      for (size_t j = 0; j < y.size(); ++j) err = std::max(err, std::fabs(p[j] - std::exp(y[j] - m) / S));
+    }
+    check_err(std::string("polynomial softmax vs exact") + (sm ? ", max subtracted" : ""), err, 1e-6);
+  }
+  gradient_check("cross-entropy, mlp", [] { return mlp(1); }, {}, cross_entropy(false));
+  gradient_check("cross-entropy, ten classes", [] { return classifier(13); }, {}, cross_entropy(false));
+  gradient_check("cross-entropy, max subtracted", [] { return classifier(13); }, {}, cross_entropy(true));
+  gradient_check("cross-entropy, softmax attention", [] { return attention_tokens(11, true); }, {}, cross_entropy(false));
+
+  encrypted_check("cross-entropy mlp", [] { return mlp(1); }, 1, false, 1e-4, {}, 0.5, 0, cross_entropy(false));
+  encrypted_check("cross-entropy ten classes", [] { return classifier(13); }, 1, false, 1e-4, {}, 0.5, 0,
+                  cross_entropy(false));
+  encrypted_check("cross-entropy mlp, ladder window 1", [] { return mlp(5); }, 1, false, 1e-4, {0}, 0.5, 1,
+                  cross_entropy(false));
+  if (!quick)
+    encrypted_check("cross-entropy mlp, bootstrapped weights", [] { return mlp(6); }, 2, true, 1e-3, {}, 0.3, 0,
+                    cross_entropy(false));
+  // Scheme-switching comparisons (CPU OpenFHE only).
+  if (!quick && !gpu_backend_built())
+    encrypted_check("cross-entropy ten classes, max subtracted", [] { return classifier(13); }, 1, false, 1e-3, {}, 0.5,
+                    0, cross_entropy(true));
 }
 
 }  // namespace
@@ -373,6 +445,8 @@ int main(int argc, char** argv) {
         2, true, 1e-3, {}, 0.3, 1);
   if (!quick) encrypted_check("mlp, bootstrapped weights", [] { return mlp(6); }, 3, true, 1e-3, {}, 0.3);
   if (!quick) encrypted_check("cnn, bootstrapped weights", [] { return cnn(7); }, 2, true, 1e-3, {}, 0.3);
+
+  cross_entropy_tests(quick);
 
   std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");
   return g_failures ? 1 : 0;

@@ -201,9 +201,24 @@ PYBIND11_MODULE(_fheml, m) {
       .def("encrypt_weights", &Network::encrypt_weights, py::arg("ctx"), py::arg("drop_plaintext") = true,
            py::call_guard<py::gil_scoped_release>());
 
+  py::class_<Loss> loss(m, "Loss", "Training loss: Loss.mse() or Loss.cross_entropy(SoftmaxOptions) (see train.h).");
+  py::enum_<Loss::Kind>(loss, "Kind").value("MSE", Loss::kMSE).value("CROSS_ENTROPY", Loss::kCrossEntropy);
+  loss.def(py::init<>())
+      .def_readwrite("kind", &Loss::kind)
+      .def_readwrite("softmax", &Loss::softmax)
+      .def_static("mse", &Loss::mse)
+      .def_static("cross_entropy", &Loss::cross_entropy, py::arg("softmax") = SoftmaxOptions{},
+                  "Softmax cross-entropy against one-hot targets; the softmax uses the polynomial exp and 1/x "
+                  "(optionally with the maximum subtracted through scheme switching).");
+  m.def("softmax_plain", &softmax_plain, py::arg("loss"), py::arg("y"),
+        "The softmax the cross-entropy Trainer computes under encryption.");
+  m.def("cross_entropy_plain", &cross_entropy_plain, py::arg("y"), py::arg("target"),
+        "Exact -sum t log softmax(y).");
+
   py::class_<Trainer>(m, "Trainer", "Encrypted SGD training (see include/fheml/train.h).")
-      .def(py::init<Network&, std::vector<size_t>>(), py::arg("net"), py::arg("frozen") = std::vector<size_t>{},
-           py::keep_alive<1, 2>())
+      .def(py::init<Network&, std::vector<size_t>, Loss>(), py::arg("net"), py::arg("frozen") = std::vector<size_t>{},
+           py::arg("loss") = Loss{}, py::keep_alive<1, 2>())
+      .def_property_readonly("loss", &Trainer::loss)
       .def_property_readonly("step_depth", &Trainer::step_depth)
       .def_property_readonly("weight_ciphertexts", &Trainer::weight_ciphertexts)
       .def_property_readonly("first_trained_layer", &Trainer::first_trained_layer)
@@ -244,6 +259,7 @@ PYBIND11_MODULE(_fheml, m) {
   m.def("gpu_backend_built", &gpu_backend_built, "True when built with FIDESlib (-DFHEML_GPU=ON).");
   m.def("gpu_device_count", &gpu_device_count, "Visible CUDA devices (0 without the GPU backend).");
   m.def("train_plain", &train_plain, py::arg("net"), py::arg("xs"), py::arg("targets"), py::arg("lr"),
-        py::arg("frozen") = std::vector<size_t>{}, "Plaintext reference of Trainer: one SGD update on a batch.",
+        py::arg("frozen") = std::vector<size_t>{}, py::arg("loss") = Loss{},
+        "Plaintext reference of Trainer: one SGD update on a batch.",
         py::call_guard<py::gil_scoped_release>());
 }
