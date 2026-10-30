@@ -21,6 +21,15 @@
 // the result is broadcast back over the block and multiplied with V_s.
 // Cost: about n * (2 log2(d) rotations + 3 ct-ct products); depth 6 for the
 // whole attention block including the four projections.
+//
+// Multi-head attention (H heads of width dh = d/H) uses the same layout: head
+// h of token t is the sub-block [t*B + h*dh, t*B + (h+1)*dh), which is what
+// the concatenated Q/K/V projections produce anyway. The window sums and the
+// broadcasts just shrink from d to dh slots (log2(dh) rotations), the score
+// masks pick slot t*B + h*dh for every head, and the head concatenation
+// before W_o is free. So H heads cost less than one head of width d: no extra
+// ciphertexts, rotations or levels. Each head may have its own score
+// polynomial, at no cost.
 #ifndef FHEML_TRANSFORMER_H_
 #define FHEML_TRANSFORMER_H_
 
@@ -90,13 +99,17 @@ class Residual : public Layer {
   std::vector<std::shared_ptr<Layer>> body_;
 };
 
-// Single-head self-attention with a quadratic score function (see top).
+// Self-attention with a quadratic score function (see top); `heads` heads of
+// width d / heads, as sub-blocks of each token.
 class Attention : public Layer {
  public:
-  // w*: [d][d] as [out][in]; b*: empty or [d]; score = {c0, c1, c2}.
+  // w*: [d][d] as [out][in] (head h reads/writes rows [h*dh, (h+1)*dh) of
+  // Wq, Wk, Wv and columns of Wo, like torch's MultiheadAttention); b*: empty
+  // or [d]; score = {c0, c1, c2} shared by all heads, or 3*heads values with
+  // one polynomial per head.
   Attention(int n, int d, std::vector<double> wq, std::vector<double> wk, std::vector<double> wv,
             std::vector<double> wo, std::vector<double> bq, std::vector<double> bk, std::vector<double> bv,
-            std::vector<double> bo, std::vector<double> score);
+            std::vector<double> bo, std::vector<double> score, int heads = 1);
   std::string type() const override { return "attention"; }
   std::string describe() const override;
   Shape configure(const Shape& in) override;
@@ -110,12 +123,13 @@ class Attention : public Layer {
   void save(std::ostream& os) const override;
   // The cyclic copy of K and V needs 2*n*d slots.
   size_t min_slots() const override;
+  int heads() const { return heads_; }
 
  private:
-  int n_, d_;
+  int n_, d_, heads_, dh_;
   int stride_ = 0;                   // token stride B of the input layout
   std::vector<double> w_[4], b_[4];  // q, k, v, o
-  std::vector<double> score_;
+  std::vector<double> score_;  // [heads][3]
   std::shared_ptr<TokenDense> proj_[4];
   uint32_t slots_ = 0;
   std::vector<double> mask_c2_, mask_c1_, mask_c0_;

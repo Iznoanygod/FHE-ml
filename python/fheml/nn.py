@@ -97,27 +97,44 @@ class Chebyshev(nn.Module):
 
 
 class Attention(nn.Module):
-    """Single-head self-attention with a polynomial score instead of softmax.
+    """Self-attention with a polynomial score instead of softmax.
 
     Input (batch, tokens, dim). ``A = c0 + c1 S + c2 S^2`` with ``S = Q K^T``
     (no 1/sqrt(d): it is learned into W_q). The default score is
     ``(S + 2)^2 / (8 n)``: non-negative and about 1/n at S = 0.
+
+    ``heads`` > 1 splits the dim features into heads of width ``dim / heads``
+    (a power of two) exactly like ``nn.MultiheadAttention``: head h uses rows
+    ``[h*dh, (h+1)*dh)`` of q/k/v and the matching columns of o. ``score`` is
+    a shared ``(c0, c1, c2)`` or one triple per head, shape ``(heads, 3)``.
+    Under encryption extra heads are free (fewer rotations than one wide head).
     """
 
-    def __init__(self, dim, tokens, score=None, bias=True):
+    def __init__(self, dim, tokens, score=None, bias=True, heads=1):
         super().__init__()
+        if heads < 1 or dim % heads:
+            raise ValueError("heads must divide dim")
         if score is None:
             score = (4.0 / (8 * tokens), 4.0 / (8 * tokens), 1.0 / (8 * tokens))
-        if len(score) != 3:
-            raise ValueError("score must be (c0, c1, c2)")
-        self.tokens = tokens
+        score = torch.as_tensor(score, dtype=torch.get_default_dtype())
+        if score.shape == (3,):
+            score = score.expand(heads, 3).clone()
+        if score.shape != (heads, 3):
+            raise ValueError("score must be (c0, c1, c2) or (heads, 3)")
+        self.tokens, self.heads = tokens, heads
         self.q, self.k, self.v, self.o = (nn.Linear(dim, dim, bias=bias) for _ in range(4))
-        self.register_buffer("score", torch.as_tensor(score, dtype=torch.get_default_dtype()))
+        self.register_buffer("score", score)
 
     def forward(self, x):
-        s = self.q(x) @ self.k(x).transpose(-1, -2)
-        a = self.score[0] + self.score[1] * s + self.score[2] * s * s
-        return self.o(a @ self.v(x))
+        b, n, d = x.shape
+        q, k, v = (f(x).reshape(b, n, self.heads, d // self.heads).transpose(1, 2) for f in (self.q, self.k, self.v))
+        s = q @ k.transpose(-1, -2)  # (b, heads, n, n)
+        c = self.score.view(1, self.heads, 1, 1, 3)
+        a = c[..., 0] + c[..., 1] * s + c[..., 2] * s * s
+        return self.o((a @ v).transpose(1, 2).reshape(b, n, d))
+
+    def extra_repr(self):
+        return f"tokens={self.tokens}, heads={self.heads}"
 
 
 class Residual(nn.Module):

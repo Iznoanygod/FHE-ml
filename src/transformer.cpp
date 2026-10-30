@@ -213,10 +213,17 @@ void Residual::save(std::ostream& os) const {
 
 Attention::Attention(int n, int d, std::vector<double> wq, std::vector<double> wk, std::vector<double> wv,
                      std::vector<double> wo, std::vector<double> bq, std::vector<double> bk, std::vector<double> bv,
-                     std::vector<double> bo, std::vector<double> score)
-    : n_(n), d_(d), score_(std::move(score)) {
-  if (!is_pow2(d)) throw std::invalid_argument("attention: d must be a power of two");
-  if (score_.size() != 3) throw std::invalid_argument("attention: score polynomial needs 3 coefficients");
+                     std::vector<double> bo, std::vector<double> score, int heads)
+    : n_(n), d_(d), heads_(heads), dh_(heads > 0 ? d / heads : 0), score_(std::move(score)) {
+  if (heads < 1 || d % heads != 0) throw std::invalid_argument("attention: heads must divide d");
+  if (!is_pow2(dh_)) throw std::invalid_argument("attention: the head width d/heads must be a power of two");
+  if (score_.size() == 3 && heads > 1) {
+    std::vector<double> shared = score_;
+    score_.clear();
+    for (int h = 0; h < heads; ++h) score_.insert(score_.end(), shared.begin(), shared.end());
+  }
+  if (score_.size() != 3u * heads)
+    throw std::invalid_argument("attention: score polynomial needs 3 coefficients, or 3 per head");
   std::vector<double>* ws[4] = {&wq, &wk, &wv, &wo};
   std::vector<double>* bs[4] = {&bq, &bk, &bv, &bo};
   for (int i = 0; i < 4; ++i) {
@@ -229,8 +236,16 @@ Attention::Attention(int n, int d, std::vector<double> wq, std::vector<double> w
 
 std::string Attention::describe() const {
   std::ostringstream os;
-  os << "attention n=" << n_ << " d=" << d_ << " score " << score_[0] << " + " << score_[1] << " s + " << score_[2]
-     << " s^2";
+  os << "attention n=" << n_ << " d=" << d_;
+  if (heads_ > 1) os << " heads=" << heads_;
+  for (int h = 0; h < heads_; ++h) {
+    os << (h == 0 ? " score " : "; ") << score_[3 * h] << " + " << score_[3 * h + 1] << " s + " << score_[3 * h + 2]
+       << " s^2";
+    if (h == 3 && heads_ > 4) {
+      os << "; ...";
+      break;
+    }
+  }
   return os.str();
 }
 
@@ -258,27 +273,30 @@ void Attention::compile(uint32_t slots) {
   if (slots < min_slots()) throw std::invalid_argument("attention: needs at least 2*n*d slots");
   slots_ = slots;
   for (auto& p : proj_) p->compile(slots);
-  // Score polynomial coefficients, masked to the first slot of each token.
+  // Score polynomial coefficients, masked to the first slot of each head of
+  // each token (slot t*B + h*dh holds head h's q.k sum after the window sum).
   mask_c0_.assign(slots, 0.0);
   mask_c1_.assign(slots, 0.0);
   mask_c2_.assign(slots, 0.0);
-  for (int t = 0; t < n_; ++t) {
-    mask_c0_[t * stride_] = score_[0];
-    mask_c1_[t * stride_] = score_[1];
-    mask_c2_[t * stride_] = score_[2];
-  }
+  for (int t = 0; t < n_; ++t)
+    for (int h = 0; h < heads_; ++h) {
+      mask_c0_[t * stride_ + h * dh_] = score_[3 * h];
+      mask_c1_[t * stride_ + h * dh_] = score_[3 * h + 1];
+      mask_c2_[t * stride_ + h * dh_] = score_[3 * h + 2];
+    }
 }
 
 std::vector<double> Attention::forward_plain(const std::vector<double>& x) const {
   std::vector<double> q = proj_[0]->forward_plain(x), k = proj_[1]->forward_plain(x), v = proj_[2]->forward_plain(x);
   std::vector<double> out(static_cast<size_t>(n_) * d_, 0.0);
-  for (int i = 0; i < n_; ++i)
-    for (int j = 0; j < n_; ++j) {
-      double s = 0.0;
-      for (int c = 0; c < d_; ++c) s += q[i * d_ + c] * k[j * d_ + c];
-      double a = score_[0] + score_[1] * s + score_[2] * s * s;
-      for (int c = 0; c < d_; ++c) out[i * d_ + c] += a * v[j * d_ + c];
-    }
+  for (int h = 0; h < heads_; ++h)
+    for (int i = 0; i < n_; ++i)
+      for (int j = 0; j < n_; ++j) {
+        double s = 0.0;
+        for (int c = h * dh_; c < (h + 1) * dh_; ++c) s += q[i * d_ + c] * k[j * d_ + c];
+        double a = score_[3 * h] + score_[3 * h + 1] * s + score_[3 * h + 2] * s * s;
+        for (int c = h * dh_; c < (h + 1) * dh_; ++c) out[i * d_ + c] += a * v[j * d_ + c];
+      }
   return proj_[3]->forward_plain(out);
 }
 
@@ -305,11 +323,12 @@ Ctxt Attention::forward(const FHEContext& ctx, const Ctxt& x) const {
   for (int s = 0; s < n_; ++s) {
     const Ctxt& ks = kr[s];
     const Ctxt& vs = vr[s];
-    // score[i] = q_i . k_{i+s}, accumulated into slot i*B (slots i*B+d ..
-    // i*B+B-1 are zero, so summing a d-wide window is enough).
+    // score[i][h] = q_i . k_{i+s} over head h, accumulated into slot
+    // i*B + h*dh by summing a dh-wide window (slots i*B+d .. i*B+B-1 are
+    // zero, so the last head's window never reads the next token).
     Ctxt p = cc->EvalMult(q, ks);
-    for (int t = 1; t < d_; t *= 2) cc->EvalAddInPlace(p, rot(p, t));
-    // a = mask * (c2 p^2 + c1 p + c0): 2 levels, zero outside slots i*d.
+    for (int t = 1; t < dh_; t *= 2) cc->EvalAddInPlace(p, rot(p, t));
+    // a = mask * (c2 p^2 + c1 p + c0): 2 levels, zero outside slots i*B+h*dh.
     const uint32_t lvl = p->GetLevel() + (p->GetNoiseScaleDeg() > 1 ? 1 : 0);
     Ptxt c2 = ctx.encode(mask_c2_, lvl);
     Ctxt a = cc->EvalMult(p, c2);
@@ -318,8 +337,9 @@ Ctxt Attention::forward(const FHEContext& ctx, const Ctxt& x) const {
     a = cc->EvalMult(p, a);
     Ptxt c0 = ctx.encode(mask_c0_, a->GetLevel(), a->GetNoiseScaleDeg());
     cc->EvalAddInPlace(a, c0);
-    // Broadcast a[i*d] over token i's block, then weight v_{i+s}.
-    for (int t = 1; t < d_; t *= 2) cc->EvalAddInPlace(a, rot(a, -t));
+    // Broadcast a[i*B+h*dh] over head h's sub-block (the dh-wide window
+    // behind each slot holds at most one head slot), then weight v_{i+s}.
+    for (int t = 1; t < dh_; t *= 2) cc->EvalAddInPlace(a, rot(a, -t));
     partial[s] = cc->EvalMult(a, vs);
   }
   Ctxt o = partial[0];
@@ -333,7 +353,7 @@ std::vector<int32_t> Attention::rotation_indices() const {
     for (int32_t i : p->rotation_indices()) r.insert(i);
   r.insert(-n_ * stride_);
   for (int s = 1; s < n_; ++s) r.insert(s * stride_);
-  for (int t = 1; t < d_; t *= 2) {
+  for (int t = 1; t < dh_; t *= 2) {
     r.insert(t);
     r.insert(-t);
   }
@@ -346,7 +366,9 @@ void Attention::encrypt_weights(const FHEContext& ctx, bool drop_plaintext) {
 
 void Attention::save(std::ostream& os) const {
   bool has_bias = !b_[0].empty();
-  os << "attention " << n_ << " " << d_ << " " << (has_bias ? 1 : 0) << "\n";
+  os << "attention " << n_ << " " << d_ << " " << (has_bias ? 1 : 0);
+  if (heads_ > 1) os << " heads " << heads_;
+  os << "\n";
   for (int i = 0; i < 4; ++i) write_vec(os, w_[i]);
   if (has_bias)
     for (int i = 0; i < 4; ++i) write_vec(os, b_[i].empty() ? std::vector<double>(d_, 0.0) : b_[i]);

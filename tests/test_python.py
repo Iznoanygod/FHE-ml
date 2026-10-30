@@ -17,11 +17,15 @@ def w(o, i, s=0.3):
 
 net = fheml.Network(fheml.Shape(n, 1, d))
 net.add(fheml.Residual([fheml.Attention(n, d, w(d, d), w(d, d), w(d, d), w(d, d), score=[0.1, 0.1, 0.03])]))
+# Two heads of width 4 with a score polynomial per head.
+net.add(fheml.Residual([fheml.Attention(n, d, w(d, d), w(d, d), w(d, d), w(d, d),
+                                        score=[[0.1, 0.1, 0.03], [0.1, 0.05, 0.02]], heads=2)]))
 net.add(fheml.Residual([fheml.TokenDense(n, d, h, w(h, d), w(1, h, 0.1)), fheml.Poly([0, 0.5, 0.25]),
                         fheml.TokenDense(n, h, d, w(d, h), w(1, d, 0.1))]))
 net.add(fheml.TokenMean(n, d)).add(fheml.Dense(d, 3, w(3, d), w(1, 3, 0.1)))
 net.compile()
 print(net.summary())
+assert "heads=2" in net.layers[1].describe()
 
 ctx = fheml.make_context(net, secure=False)
 x = rng.uniform(-1, 1, (n, d))

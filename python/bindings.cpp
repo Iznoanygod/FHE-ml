@@ -116,9 +116,12 @@ PYBIND11_MODULE(_fheml, m) {
   py::class_<Residual, Layer, std::shared_ptr<Residual>>(m, "Residual")
       .def(py::init<std::vector<LayerPtr>>(), py::arg("body"));
   py::class_<Attention, Layer, std::shared_ptr<Attention>>(m, "Attention")
-      .def(py::init<int, int, Vec, Vec, Vec, Vec, Vec, Vec, Vec, Vec, Vec>(), py::arg("tokens"), py::arg("dim"),
+      .def(py::init<int, int, Vec, Vec, Vec, Vec, Vec, Vec, Vec, Vec, Vec, int>(), py::arg("tokens"), py::arg("dim"),
            py::arg("wq"), py::arg("wk"), py::arg("wv"), py::arg("wo"), py::arg("bq") = Vec{}, py::arg("bk") = Vec{},
-           py::arg("bv") = Vec{}, py::arg("bo") = Vec{}, py::arg("score") = Vec{0.0, 0.0, 1.0});
+           py::arg("bv") = Vec{}, py::arg("bo") = Vec{}, py::arg("score") = Vec{0.0, 0.0, 1.0}, py::arg("heads") = 1,
+           "Self-attention with `heads` heads of width dim/heads; score is (c0, c1, c2) shared by all heads "
+           "or 3*heads values, one polynomial per head.")
+      .def_property_readonly("heads", &Attention::heads);
 
   py::class_<Network>(m, "Network")
       .def(py::init<Shape>(), py::arg("input_shape"))

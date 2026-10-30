@@ -140,7 +140,7 @@ class _Exporter:
             self.need_width(d, m.q.in_features, name)
             ws = [_np(l.weight) for l in (m.q, m.k, m.v, m.o)]
             bs = [_np(l.bias) for l in (m.q, m.k, m.v, m.o)]
-            out.append(("attention", n, d, ws, bs, _np(m.score)))
+            out.append(("attention", n, d, ws, bs, _np(m.score), m.heads))
             return state
         if isinstance(m, hnn.Residual):
             body, after = self.run(m.body, state)
@@ -168,7 +168,9 @@ class _Exporter:
             raise ValueError("nn.MaxPool2d is not exported: fheml.MaxPool2d (exact, via CKKS<->FHEW scheme "
                              "switching) costs 15+ levels, add it to the fheml network by hand or use nn.AvgPool2d")
         if isinstance(m, (nn.LayerNorm, nn.Softmax, nn.MultiheadAttention)):
-            raise ValueError(f"nn.{name} is not supported under encryption (see docs/DESIGN.md#transformers)")
+            hint = " (fheml.nn.Attention(dim, tokens, heads=h) is the polynomial multi-head form)" \
+                if isinstance(m, nn.MultiheadAttention) else ""
+            raise ValueError(f"nn.{name} is not supported under encryption (see docs/DESIGN.md#transformers){hint}")
         raise ValueError(f"unsupported module {name}: build the model from nn.Sequential, the supported "
                          "torch.nn layers and fheml.nn modules")
 
@@ -232,8 +234,8 @@ def _build(s):
     if k == "bootstrap":
         return _fheml.Bootstrap()
     if k == "attention":
-        _, n, d, ws, bs, score = s
-        return _fheml.Attention(n, d, *map(_flat, ws), *map(_flat, bs), score=_flat(score))
+        _, n, d, ws, bs, score, heads = s
+        return _fheml.Attention(n, d, *map(_flat, ws), *map(_flat, bs), score=_flat(score), heads=heads)
     if k == "residual":
         return _fheml.Residual([_build(b) for b in s[1]])
     raise AssertionError(k)

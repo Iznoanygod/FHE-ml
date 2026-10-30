@@ -30,7 +30,9 @@ That code is kept in [`legacy/`](legacy/) for reference.
 * **Small transformers.**
   * `TokenDense` is a per-token linear layer.
   * `Attention` is fully homomorphic self-attention: ct×ct QKᵀ and AV, with
-    a trainable quadratic in place of softmax.
+    a trainable quadratic in place of softmax. `heads=H` gives multi-head
+    attention with the heads as sub-blocks of each token, which costs fewer
+    rotations than one wide head and no extra levels.
   * `Residual` and `TokenMean` complete the block.
   * See [docs/DESIGN.md](docs/DESIGN.md#transformers).
 * **A Python package**, `import fheml`, wraps the same API with numpy in and
@@ -237,7 +239,7 @@ logits = fheml.infer(net, ctx, image)        # image: (1, 28, 28) numpy array
 | `nn.BatchNorm2d` / `nn.BatchNorm1d` | folded into the preceding conv/linear, else `affine` |
 | `nn.Flatten`, `nn.Dropout`, `nn.Identity` | nothing |
 | `hnn.Poly`, `hnn.Square`, `hnn.Chebyshev` | `poly`, `square`, `chebyshev` |
-| `hnn.Attention`, `hnn.Residual`, `hnn.TokenMean`, `hnn.PosEmbedding` | `attention`, `residual`, `tokenmean`, per-token bias |
+| `hnn.Attention(dim, tokens, heads=H)`, `hnn.Residual`, `hnn.TokenMean`, `hnn.PosEmbedding` | `attention` (single or multi-head), `residual`, `tokenmean`, per-token bias |
 | `hnn.Bootstrap` | `bootstrap` |
 
 `nn.ReLU`, softmax and LayerNorm have no exact encrypted form and are
