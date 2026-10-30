@@ -105,6 +105,19 @@ Network strided_cnn(unsigned seed) {
   return n;
 }
 
+// Multiplexed packing: the stride-2 conv interleaves its 4 channels into the
+// gaps (m = 2), the stride-1 conv keeps that layout.
+Network multiplexed_cnn(unsigned seed) {
+  Rng r(seed);
+  Network n(Shape{1, 8, 8});
+  n.set_packing(Packing::kMultiplexed);
+  n.emplace<Conv2d>(1, 4, 3, 3, 2, 1, r.vec(36, 0.4), r.vec(4, 0.1))
+      .emplace<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25})
+      .emplace<Conv2d>(4, 2, 3, 3, 1, 1, r.vec(72, 0.3), r.vec(2, 0.1))
+      .emplace<Dense>(32, 2, r.vec(64, 0.3), std::vector<double>{});
+  return n;
+}
+
 // Token layers with shared and per-token biases, a Chebyshev activation and a
 // residual connection.
 Network tokens(unsigned seed) {
@@ -336,6 +349,12 @@ int main(int argc, char** argv) {
   gradient_check("mlp", [] { return mlp(1); });
   gradient_check("cnn (shared weights, affine, square, avgpool)", [] { return cnn(2); });
   gradient_check("strided cnn", [] { return strided_cnn(3); });
+  {
+    Network n = multiplexed_cnn(13);
+    n.compile();
+    check(n.layers()[0]->out_layout().m == 2 && n.layers()[2]->out_layout().m == 2, "multiplexed cnn layouts (m = 2)");
+  }
+  gradient_check("multiplexed cnn", [] { return multiplexed_cnn(13); });
   gradient_check("tokens (residual, chebyshev, per-token bias)", [] { return tokens(4); });
   gradient_check("mlp, first layer frozen", [] { return mlp(5); }, {0});
   gradient_check("layernorm (gamma, beta, backward through the normalisation)", [] { return norm_tokens(9); });
@@ -348,6 +367,7 @@ int main(int argc, char** argv) {
   encrypted_check("mlp, two updates", [] { return mlp(1); }, 2, false, 1e-4);
   encrypted_check("cnn", [] { return cnn(2); }, 1, false, 1e-4);
   encrypted_check("strided cnn", [] { return strided_cnn(3); }, 1, false, 1e-4);
+  encrypted_check("multiplexed cnn", [] { return multiplexed_cnn(13); }, 1, false, 1e-4);
   encrypted_check("tokens", [] { return tokens(4); }, 1, false, 1e-4);
   encrypted_check("mlp, fine-tune last layer", [] { return mlp(5); }, 1, false, 1e-4, {0});
   encrypted_check("layernorm", [] { return norm_tokens(9); }, 1, false, 1e-4);

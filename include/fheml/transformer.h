@@ -49,7 +49,7 @@ class TokenDense : public LinearLayer {
   std::string type() const override { return "tokendense"; }
   std::string describe() const override;
   Shape configure(const Shape& in) override;
-  Layout configure_layout(const Layout& in, bool gapped) override;
+  Layout configure_layout(const Layout& in, Packing packing) override;
   SparseMatrix matrix() const override;
   std::vector<double> bias() const override;
   std::vector<ParamRef> weight_refs() const override;
@@ -95,7 +95,7 @@ class LayerNorm : public Layer {
   std::string type() const override { return "layernorm"; }
   std::string describe() const override;
   Shape configure(const Shape& in) override;
-  Layout configure_layout(const Layout& in, bool gapped) override;
+  Layout configure_layout(const Layout& in, Packing packing) override;
   void compile(uint32_t slots) override;
   std::vector<double> forward_plain(const std::vector<double>& x) const override;
   Ctxt forward(const FHEContext& ctx, const Ctxt& x) const override;
@@ -150,7 +150,7 @@ class Residual : public Layer {
   std::string type() const override { return "residual"; }
   std::string describe() const override;
   Shape configure(const Shape& in) override;
-  Layout configure_layout(const Layout& in, bool gapped) override;
+  Layout configure_layout(const Layout& in, Packing packing) override;
   void compile(uint32_t slots) override;
   std::vector<double> forward_plain(const std::vector<double>& x) const override;
   Ctxt forward(const FHEContext& ctx, const Ctxt& x) const override;
@@ -206,7 +206,7 @@ class Attention : public Layer {
   std::string type() const override { return "attention"; }
   std::string describe() const override;
   Shape configure(const Shape& in) override;
-  Layout configure_layout(const Layout& in, bool gapped) override;
+  Layout configure_layout(const Layout& in, Packing packing) override;
   void compile(uint32_t slots) override;
   std::vector<double> forward_plain(const std::vector<double>& x) const override;
   Ctxt forward(const FHEContext& ctx, const Ctxt& x) const override;

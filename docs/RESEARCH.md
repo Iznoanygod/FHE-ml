@@ -47,8 +47,9 @@ were not confirmed.
 - **Multiplexed parallel convolutions.** E. Lee et al. ICML 2022, ePrint 2021/1688.
   - Interleaves channels so that strided outputs stay dense in the slots, and
     runs several convolutions in parallel in one ciphertext.
-  - About 4.7× faster ResNet-20. This is the natural next step after fheml's
-    gapped layout.
+  - About 4.7× faster ResNet-20. fheml implements the packing
+    (`Packing::kMultiplexed`) but evaluates each conv with its generic BSGS
+    plan, like Orion, rather than Lee et al.'s rotation schedule.
 - **Minimax composite ReLU.**
   - E. Lee, J.-W. Lee, J.-S. No, Y.-S. Kim. IEEE TDSC 2022, ePrint 2020/834.
   - J. Lee et al. IEEE Access 2023, arXiv:2105.10879.

@@ -47,10 +47,10 @@ Shape TokenDense::configure(const Shape& in) {
   return out_;
 }
 
-Layout TokenDense::configure_layout(const Layout& in, bool gapped) {
+Layout TokenDense::configure_layout(const Layout& in, Packing packing) {
   in_layout_ = in;
   // Keep the input's token stride when the output tokens fit in it.
-  if (gapped && in.xs == 1 && in.cs >= static_cast<size_t>(out_dim_))
+  if (packing != Packing::kCompact && in.m == 1 && in.xs == 1 && in.cs >= static_cast<size_t>(out_dim_))
     out_layout_ = Layout{in.cs, static_cast<size_t>(out_dim_), 1};
   else
     out_layout_ = Layout::compact(out_);
@@ -160,9 +160,9 @@ Shape LayerNorm::configure(const Shape& in) {
   return out_;
 }
 
-Layout LayerNorm::configure_layout(const Layout& in, bool gapped) {
-  (void)gapped;
-  if (in.xs != 1 || in.ys != static_cast<size_t>(d_) && n_ > 1)
+Layout LayerNorm::configure_layout(const Layout& in, Packing packing) {
+  (void)packing;
+  if (in.m != 1 || in.xs != 1 || in.ys != static_cast<size_t>(d_) && n_ > 1)
     throw std::invalid_argument("layernorm: tokens must be contiguous in the slots");
   in_layout_ = out_layout_ = in;
   stride_ = n_ > 1 ? in.cs : static_cast<size_t>(d_);
@@ -346,9 +346,9 @@ Shape Residual::configure(const Shape& in) {
   return out_;
 }
 
-Layout Residual::configure_layout(const Layout& in, bool gapped) {
+Layout Residual::configure_layout(const Layout& in, Packing packing) {
   Layout l = in;
-  for (auto& b : body_) l = b->configure_layout(l, gapped);
+  for (auto& b : body_) l = b->configure_layout(l, packing);
   bool same = true;
   for (size_t i = 0; i < in_.size() && same; ++i) same = l.slot(body_.back()->out_shape(), i) == in.slot(in_, i);
   if (!same) {
@@ -459,13 +459,13 @@ Shape Attention::configure(const Shape& in) {
   return out_;
 }
 
-Layout Attention::configure_layout(const Layout& in, bool gapped) {
-  (void)gapped;
-  if (in.xs != 1 || in.cs < static_cast<size_t>(d_))
+Layout Attention::configure_layout(const Layout& in, Packing packing) {
+  (void)packing;
+  if (in.m != 1 || in.xs != 1 || in.cs < static_cast<size_t>(d_))
     throw std::invalid_argument("attention: tokens must be contiguous with stride >= d");
   stride_ = static_cast<int>(in.cs);
   for (auto& p : proj_)
-    if (p->configure_layout(in, true).cs != in.cs) throw std::logic_error("attention: projection changed the layout");
+    if (p->configure_layout(in, Packing::kGapped).cs != in.cs) throw std::logic_error("attention: projection changed the layout");
   in_layout_ = out_layout_ = in;
   return in;
 }

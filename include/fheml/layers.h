@@ -3,8 +3,10 @@
 // in slot c*cs + y*ys + x*xs (a strided Layout). Strided convolutions and
 // pooling keep their outputs "gapped" at the input positions instead of
 // compacting them, which keeps their diagonals constant (k*k*(Ci+Co-1) of
-// them); the next linear layer absorbs the gaps into its matrix. Every linear
-// layer is lowered to a LinearTransform.
+// them); the next linear layer absorbs the gaps into its matrix. With
+// multiplexed packing (Lee et al., ICML'22) the gaps are filled with other
+// channels instead (see Layout). Every linear layer is lowered to a
+// LinearTransform.
 #ifndef FHEML_LAYERS_H_
 #define FHEML_LAYERS_H_
 
@@ -27,14 +29,57 @@ struct Shape {
   std::string str() const;
 };
 
+// How strided conv/pool layers lay out their outputs (Network::set_packing).
+enum class Packing {
+  kCompact,     // dense (C, H, W) order: fewest slots, most diagonals
+  kGapped,      // outputs stay at their input positions: fewest diagonals
+  kMultiplexed  // gaps filled with other channels: compact slot count, few diagonals
+};
+
+// Slot of element (c, y, x). Without multiplexing (m = 1) it is
+// c*cs + y*ys + x*xs. With multiplexing factor m, m*m channels share one
+// block of cs slots: the spatial grid (ys, xs) is m times coarser than the
+// "fine" grid (fy, fx) of the original image, and channel c sits at sub-offset
+// (i, j) = ((c mod m^2) / m, c mod m) of that grid:
+//
+//   slot = (c / m^2)*cs + i*fy + j*fx + y*ys + x*xs
+//
+// After a stride-2 layer on a compact HxW input, ys = 2W, xs = 2, m = 2,
+// (fy, fx) = (W, 1): the four channels of a block interleave like the
+// pixels of a 2x2 window. Offsets between an input and an output element
+// still only depend on (input channel, output channel, kernel tap), so
+// convolutions keep few diagonals, but the activation needs C*H*W/m^2 slots
+// like a compact one instead of C*H*W like a gapped one.
 struct Layout {
   size_t cs = 0, ys = 0, xs = 0;
-  static Layout compact(const Shape& s) { return Layout{static_cast<size_t>(s.h) * s.w, static_cast<size_t>(s.w), 1}; }
-  size_t slot(size_t c, size_t y, size_t x) const { return c * cs + y * ys + x * xs; }
+  size_t m = 1;            // multiplexing factor
+  size_t fy = 0, fx = 0;   // fine grid (0 = unknown: no multiplexing possible)
+  static Layout compact(const Shape& s) {
+    return Layout{static_cast<size_t>(s.h) * s.w, static_cast<size_t>(s.w), 1, 1, static_cast<size_t>(s.w), 1};
+  }
+  size_t channel_offset(size_t c) const {
+    if (m == 1) return c * cs;
+    const size_t g = m * m, lo = c % g;
+    return (c / g) * cs + (lo / m) * fy + (lo % m) * fx;
+  }
+  size_t slot(size_t c, size_t y, size_t x) const { return channel_offset(c) + y * ys + x * xs; }
   size_t slot(const Shape& s, size_t logical) const;
+  // Spatial strides multiplied by s (gapped output of a stride-s layer).
+  Layout strided(size_t s) const {
+    Layout l = *this;
+    l.ys *= s;
+    l.xs *= s;
+    return l;
+  }
   // Number of slots needed: highest slot used + 1.
-  size_t span(const Shape& s) const { return slot(s.c - 1, s.h - 1, s.w - 1) + 1; }
-  bool is_compact(const Shape& s) const { return cs == static_cast<size_t>(s.h) * s.w && ys == static_cast<size_t>(s.w) && xs == 1; }
+  size_t span(const Shape& s) const;
+  bool is_compact(const Shape& s) const {
+    return m == 1 && cs == static_cast<size_t>(s.h) * s.w && ys == static_cast<size_t>(s.w) && xs == 1;
+  }
+  bool operator==(const Layout& o) const {
+    return cs == o.cs && ys == o.ys && xs == o.xs && m == o.m && (m == 1 || (fy == o.fy && fx == o.fx));
+  }
+  bool operator!=(const Layout& o) const { return !(*this == o); }
 };
 
 // Multiplicative depth OpenFHE uses for a polynomial of the given degree
@@ -50,9 +95,9 @@ class Layer {
   // Fixes the input shape, returns the output shape.
   virtual Shape configure(const Shape& in) = 0;
   // Picks the slot layout of the output given the input's (after configure).
-  // gapped = allow strided outputs (see the top of this file).
-  virtual Layout configure_layout(const Layout& in, bool gapped) {
-    (void)gapped;
+  // packing: how strided outputs are laid out (see Packing).
+  virtual Layout configure_layout(const Layout& in, Packing packing) {
+    (void)packing;
     return in_layout_ = out_layout_ = in;
   }
   // Lowers the layer for a given slot count (after configure_layout).
@@ -102,7 +147,7 @@ class LinearLayer : public Layer {
  public:
   bool is_linear() const override { return true; }
   uint32_t depth() const override { return 1; }
-  Layout configure_layout(const Layout& in, bool gapped) override;
+  Layout configure_layout(const Layout& in, Packing packing) override;
   void compile(uint32_t slots) override;
   std::vector<double> forward_plain(const std::vector<double>& x) const override;
   Ctxt forward(const FHEContext& ctx, const Ctxt& x) const override;
@@ -246,7 +291,7 @@ class MaxPool2d : public Layer {
   std::string type() const override { return "maxpool2d"; }
   std::string describe() const override;
   Shape configure(const Shape& in) override;
-  Layout configure_layout(const Layout& in, bool gapped) override;
+  Layout configure_layout(const Layout& in, Packing packing) override;
   std::vector<double> forward_plain(const std::vector<double>& x) const override;
   Ctxt forward(const FHEContext& ctx, const Ctxt& x) const override;
   uint32_t depth() const override;
