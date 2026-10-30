@@ -17,8 +17,14 @@ bool is_pow2(uint32_t x) { return x && !(x & (x - 1)); }
 FHEContext::FHEContext(const ContextOptions& opts) : opts_(opts) {
   if (!is_pow2(opts_.slots)) throw std::invalid_argument("slots must be a power of two");
 
-  boot_depth_ =
-      opts_.bootstrapping ? lbcrypto::FHECKKSRNS::GetBootstrapDepth(opts_.level_budget, lbcrypto::UNIFORM_TERNARY) : 0;
+  if (opts_.bootstrap_iterations < 1 || opts_.bootstrap_iterations > 2)
+    throw std::invalid_argument("bootstrap_iterations must be 1 or 2");
+  // An iterative bootstrap rescales its first result once more.
+  boot_depth_ = opts_.bootstrapping ? lbcrypto::FHECKKSRNS::GetBootstrapDepth(opts_.level_budget,
+                                                                               lbcrypto::UNIFORM_TERNARY) +
+                                          (opts_.bootstrap_iterations - 1)
+                                    : 0;
+  boot_precision_ = opts_.bootstrap_precision;
   total_depth_ = opts_.mult_depth + boot_depth_;
 
   fhe::CCParams<fhe::CryptoContextCKKSRNS> params;
@@ -111,6 +117,20 @@ void FHEContext::keygen(const std::vector<int32_t>& rotations) {
   for (int32_t r : uniq) has_key_[static_cast<size_t>(r)] = 1;
   if (!uniq.empty()) cc_->EvalRotateKeyGen(keys_.secretKey, std::vector<int32_t>(uniq.begin(), uniq.end()));
   if (opts_.bootstrapping) cc_->EvalBootstrapKeyGen(keys_.secretKey, opts_.slots);
+#ifndef FHEML_WITH_FIDESLIB
+  if (opts_.bootstrapping && opts_.bootstrap_iterations > 1 && !boot_precision_) {
+    // Precision of one bootstrap on values in [-1, 1], with two bits of
+    // margin: the second iteration scales the first one's error up by
+    // 2^precision and must keep it inside the bootstrap's input range.
+    std::vector<double> v(opts_.slots);
+    for (size_t i = 0; i < v.size(); ++i) v[i] = std::sin(0.7 * static_cast<double>(i) + 0.3);
+    const Ctxt b = cc_->EvalBootstrap(encrypt(v, total_depth_ - 1));
+    double err = 1e-12;
+    const std::vector<double> got = decrypt(b, v.size());
+    for (size_t i = 0; i < v.size(); ++i) err = std::max(err, std::fabs(got[i] - v[i]));
+    boot_precision_ = static_cast<uint32_t>(std::max(1.0, std::floor(-std::log2(err)) - 2.0));
+  }
+#endif
 #ifndef FHEML_WITH_FIDESLIB
   if (opts_.scheme_switching) {
     // One FHEW context per CKKS context; its secret key is a function of
@@ -384,7 +404,8 @@ std::vector<double> FHEContext::decrypt(const Ctxt& c, size_t n) const {
 uint32_t FHEContext::ring_dim_for(const ContextOptions& opts) {
   ContextOptions o = opts;
   if (o.bootstrapping) {
-    o.mult_depth += lbcrypto::FHECKKSRNS::GetBootstrapDepth(o.level_budget, lbcrypto::UNIFORM_TERNARY);
+    o.mult_depth += lbcrypto::FHECKKSRNS::GetBootstrapDepth(o.level_budget, lbcrypto::UNIFORM_TERNARY) +
+                    (o.bootstrap_iterations - 1);
     o.bootstrapping = false;
     if (!o.ring_dim) o.slots = std::max(o.slots, 2048u);  // the constructor's 4096 floor
   }
@@ -393,6 +414,11 @@ uint32_t FHEContext::ring_dim_for(const ContextOptions& opts) {
 
 Ctxt FHEContext::bootstrap(const Ctxt& c) const {
   if (!opts_.bootstrapping) throw std::logic_error("bootstrapping is not enabled in this context");
+#ifndef FHEML_WITH_FIDESLIB
+  if (opts_.bootstrap_iterations > 1) return cc_->EvalBootstrap(c, opts_.bootstrap_iterations, boot_precision_);
+#else
+  if (opts_.bootstrap_iterations > 1) throw std::logic_error("iterative bootstrapping is not available on FIDESlib");
+#endif
   return cc_->EvalBootstrap(c);
 }
 
@@ -470,6 +496,8 @@ std::string FHEContext::describe() const {
      << " depth=" << total_depth_ << " (network " << opts_.mult_depth << ", bootstrap " << boot_depth_ << ")"
      << " scale_bits=" << opts_.scale_mod_bits << " security=" << (opts_.secure ? "128-bit" : "NOT SET (insecure)")
      << " device=" << (on_gpu_ ? "gpu" : "cpu");
+  if (opts_.bootstrap_iterations > 1)
+    os << " bootstrap_iterations=" << opts_.bootstrap_iterations << " (precision " << boot_precision_ << " bits)";
   if (opts_.rotation_window) os << " rotation_window=" << opts_.rotation_window;
   if (opts_.scheme_switching) os << " scheme_switching=fhew(logq " << opts_.fhew_log_q << ")";
   if (keys_.secretKey)

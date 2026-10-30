@@ -24,7 +24,7 @@ import torch
 from torch import nn
 
 __all__ = ["Poly", "Square", "Chebyshev", "Attention", "LayerNorm", "MaxPool2d", "Residual", "TokenMean",
-           "PosEmbedding", "Bootstrap", "chebyshev_coefficients"]
+           "PosEmbedding", "Bootstrap", "chebyshev_coefficients", "range_loss"]
 
 
 class Poly(nn.Module):
@@ -80,6 +80,21 @@ def _chebyshev_eval(c, a, b, x):
     for ck in reversed(c[1:]):
         b1, b2 = 2 * t * b1 - b2 + ck, b1
     return t * b1 - b2 + c[0]
+
+
+def _excess(x, lo, hi):
+    """Mean squared distance of x outside [lo, hi] (0 inside)."""
+    return (torch.relu(x - hi) + torch.relu(lo - x)).pow(2).mean()
+
+
+def range_loss(model):
+    """Sum of how far the last training forward pushed LayerNorm variances and
+    softmax scores / row sums outside the intervals their encrypted series
+    cover (mean squared excess). Add ``weight * range_loss(model)`` to the
+    training loss so the model learns to stay inside them: the series
+    diverge outside, and encrypted inference cannot clamp."""
+    terms = [m._excess for m in model.modules() if getattr(m, "_excess", None) is not None]
+    return sum(terms) if terms else torch.zeros(())
 
 
 def _series_buffer(fn, a, b, degree):
@@ -140,6 +155,8 @@ class LayerNorm(nn.Module):
         """1/sqrt(var + eps) as the layer approximates it. While training, the
         series sees the variance clamped to its interval (a stray value would
         otherwise blow it up); check the ranges on data before encrypting."""
+        if self.training:
+            self._excess = _excess(var, self.var_min, self.var_max)
         v = var.clamp(self.var_min, self.var_max) if self.training else var
         r = _chebyshev_eval(self.c, self.var_min, self.var_max, v)
         for _ in range(self.newton):
@@ -246,9 +263,12 @@ class Attention(nn.Module):
             # intervals (outside them they diverge); check the ranges on data
             # before encrypting (fheml.Network.forward_plain does not clamp).
             if self.training:
+                excess = _excess(s, self.exp_lo, self.exp_hi)
                 s = s.clamp(self.exp_lo, self.exp_hi)
             e = _chebyshev_eval(self.exp_c, self.exp_lo, self.exp_hi, s)
             total = e.sum(-1, keepdim=True)
+            if self.training:
+                self._excess = excess + _excess(total, self.sum_lo, self.sum_hi)
             t = total.clamp(self.sum_lo, self.sum_hi) if self.training else total
             y = _chebyshev_eval(self.inv_c, self.sum_lo, self.sum_hi, t)
             for _ in range(self.softmax["newton"]):

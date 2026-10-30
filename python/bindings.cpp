@@ -46,6 +46,8 @@ PYBIND11_MODULE(_fheml, m) {
       .def_readwrite("rotation_window", &ContextOptions::rotation_window)
       .def_readwrite("scheme_switching", &ContextOptions::scheme_switching)
       .def_readwrite("fhew_log_q", &ContextOptions::fhew_log_q)
+      .def_readwrite("bootstrap_iterations", &ContextOptions::bootstrap_iterations)
+      .def_readwrite("bootstrap_precision", &ContextOptions::bootstrap_precision)
       .def_readwrite("key_switch_digits", &ContextOptions::key_switch_digits)
       .def_readwrite("use_gpu", &ContextOptions::use_gpu)
       .def_readwrite("gpu_devices", &ContextOptions::gpu_devices);

@@ -95,10 +95,16 @@ def poolcnn(channels=4, stride=2):
 
 
 POOL_RANGE = 8.0
+RANGE_WEIGHT = 1.0
 # Softmax and layer-norm intervals of the transformers. The training forward
 # clamps to them; check_softmax_ranges() reports how the test data fits.
-SOFTMAX = dict(lo=-4.0, hi=4.0, exp_degree=15, inv_degree=15, newton=2)
-LN = dict(eps=0.05, var_min=0.0, var_max=16.0, degree=15, newton=1)
+# Narrow intervals matter under encryption: values are scaled by the
+# interval bounds before each bootstrap inside the layers, so a wide
+# interval spends the bootstrap's ~10-20 bits of precision on headroom. The
+# row-sum interval [0.5, 100] is far inside the worst case [n e^lo, n e^hi]
+# and the range loss keeps the sums there.
+SOFTMAX = dict(lo=-4.0, hi=4.0, exp_degree=15, inv_degree=15, newton=2, sum_lo=0.5, sum_hi=100.0)
+LN = dict(eps=0.05, var_min=0.0, var_max=4.0, degree=15, newton=1)
 
 
 def lnvit(tokens):
@@ -193,6 +199,8 @@ def main():
                     "[-RANGE, RANGE] (default 8)")
     ap.add_argument("--packing", choices=("gapped", "compact", "multiplexed"),
                     help="layout of strided conv outputs (default: compact for deepcnn, gapped otherwise)")
+    ap.add_argument("--boot-iterations", type=int, default=1, choices=(1, 2),
+                    help="2 = iterative bootstrapping: about twice the bits of precision for twice the time")
     ap.add_argument("--data", default="data")
     ap.add_argument("--epochs", type=int, help="default: 3 (cnn), 15 (vit)")
     ap.add_argument("--out", help="also save the exported model here (.fheml)")
@@ -221,7 +229,8 @@ def main():
         t = time.time()
         for idx in torch.randperm(len(xtr)).split(128):
             opt.zero_grad()
-            nn.functional.cross_entropy(model(xtr[idx]), ytr[idx]).backward()
+            loss = nn.functional.cross_entropy(model(xtr[idx]), ytr[idx])
+            (loss + RANGE_WEIGHT * hnn.range_loss(model)).backward()  # keep series arguments in their intervals
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # polynomial nets can spike early
             opt.step()
             sched.step()
@@ -268,13 +277,15 @@ def main():
         check_ranges(net, calib)
         depth = net.depth
         boots, budget = fheml.auto_bootstrap(net, calib, level_budget=level_budget, max_ring=1 << 16,
-                                             key_switch_digits=args.digits)
+                                             key_switch_digits=args.digits,
+                                             bootstrap_iterations=args.boot_iterations)
         print(f"auto_bootstrap: depth {depth} -> {net.depth}, {boots} bootstraps, at most {budget} levels between them")
     net.compile()
     print(net.summary())
 
     t = time.time()
-    overrides = {"level_budget": level_budget, "key_switch_digits": args.digits}
+    overrides = {"level_budget": level_budget, "key_switch_digits": args.digits,
+                 "bootstrap_iterations": args.boot_iterations}
     if args.ring or (args.insecure and net.uses_bootstrapping):
         overrides["ring_dim"] = args.ring or 4096
     ctx = fheml.make_context(net, secure=not args.insecure, rotation_window=args.window, **overrides)

@@ -876,6 +876,36 @@ void encrypted_tests(bool quick) {
   }
 }
 
+// Iterative bootstrapping (ContextOptions::bootstrap_iterations = 2): one
+// more level, a measured precision, a much smaller error than one bootstrap.
+void iterative_bootstrap_tests() {
+  double err[2] = {0, 0};
+  for (uint32_t it : {1u, 2u}) {
+    ContextOptions o;
+    o.mult_depth = 2;
+    o.slots = 256;
+    o.secure = false;
+    o.ring_dim = 4096;
+    o.bootstrapping = true;
+    o.scale_mod_bits = 50;
+    o.first_mod_bits = 57;
+    o.bootstrap_iterations = it;
+    FHEContext ctx(o);
+    ctx.keygen({});
+    auto x = rand_vec(o.slots, -0.9, 0.9);
+    Ctxt b = ctx.bootstrap(ctx.encrypt(x, ctx.bootstrap_depth() + o.mult_depth - 1));
+    check(FHEContext::level(b) == ctx.bootstrap_depth(),
+          "bootstrap with " + std::to_string(it) + " iteration(s) lands at bootstrap_depth()",
+          "(level " + std::to_string(FHEContext::level(b)) + ", depth " + std::to_string(ctx.bootstrap_depth()) + ")");
+    // The stretch after it still holds mult_depth products.
+    Ctxt y = ctx.cc()->EvalMult(ctx.cc()->EvalMult(b, b), b);
+    auto got = ctx.decrypt(y, o.slots);
+    for (uint32_t i = 0; i < o.slots; ++i) err[it - 1] = std::max(err[it - 1], std::fabs(got[i] - x[i] * x[i] * x[i]));
+  }
+  check(err[1] < err[0] / 10, "iterative bootstrapping is 10x more precise",
+        "(" + std::to_string(err[0]) + " vs " + std::to_string(err[1]) + ")");
+}
+
 // Rotations composed from a ladder of keys (ContextOptions::rotation_window).
 void ladder_tests() {
   for (uint32_t window : {1u, 3u}) {
@@ -1186,6 +1216,7 @@ int main(int argc, char** argv) {
   bool quick = argc > 1 && std::strcmp(argv[1], "--quick") == 0;
   cleartext_tests();
   ladder_tests();
+  if (!quick && !gpu_backend_built()) iterative_bootstrap_tests();
   placement_tests(quick);
   backend_tests();
   encrypted_tests(quick);

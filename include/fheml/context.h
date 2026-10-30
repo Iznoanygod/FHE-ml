@@ -29,6 +29,13 @@ struct ContextOptions {
   bool secure = true;
   bool bootstrapping = false;
   std::vector<uint32_t> level_budget = {3, 3};
+  // 2 = OpenFHE's iterative bootstrapping: the residual error of a first
+  // bootstrap is bootstrapped again, which roughly doubles the bits of
+  // precision (about 10 -> 20 at 50-bit scaling) for twice the time and one
+  // more level (counted in bootstrap_depth()). bootstrap_precision is the
+  // precision in bits of a single bootstrap; 0 measures it in keygen().
+  uint32_t bootstrap_iterations = 1;
+  uint32_t bootstrap_precision = 0;
   // Rotation keys. 0: keygen() makes one key per rotation index it is given.
   // w > 0: keygen() also makes a ladder of keys for +-j * 2^(w*i), 1 <= j <=
   // 2^(w-1), and rotate() composes every other rotation from them, so the key
@@ -178,6 +185,7 @@ class FHEContext {
   uint32_t compare_plaintext_mod_ = 0;
   uint32_t total_depth_ = 0;
   uint32_t boot_depth_ = 0;
+  uint32_t boot_precision_ = 0;  // bits of one bootstrap (iterative bootstrapping)
   struct PlanCache {
     std::mutex mu;
     std::map<std::vector<int32_t>, std::shared_ptr<const RotationPlan>> plans;
