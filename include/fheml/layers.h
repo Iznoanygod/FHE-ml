@@ -419,7 +419,7 @@ class MaxPool2d : public Layer {
 // which are fresh at compare_depth() whatever the input level: the layer
 // costs compare_depth() + rounds + 3 levels, and past a bootstrap its output
 // sits `rounds` levels into the stretch (the comparisons come back above a
-// bootstrap's output level) while its input needs rounds + 2 levels left.
+// bootstrap's output level) while its input needs rounds + 3 levels left.
 //
 // The network sets ContextOptions::compare_slots to the span the
 // comparisons touch (blocks x block), so the scheme-switching keys stay
@@ -448,6 +448,13 @@ class ArgMax : public Layer {
   size_t compare_span() const override { return static_cast<size_t>(blocks()) * block(); }
   bool composes_rotations() const override { return true; }
   void set_bootstrapped(bool on) override { bootstrapped_ = on; }
+  // Past a bootstrap, a tournament longer than the stretch refreshes its
+  // running maxima (bounded by range) before the comparison that would not
+  // fit; the "still winning" bits never need it (see level_after()).
+  bool can_self_bootstrap() const override { return true; }
+  void set_self_bootstrapping(bool on) override { self_ = on; }
+  bool self_bootstrapping() const override { return self_; }
+  uint32_t internal_bootstraps(uint32_t d, uint32_t budget) const override;
   void compile(uint32_t slots) override;
   size_t min_slots() const override;
   void save(std::ostream& os) const override;
@@ -483,8 +490,13 @@ class ArgMax : public Layer {
   bool over_channels_;
   double gain_ = 1.0;
   bool bootstrapped_ = false;
+  bool self_ = false;
   uint32_t slots_ = 0;
   LinearTransform gather_, scatter_;
+  // Walks the value chain entered at stretch level d with `top` levels in
+  // the stretch: false when it does not fit; refreshes counts the
+  // refreshes it needs.
+  bool plan_chain(uint32_t d, uint32_t top, uint32_t* refreshes) const;
   std::vector<double> pad_;  // -range in the extra class blocks (times the gather's scale: none)
 };
 
