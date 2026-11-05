@@ -9,7 +9,8 @@ encrypted.
 
 mlp is the fully connected 784-200-10 sigmoid network of the original
 prototype, run fully encrypted; mlp-poly is the same with the quadratic
-activation. mnist_mlp_cnn.py runs mlp, mlp-poly and cnn side by side.
+activation. mlp-deep / mlp-deep-poly are the deeper 784-512-256-128-10
+versions. mnist_mlp_cnn.py runs mlp, mlp-poly and cnn side by side.
 
 The model is ordinary torch code: torch.nn layers plus the polynomial
 activation / attention modules in fheml.nn, which compute exactly what the
@@ -52,27 +53,32 @@ from fhe_eval import check_ranges, check_softmax_ranges  # noqa: E402,F401
 
 N_TOK, PATCH, D, HID = 16, 49, 32, 64
 HIDDEN, SIGMOID_RANGE = 200, 16.0
+DEEP_HIDDEN = (512, 256, 128)
 
 
 MLP_LR = 1e-2
 
 
-def mlp(act="sigmoid"):
+def mlp(act="sigmoid", hidden=(HIDDEN,)):
     # The fully connected 784-200-10 network of the 2022 prototype (legacy/).
     # There the client decrypted the hidden layer, applied the sigmoid in the
     # clear and re-encrypted it; here the sigmoid is a degree-15 Chebyshev
     # series on [-16, 16] (6 levels) and the whole network stays encrypted.
-    # BatchNorm, folded into the first layer on export, and the range loss
-    # keep the pre-activations inside the interval (a few test values still
-    # land just outside; the accuracies count them). The sigmoid saturates,
-    # so it trains with lr 1e-2 (MLP_LR) instead of 2e-3. The prototype's output sigmoid is
-    # dropped: it is monotone, so the argmax is unchanged. act="poly" swaps
-    # the sigmoid for the CNN's quadratic (1 level).
-    activation = hnn.Poly([0, 0.5, 0.25]) if act == "poly" else \
-        hnn.Chebyshev("sigmoid", -SIGMOID_RANGE, SIGMOID_RANGE, 15)
-    return nn.Sequential(
-        nn.Flatten(), nn.Linear(784, HIDDEN), nn.BatchNorm1d(HIDDEN), activation,
-        nn.Linear(HIDDEN, 10))
+    # BatchNorm, folded into the preceding layer on export, and the range
+    # loss keep the pre-activations inside the interval (a few test values
+    # still land just outside; the accuracies count them). The sigmoid
+    # saturates, so it trains with lr 1e-2 (MLP_LR) instead of 2e-3. The
+    # prototype's output sigmoid is dropped: it is monotone, so the argmax is
+    # unchanged. act="poly" swaps the sigmoid for the CNN's quadratic (1
+    # level). hidden= gives the hidden widths; DEEP_HIDDEN is the deeper
+    # 784-512-256-128-10 variant (mlp-deep, mlp-deep-poly).
+    layers, width = [nn.Flatten()], 784
+    for h in hidden:
+        activation = hnn.Poly([0, 0.5, 0.25]) if act == "poly" else \
+            hnn.Chebyshev("sigmoid", -SIGMOID_RANGE, SIGMOID_RANGE, 15)
+        layers += [nn.Linear(width, h), nn.BatchNorm1d(h), activation]
+        width = h
+    return nn.Sequential(*layers, nn.Linear(width, 10))
 
 
 def cnn():
@@ -170,7 +176,7 @@ def patchify14(x):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arch", choices=("mlp", "mlp-poly", "cnn", "vit", "deepcnn", "poolcnn", "poolcnn-s1", "lnvit", "lnvit16"), default="cnn")
+    ap.add_argument("--arch", choices=("mlp", "mlp-poly", "mlp-deep", "mlp-deep-poly", "cnn", "vit", "deepcnn", "poolcnn", "poolcnn-s1", "lnvit", "lnvit16"), default="cnn")
     ap.add_argument("--exact-relu", type=float, nargs="?", const=8.0, default=None, metavar="RANGE",
                     help="deepcnn: train with nn.ReLU and run it as the exact scheme-switching ReLU on "
                     "[-RANGE, RANGE] (default 8)")
@@ -179,20 +185,21 @@ def main():
 
     torch.manual_seed(args.seed)
     data = load_mnist(args.data)
-    prep = {"mlp": lambda x: x, "mlp-poly": lambda x: x, "cnn": lambda x: x, "vit": patchify, "deepcnn": pool2, "poolcnn": pool2, "poolcnn-s1": pool2, "lnvit": patchify14,
+    prep = {"mlp": lambda x: x, "mlp-poly": lambda x: x, "mlp-deep": lambda x: x, "mlp-deep-poly": lambda x: x, "cnn": lambda x: x, "vit": patchify, "deepcnn": pool2, "poolcnn": pool2, "poolcnn-s1": pool2, "lnvit": patchify14,
             "lnvit16": patchify}[args.arch]
     xtr, ytr = torch.tensor(prep(data["train_x"]), dtype=torch.float32), torch.tensor(data["train_y"]).long()
     xte, yte = torch.tensor(prep(data["test_x"]), dtype=torch.float32), torch.tensor(data["test_y"]).long()
 
     if args.exact_relu and args.arch != "deepcnn":
         ap.error("--exact-relu is for --arch deepcnn")
-    model = {"mlp": mlp, "mlp-poly": lambda: mlp("poly"), "cnn": cnn, "vit": vit, "deepcnn": lambda: deepcnn(bool(args.exact_relu)), "poolcnn": poolcnn,
+    model = {"mlp": mlp, "mlp-poly": lambda: mlp("poly"), "mlp-deep": lambda: mlp("sigmoid", DEEP_HIDDEN),
+             "mlp-deep-poly": lambda: mlp("poly", DEEP_HIDDEN), "cnn": cnn, "vit": vit, "deepcnn": lambda: deepcnn(bool(args.exact_relu)), "poolcnn": poolcnn,
              "poolcnn-s1": lambda: poolcnn(4, 1), "lnvit": lambda: lnvit(4), "lnvit16": lambda: lnvit(16)}[args.arch]()
-    epochs = args.epochs or {"mlp": 5, "mlp-poly": 5, "cnn": 3, "vit": 15, "deepcnn": 4, "poolcnn": 4, "poolcnn-s1": 4, "lnvit": 10,
+    epochs = args.epochs or {"mlp": 5, "mlp-poly": 5, "mlp-deep": 5, "mlp-deep-poly": 5, "cnn": 3, "vit": 15, "deepcnn": 4, "poolcnn": 4, "poolcnn-s1": 4, "lnvit": 10,
                              "lnvit16": 10}[args.arch]
-    acc, train_time = fhe_eval.train(model, xtr, ytr, xte, yte, epochs, lr=MLP_LR if args.arch == "mlp" else 2e-3)
+    acc, train_time = fhe_eval.train(model, xtr, ytr, xte, yte, epochs, lr=MLP_LR if args.arch in ("mlp", "mlp-deep") else 2e-3)
 
-    shape = {"mlp": (1, 28, 28), "mlp-poly": (1, 28, 28), "cnn": (1, 28, 28), "vit": (N_TOK, PATCH), "deepcnn": (1, 14, 14), "poolcnn": (1, 14, 14), "poolcnn-s1": (1, 14, 14),
+    shape = {"mlp": (1, 28, 28), "mlp-poly": (1, 28, 28), "mlp-deep": (1, 28, 28), "mlp-deep-poly": (1, 28, 28), "cnn": (1, 28, 28), "vit": (N_TOK, PATCH), "deepcnn": (1, 14, 14), "poolcnn": (1, 14, 14), "poolcnn-s1": (1, 14, 14),
              "lnvit": (4, PATCH), "lnvit16": (N_TOK, PATCH)}[args.arch]
     if args.arch.startswith("lnvit"):
         check_softmax_ranges(model, xte[:2000])

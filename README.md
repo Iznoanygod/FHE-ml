@@ -283,19 +283,26 @@ Chebyshev series on [-16, 16] instead of a decrypt-sigmoid-re-encrypt round
 trip through the client. `--arch mlp-poly` is the same network with the
 CNN's quadratic activation. `examples/python/mnist_mlp_cnn.py` trains the
 MLPs and the CNN on the full 28×28 images and runs them side by side
-(128-bit, no bootstrapping, 6 encrypted test images each, all 6 agreeing
-with torch):
+(128-bit, no bootstrapping; 6 encrypted test images each for the shallow
+models and 3-4 for the deep ones, all agreeing with torch). `--arch mlp-deep`
+and `mlp-deep-poly` are 784-512-256-128-10 versions of the two MLPs:
 
 | Model | Parameters | Accuracy (torch, 10k) | Depth | Ring | Rotation keys | s / image | max \|enc − torch\| |
 |---|---|---|---|---|---|---|---|
 | MLP 784-200-10, Chebyshev sigmoid | 159,410 | 97.1% | 8 | 2^15 | 49 (882 MB) | 4.0 | 5e-7 |
 | MLP 784-200-10, quadratic | 159,410 | 98.2% | 4 | 2^14 | 49 (257 MB) | 0.9 | 3e-7 |
+| MLP 784-512-256-128-10, Chebyshev sigmoid | 569,226 | 98.3% | 22 | 2^16 | 93 (8.1 GB) | 78 | 2e-6 |
+| MLP 784-512-256-128-10, quadratic | 569,226 | 98.8% | 10 | 2^15 | 93 (2.1 GB) | 16 | 6e-7 |
 | CNN (conv 5×5/2, 845-64-10), quadratic | 54,934 | 98.4% | 7 | 2^15 | 55 (907 MB) | 3.0 | 1e-6 |
 
 The dense 784→200 layer packs into 455 diagonals in 1024 slots, so the
 quadratic MLP is the cheapest model here; the sigmoid series costs six levels
 where the quadratic costs two, which doubles the ring and quadruples the time.
-The CNN reaches the best accuracy with a third of the parameters, and
+Three hidden layers lift the sigmoid MLP from 97.1% to 98.3% and the
+quadratic one from 98.2% to 98.8%, but the 784→512 layer needs all 1024 diagonals and every layer adds
+rotation keys, so the deep MLPs cost 16 s (quadratic) and 78 s (sigmoid,
+whose depth 22 needs ring 2^16) per image. The CNN gets 98.4% with a tenth
+of the deep MLP's parameters, and
 multiplexed packing (`--packing multiplexed`: 2048 slots, 40 keys, 660 MB)
 brings it to 2.6 s per image.
 
