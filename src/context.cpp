@@ -483,23 +483,40 @@ Ctxt FHEContext::compare(const Ctxt& a, const Ctxt& b, double range, size_t coun
   }
   // OpenFHE's slots-to-coefficients matrix needs a power-of-two count.
   uint32_t n = 1;
-  while (n < count && n < cs) n *= 2;
-  if (!count) n = cs;
-  if (count > cs) throw std::invalid_argument("compare: count exceeds ContextOptions::compare_slots");
+  while (n < count && n < opts_.slots) n *= 2;
+  if (!count) n = opts_.slots;
   if (cs == opts_.slots) return cc_->EvalCompareSchemeSwitching(a, b, n, opts_.slots);
   // Fewer compared slots than the ciphertext holds: a - b, masked to the
   // compared slots, folded onto period cs, is what a cs-slot (sparsely
-  // packed) ciphertext with those values looks like.
-  Ctxt d = cc_->EvalSub(a, b);
-  std::vector<double> mask(opts_.slots, 0.0);
-  std::fill(mask.begin(), mask.begin() + n, 1.0);
-  d = cc_->EvalMult(d, encode(mask, level(d)));
-  for (uint32_t s = cs; s < opts_.slots; s *= 2) cc_->EvalAddInPlace(d, rotate(d, static_cast<int32_t>(s)));
-  // The result is a cs-slot (sparsely packed) ciphertext: as a full one it
-  // repeats with period cs.
-  Ctxt r = cc_->EvalCompareSchemeSwitching(d, cc_->EvalSub(d, d), n, cs);
-  r->SetSlots(opts_.slots);
-  return r;
+  // packed) ciphertext with those values looks like. The result is a cs-slot
+  // ciphertext too: as a full one it repeats with period cs.
+  const Ctxt d = cc_->EvalSub(a, b);
+  auto switch_chunk = [&](Ctxt x, uint32_t m) {
+    for (uint32_t s = cs; s < opts_.slots; s *= 2) cc_->EvalAddInPlace(x, rotate(x, static_cast<int32_t>(s)));
+    Ctxt r = cc_->EvalCompareSchemeSwitching(x, cc_->EvalSub(x, x), m, cs);
+    r->SetSlots(opts_.slots);
+    return r;
+  };
+  if (n <= cs) {
+    std::vector<double> mask(opts_.slots, 0.0);
+    std::fill(mask.begin(), mask.begin() + n, 1.0);
+    return switch_chunk(cc_->EvalMult(d, encode(mask, level(d))), n);
+  }
+  // More slots than one switch holds (compare_slots caps the switching
+  // keys): cs slots at a time, each chunk rotated to the front, compared,
+  // and its result masked back into place (one more level). The result is
+  // [a < b] in the first n slots and 0 elsewhere.
+  std::vector<double> front(opts_.slots, 0.0);
+  std::fill(front.begin(), front.begin() + cs, 1.0);
+  Ctxt out;
+  for (uint32_t k = 0; k * cs < n; ++k) {
+    const Ctxt dk = k ? rotate(d, static_cast<int32_t>(k * cs)) : d;
+    Ctxt r = switch_chunk(cc_->EvalMult(dk, encode(front, level(dk))), cs);
+    r = cc_->EvalMult(r, encode(front, level(r)));
+    if (k) r = rotate(r, -static_cast<int32_t>(k * cs));
+    out = out ? cc_->EvalAdd(out, r) : r;
+  }
+  return out;
 #endif
 }
 
