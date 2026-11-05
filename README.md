@@ -834,7 +834,35 @@ PYTHONPATH=build/python python3 examples/python/rnn_sequences.py --task sst2 --c
 PYTHONPATH=build/python python3 examples/python/rnn_sequences.py --task agnews --cell rnn --bootstrap --insecure --n 3
 ```
 
-RESULTS_TABLE
+Measured on 4 cores at toy parameters (insecure ring, 55-bit scaling,
+10 levels per stretch for the RNN and 12 for GRU/LSTM), hidden size 32,
+3 encrypted test sequences per model:
+
+| | Accuracy (torch, whole test set) | fheml plaintext (first 1000) | Ring, slots | Bootstraps per sequence | Time per sequence | Encrypted vs torch logits |
+| --- | --- | --- | --- | --- | --- | --- |
+| Sequential MNIST, RNN | 86.8% | 83.3% (torch on them 83.3%) | 4096, 1024 | 13 | 24 s | 7e-5 to 2e-4, 3/3 same class |
+| Sequential MNIST, GRU | 96.4% | 96.0% (96.0%) | 8192, 4096 | 27 | 192 s | 1e-3 to 2e-3, 3/3 |
+| Sequential MNIST, LSTM | 97.0% | 95.9% (96.4%) | 8192, 4096 | 34 | 228 s | 2e-3 to 4e-3, 3/3 |
+| SST-2, RNN | 79.5% | 78.4% (78.4%) | 4096, 1024 | 15 | 25 s | 1e-5 to 8e-5, 3/3 |
+| SST-2, GRU | 79.8% | 79.0% (79.0%) | 8192, 4096 | 31 | 213 s | 4e-4 to 3e-3, 3/3 |
+| SST-2, LSTM | 81.4% | 81.3% (81.3%) | 8192, 4096 | 39 | 262 s | 7e-4 to 2e-3, 3/3 |
+| AG News, RNN | 87.3% | 87.2% (87.2%) | 4096, 512 | 7 | 11 s | 2e-5 to 4e-5, 3/3 |
+| AG News, GRU | 89.1% | 88.6% (88.6%) | 4096, 2048 | 15 | 45 s | 3e-4 to 1e-3, 3/3 |
+| AG News, LSTM | 88.9% | 88.3% (88.3%) | 4096, 2048 | 19 | 55 s | 6e-4 to 2e-3, 3/3 |
+
+Sequential MNIST has 28 steps, SST-2 32 and AG News 16. Peak memory stays
+at 1.7 to 4.4 GB (0.6 to 1.6 GB of rotation keys). Bootstrapping takes
+about three quarters of the time, so the cost follows the bootstrap count:
+GRU and LSTM need one per step at 12 levels plus the refreshes of their
+gates, the RNN one per two steps. Text is padded on the left, so the last
+state the classifier reads comes right after the last word. The
+"fheml plaintext" column is the encrypted computation in the clear: where
+it trails torch, a few test inputs push a gate or cell state outside its
+series interval (4 of 200 sequential-MNIST inputs for the LSTM, none for
+the text models), which training cannot rule out for unseen data. With
+50-bit scaling the bootstraps at 4096 slots lose most of their precision
+(logit errors around 5e-2); with 59 bits values near 1 occasionally wrap
+around in the bootstrap, so the script uses 55 (`--scale-bits`).
 
 ## Encrypted training
 

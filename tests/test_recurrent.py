@@ -60,7 +60,7 @@ assert torch.equal(twin.weight_hh, lstm.weight_hh_l0) and torch.equal(twin.bias_
 with torch.no_grad():
     x = torch.rand(2, T, I) - 0.5
     gap = (twin(x) - lstm(x)[0]).abs().max().item()
-assert gap < 1e-2, gap  # series vs exact sigmoid/tanh
+assert gap < 0.1, gap  # degree-13 series on [-16, 16] / [-8, 8] vs the exact sigmoid/tanh
 try:
     fheml.from_torch(nn.Sequential(lstm), (T, I))
     raise AssertionError("nn.LSTM must be rejected")
@@ -69,7 +69,7 @@ except ValueError:
 
 # range_loss sees the recurrent series while training.
 twin.train()
-twin(10 * torch.ones(1, T, I))
+twin(100 * torch.ones(1, T, I))
 assert hnn.range_loss(twin) > 0
 twin.eval()
 
