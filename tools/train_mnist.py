@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Train an HE-friendly CNN on MNIST with numpy and export it for fheml.
+"""Train the quadratic-activation MNIST CNN with numpy and export it for fheml.
+
+This is the dependency-free reference version of the example CNN; the
+bundled models/mnist_cnn.fheml is the same shape with ReLU activations,
+trained in PyTorch (examples/python/train_torch_mnist.py --arch cnn).
 
 The architecture follows CryptoNets/LoLa, with the square activation replaced
 by the quadratic f(x) = 0.5 x + 0.25 x^2 (the 2nd-order Taylor expansion of
@@ -12,7 +16,7 @@ SiLU around 0), which trains more stably than x^2 and costs 2 CKKS levels:
     dense 64 -> 10
 
 Usage:
-    python3 tools/train_mnist.py --data data --out models/mnist_cnn.fheml \
+    python3 tools/train_mnist.py --data data --out models/mnist_cnn_poly.fheml \
         --samples models/mnist_test_samples.txt
 Only numpy is required. MNIST is downloaded into --data if missing.
 """
@@ -190,7 +194,7 @@ def export_samples(data, path, n):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data")
-    ap.add_argument("--out", default="models/mnist_cnn.fheml")
+    ap.add_argument("--out", default="models/mnist_cnn_poly.fheml")
     ap.add_argument("--samples", default="models/mnist_test_samples.txt")
     ap.add_argument("--num-samples", type=int, default=200)
     ap.add_argument("--epochs", type=int, default=6)
