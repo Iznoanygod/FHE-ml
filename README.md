@@ -45,11 +45,18 @@ That code is kept in [`legacy/`](legacy/) for reference.
     square root on a calibrated variance interval (10–12 levels).
   * `Residual` and `TokenMean` complete the block.
   * See [docs/DESIGN.md](docs/DESIGN.md#transformers).
+* **Recurrent networks.** `Recurrent` is an Elman RNN, GRU or LSTM over a
+  token sequence with its real activations (sigmoid gates and tanh as
+  Chebyshev series). All time steps advance together in SIMD, the gates
+  share one series evaluation, and the layer bootstraps its own state
+  inside the recurrence. See [Recurrent networks](#recurrent-networks).
 * **A Python package**, `import fheml`, wraps the same API with numpy in and
   numpy out.
 * **A PyTorch exporter.** Train with `torch.nn` layers plus the HE-friendly
   modules in `fheml.nn` (polynomial activations, polynomial attention), then
   `fheml.from_torch(model, input_shape)` gives the encrypted network.
+  `fheml.nn.RNN`, `GRU` and `LSTM` are torch's recurrent cells with the
+  series the encrypted layer evaluates.
 * **Encrypted training.** `Trainer` runs SGD with backpropagation entirely on
   ciphertexts: encrypted inputs, labels, weights, activations and gradients.
   The encrypted weights are bootstrapped after every update. Freezing the
@@ -782,6 +789,51 @@ attention loses nothing in accuracy against softmax on these short texts
 faster when the token blocks are wide (SST-2): each head's window sums and
 broadcasts need log2(d/heads) rotations instead of log2(d).
 
+## Recurrent networks
+
+`fheml.Recurrent` (torch twins `fheml.nn.RNN`, `GRU`, `LSTM`) runs a
+single-layer recurrent network over a token sequence, with the weights in
+torch's layout (`load_torch(layer)` copies a trained `nn.RNN` / `nn.GRU` /
+`nn.LSTM` in). It outputs every hidden state, so layers stack, or only the
+last one (`last=True`) for a classifier. The cells keep their real
+activations: the gates' sigmoid is a Chebyshev series on [-gate_a, gate_a]
+(default 8, degree 13), the tanh of the RNN, the GRU candidate and the LSTM
+cell one on [-a, a] (default 4). The LSTM's candidate gate uses
+tanh(x) = 2 sigmoid(2x) - 1, so all four gates share one series evaluation.
+
+```python
+from fheml import nn as hnn
+model = torch.nn.Sequential(hnn.LSTM(28, 32, last=True), torch.nn.Linear(32, 10))
+# ... train (fhe_eval.train adds range_loss, which keeps the series inside their intervals) ...
+net = fheml.from_torch(model, (28, 28))   # 28 time steps of 28 features
+fheml.auto_bootstrap(net, calibration)    # the layer bootstraps its own state
+```
+
+Under encryption all time steps advance together: the state ciphertext
+holds every token's hidden state and one step updates all of them (see
+[docs/DESIGN.md](docs/DESIGN.md#recurrent-layers)). After n steps the result
+is exactly the sequential recurrence, with the same depth: 5 levels per step
+for the RNN and 12 for GRU and LSTM at degree 13. A sequence is therefore
+always deeper than one bootstrapping stretch, and the layer refreshes its
+state whenever the next step would not fit (one bootstrap per RNN step,
+three per GRU or LSTM step at a 5-level budget). Everything it bootstraps
+lies in [-1, 1] by construction, so no scaling levels are spent.
+`Recurrent.series_ranges(xs)` (printed by `fhe_eval.check_ranges`) reports
+how far the series arguments go on real data, at every encrypted step.
+
+`examples/python/rnn_sequences.py` trains RNN, GRU and LSTM classifiers on
+sequential MNIST (the image read row by row, 28 steps of 28 pixels), SST-2
+and AG News (word vectors from the client's embedding lookup, as for the
+text transformers) and runs them encrypted:
+
+```sh
+PYTHONPATH=build/python python3 examples/python/rnn_sequences.py --task smnist --cell lstm --bootstrap --insecure --n 3
+PYTHONPATH=build/python python3 examples/python/rnn_sequences.py --task sst2 --cell gru --bootstrap --insecure --n 3
+PYTHONPATH=build/python python3 examples/python/rnn_sequences.py --task agnews --cell rnn --bootstrap --insecure --n 3
+```
+
+RESULTS_TABLE
+
 ## Encrypted training
 
 `Trainer` trains a network on encrypted data. The client encrypts inputs and
@@ -1046,9 +1098,9 @@ still need their own key).
 | --- | --- |
 | `include/fheml/`, `src/` | the library: backend selection (`backend.h`: OpenFHE or FIDESlib), context, linear transforms, layers, network, encrypted training (`train.h`) |
 | `examples/` | `mnist_cnn` (encrypted MNIST), `conv_demo` (network built in code), `packing_bench` (gapped vs compact vs multiplexed packing) and `rotation_bench` (hoisted rotation trees vs. plain composed rotations) |
-| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py`, `test_eval.py`, `test_g2p.py` (the encoder-decoder example) |
+| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py`, `test_eval.py`, `test_g2p.py` (the encoder-decoder example), `test_recurrent.py` (RNN, GRU, LSTM) |
 | `python/` | pybind11 bindings and the `fheml` Python package (`fheml.nn` + `fheml.from_torch`: PyTorch export) |
-| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `mnist_mlp_cnn.py` compares the MLP and CNN; `train_encrypted_mnist.py` trains on encrypted data; `text_transformer.py` classifies text (AG News, SST-2) with encoder transformers; `g2p_transformer.py` is an encoder-decoder (CMUdict grapheme to phoneme) decoded greedily under encryption |
+| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `mnist_mlp_cnn.py` compares the MLP and CNN; `train_encrypted_mnist.py` trains on encrypted data; `text_transformer.py` classifies text (AG News, SST-2) with encoder transformers; `rnn_sequences.py` runs RNN, GRU and LSTM classifiers (sequential MNIST, SST-2, AG News); `g2p_transformer.py` is an encoder-decoder (CMUdict grapheme to phoneme) decoded greedily under encryption |
 | `tools/train_mnist.py`, `tools/train_transformer.py` | HE-friendly CNN / transformer training and export (numpy) |
 | `models/` | trained example models and 200 test images |
 | `legacy/` | the original PALISADE capstone code |
