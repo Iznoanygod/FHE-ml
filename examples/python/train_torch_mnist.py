@@ -2,9 +2,18 @@
 encrypted.
 
     PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch cnn [--n 3] [--insecure]
+    PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch mlp
     PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch vit
     PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch deepcnn --bootstrap
     PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch deepcnn --bootstrap --exact-relu
+
+The MNIST baselines run on the full 28x28 image, fully encrypted, with
+Chebyshev ReLU or sigmoid activations: mlp is the 784-200-10 sigmoid network
+of the original prototype, mlp-relu the same with ReLU, mlp-deep /
+mlp-deep-relu are 784-512-256-128-10 versions, and cnn is a
+CryptoNets-shaped CNN with ReLUs. The -poly variants (mlp-poly,
+mlp-deep-poly, cnn-poly) use the quadratic activation of CryptoNets for
+comparison. mnist_mlp_cnn.py runs them side by side.
 
 The model is ordinary torch code: torch.nn layers plus the polynomial
 activation / attention modules in fheml.nn, which compute exactly what the
@@ -19,15 +28,16 @@ fheml.ExactReLU (sign through CKKS<->FHEW scheme switching): no approximation
 error and one level per ReLU past a bootstrap, but one FHEW bootstrap per
 slot per ReLU, so encrypted inference is far slower.
 
-poolcnn is a small CNN with exact max pooling (CKKS <-> FHEW scheme
+poolcnn is a small ReLU CNN with exact max pooling (CKKS <-> FHEW scheme
 switching; one FHEW bootstrap per compared slot, so it keeps the pooled
-feature map in few slots). lnvit / lnvit16 are vision transformers with
+feature map in few slots); at 30 levels it needs --bootstrap.
+poolcnn-poly is the quadratic version, 22 levels without bootstrapping. lnvit / lnvit16 are vision transformers with
 pre-norm LayerNorm, multi-head softmax attention and a GELU MLP block, on 4
 tokens (14x14 image, 7x7 patches) or 16 tokens (28x28): about 60 levels, so
 --bootstrap is needed at 128-bit security; layer norm and softmax attention
 then bootstrap internally (see Network.place_bootstraps).
 
-    PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch poolcnn
+    PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch poolcnn --bootstrap --insecure
     PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch lnvit --bootstrap --window 1 --level-budget 3 --digits 4
 """
 import argparse
@@ -46,15 +56,64 @@ from datasets import load_mnist  # noqa: E402
 from fhe_eval import check_ranges, check_softmax_ranges  # noqa: E402,F401
 
 N_TOK, PATCH, D, HID = 16, 49, 32, 64
+HIDDEN, SIGMOID_RANGE, RELU_RANGE = 200, 16.0, 8.0
+DEEP_HIDDEN = (512, 256, 128)
+MLP_LR = 1e-2
 
 
-def cnn():
-    # CryptoNets/LoLa shape. from_torch folds BatchNorm into the convolution,
-    # so it costs nothing under encryption.
+def activation(act):
+    """The hidden activation of the MNIST MLPs and CNNs, as encrypted
+    inference computes it: relu (degree-15 Chebyshev on [-8, 8]) or sigmoid
+    (degree 15 on [-16, 16]), 6 levels each once the interval is folded into
+    the preceding layer; poly is the CryptoNets quadratic 0.5x + 0.25x^2
+    (2 levels), kept as the cheap comparison point."""
+    if act == "poly":
+        return hnn.Poly([0, 0.5, 0.25])
+    r = SIGMOID_RANGE if act == "sigmoid" else RELU_RANGE
+    return hnn.Chebyshev(act, -r, r, 15)
+
+
+def mlp(act="sigmoid", hidden=(HIDDEN,)):
+    # Fully connected network, 784-200-10 by default: the network of the 2022
+    # prototype (legacy/). There the client decrypted the hidden layer,
+    # applied the sigmoid in the clear and re-encrypted it; here every
+    # activation is a Chebyshev series and the whole network stays
+    # encrypted. BatchNorm, folded into the preceding layer on export, and
+    # the range loss keep the pre-activations inside the series' interval (a
+    # few test values still land just outside; the accuracies count them).
+    # The sigmoid saturates, so the sigmoid MLPs train with lr 1e-2 (MLP_LR)
+    # instead of 2e-3. The prototype's output sigmoid is dropped: it is
+    # monotone, so the argmax is unchanged. hidden= gives the hidden widths;
+    # DEEP_HIDDEN is the deeper 784-512-256-128-10 network.
+    layers, width = [nn.Flatten()], 784
+    for h in hidden:
+        layers += [nn.Linear(width, h), nn.BatchNorm1d(h), activation(act)]
+        width = h
+    return nn.Sequential(*layers, nn.Linear(width, 10))
+
+
+def cnn(act="relu"):
+    # CryptoNets/LoLa shape: 5x5 stride-2 convolution with 5 channels, a
+    # 845-64 dense layer and a 64-10 head. from_torch folds BatchNorm into
+    # the preceding layer, so it costs nothing under encryption. act="poly"
+    # is the original CryptoNets network with quadratic activations.
     return nn.Sequential(
-        nn.Conv2d(1, 5, 5, stride=2, padding=1), nn.BatchNorm2d(5), hnn.Poly([0, 0.5, 0.25]),
-        nn.Flatten(), nn.Linear(845, 64), hnn.Poly([0, 0.5, 0.25]),
+        nn.Conv2d(1, 5, 5, stride=2, padding=1), nn.BatchNorm2d(5), activation(act),
+        nn.Flatten(), nn.Linear(845, 64), nn.BatchNorm1d(64), activation(act),
         nn.Linear(64, 10))
+
+
+# The MNIST baselines on full 28x28 images: builder, epochs, learning rate.
+BASELINES = {
+    "mlp": (lambda: mlp("sigmoid"), 5, MLP_LR),
+    "mlp-relu": (lambda: mlp("relu"), 5, 2e-3),
+    "mlp-poly": (lambda: mlp("poly"), 5, 2e-3),
+    "mlp-deep": (lambda: mlp("sigmoid", DEEP_HIDDEN), 5, MLP_LR),
+    "mlp-deep-relu": (lambda: mlp("relu", DEEP_HIDDEN), 5, 2e-3),
+    "mlp-deep-poly": (lambda: mlp("poly", DEEP_HIDDEN), 5, 2e-3),
+    "cnn": (lambda: cnn("relu"), 3, 2e-3),
+    "cnn-poly": (lambda: cnn("poly"), 3, 2e-3),
+}
 
 
 def deepcnn(exact_relu=False):
@@ -74,24 +133,27 @@ def deepcnn(exact_relu=False):
         nn.Linear(32, 10))
 
 
-def poolcnn(channels=4, stride=2):
-    # conv -> exact 2x2 max pool -> square-ish polynomial -> dense head. The
-    # pool gathers its four taps into blocks of M slots (M = the pooled size
-    # rounded up to a power of two) and compares 2M then M slots, one FHEW
-    # bootstrap each: with the default 4 channels at stride 2 (4x7x7 ->
-    # 4x3x3, M = 64) that is 192, and the network fits 256 slots, the most
-    # whose 128-bit scheme-switching and rotation keys fit in 14 GB.
-    # poolcnn-s1 (stride 1, 4x14x14 -> 4x7x7, M = 256) is more accurate but
-    # needs 1024 slots. The pool costs 15 levels (12 for the FHEW-to-CKKS
-    # decoding of each comparison), 22 in all: it fits ring 2^16 without
-    # bootstrapping. The pool's inputs must stay in [-POOL_RANGE, POOL_RANGE]
-    # (the comparison wraps around beyond it).
+def poolcnn(channels=4, stride=2, act="relu"):
+    # conv -> ReLU -> exact 2x2 max pool -> dense -> ReLU -> dense, the usual
+    # order of a small CNN. The pool gathers its four taps into blocks of M
+    # slots (M = the pooled size rounded up to a power of two) and compares
+    # 2M then M slots, one FHEW bootstrap each: with the default 4 channels
+    # at stride 2 (4x7x7 -> 4x3x3, M = 64) that is 192, and the network fits
+    # 256 slots. poolcnn-s1 (stride 1, 4x14x14 -> 4x7x7, M = 256) is more
+    # accurate but needs 1024 slots. The pool costs 15 levels (12 for the
+    # FHEW-to-CKKS decoding of each comparison) and each Chebyshev ReLU 6,
+    # 30 in all, so the ReLU models need --bootstrap. The pool's inputs must
+    # stay in [-POOL_RANGE, POOL_RANGE] (the comparison wraps around beyond
+    # it). act="poly" (poolcnn-poly) puts the quadratic after the pool
+    # instead: 22 levels, which fit ring 2^16 without bootstrapping.
     side = 14 // stride // 2
-    return nn.Sequential(
-        nn.Conv2d(1, channels, 3, stride=stride, padding=1), nn.BatchNorm2d(channels),
-        hnn.MaxPool2d(2, 2, range=POOL_RANGE), hnn.Poly([0, 0.5, 0.25]),
-        nn.Flatten(), nn.Linear(channels * side * side, 32), nn.BatchNorm1d(32), hnn.Poly([0, 0.5, 0.25]),
-        nn.Linear(32, 10))
+    conv = [nn.Conv2d(1, channels, 3, stride=stride, padding=1), nn.BatchNorm2d(channels)]
+    pool = hnn.MaxPool2d(2, 2, range=POOL_RANGE)
+    head = [nn.Flatten(), nn.Linear(channels * side * side, 32), nn.BatchNorm1d(32), activation(act),
+            nn.Linear(32, 10)]
+    if act == "poly":
+        return nn.Sequential(*conv, pool, activation(act), *head)
+    return nn.Sequential(*conv, activation(act), pool, *head)
 
 
 POOL_RANGE = 8.0
@@ -151,7 +213,8 @@ def patchify14(x):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arch", choices=("cnn", "vit", "deepcnn", "poolcnn", "poolcnn-s1", "lnvit", "lnvit16"), default="cnn")
+    ap.add_argument("--arch", default="cnn", choices=(*BASELINES, "vit", "deepcnn", "poolcnn", "poolcnn-s1",
+                                                      "poolcnn-poly", "lnvit", "lnvit16"))
     ap.add_argument("--exact-relu", type=float, nargs="?", const=8.0, default=None, metavar="RANGE",
                     help="deepcnn: train with nn.ReLU and run it as the exact scheme-switching ReLU on "
                     "[-RANGE, RANGE] (default 8)")
@@ -162,25 +225,29 @@ def main():
 
     torch.manual_seed(args.seed)
     data = load_mnist(args.data)
-    prep = {"cnn": lambda x: x, "vit": patchify, "deepcnn": pool2, "poolcnn": pool2, "poolcnn-s1": pool2, "lnvit": patchify14,
-            "lnvit16": patchify}[args.arch]
+    baseline = args.arch in BASELINES
+    prep = (lambda x: x) if baseline else {"vit": patchify, "deepcnn": pool2, "poolcnn": pool2, "poolcnn-s1": pool2, "poolcnn-poly": pool2,
+                                           "lnvit": patchify14, "lnvit16": patchify}[args.arch]
     xtr, ytr = torch.tensor(prep(data["train_x"]), dtype=torch.float32), torch.tensor(data["train_y"]).long()
     xte, yte = torch.tensor(prep(data["test_x"]), dtype=torch.float32), torch.tensor(data["test_y"]).long()
 
     if args.exact_relu and args.arch != "deepcnn":
         ap.error("--exact-relu is for --arch deepcnn")
-    model = {"cnn": cnn, "vit": vit, "deepcnn": lambda: deepcnn(bool(args.exact_relu)), "poolcnn": poolcnn,
-             "poolcnn-s1": lambda: poolcnn(4, 1), "lnvit": lambda: lnvit(4), "lnvit16": lambda: lnvit(16)}[args.arch]()
-    epochs = args.epochs or {"cnn": 3, "vit": 15, "deepcnn": 4, "poolcnn": 4, "poolcnn-s1": 4, "lnvit": 10,
-                             "lnvit16": 10}[args.arch]
-    # The transformers' GELU series diverge outside [-6, 6]: a stronger range
-    # penalty keeps their inputs there, so no test image's logits blow up
-    # (which would also cost the encrypted argmax its resolution).
-    range_weight = 10.0 if args.arch in ("vit", "lnvit", "lnvit16") else fhe_eval.RANGE_WEIGHT
-    acc, train_time = fhe_eval.train(model, xtr, ytr, xte, yte, epochs, range_weight=range_weight)
+    if baseline:
+        build, epochs, lr = BASELINES[args.arch]
+        model = build()
+    else:
+        model = {"vit": vit, "deepcnn": lambda: deepcnn(bool(args.exact_relu)), "poolcnn": poolcnn,
+                 "poolcnn-s1": lambda: poolcnn(4, 1), "poolcnn-poly": lambda: poolcnn(act="poly"),
+                 "lnvit": lambda: lnvit(4),
+                 "lnvit16": lambda: lnvit(16)}[args.arch]()
+        epochs = {"vit": 15, "deepcnn": 4, "poolcnn": 4, "poolcnn-s1": 4, "poolcnn-poly": 4, "lnvit": 10, "lnvit16": 10}[args.arch]
+        lr = 2e-3
+    acc, train_time = fhe_eval.train(model, xtr, ytr, xte, yte, args.epochs or epochs, lr=lr)
 
-    shape = {"cnn": (1, 28, 28), "vit": (N_TOK, PATCH), "deepcnn": (1, 14, 14), "poolcnn": (1, 14, 14), "poolcnn-s1": (1, 14, 14),
-             "lnvit": (4, PATCH), "lnvit16": (N_TOK, PATCH)}[args.arch]
+    shape = (1, 28, 28) if baseline else {"vit": (N_TOK, PATCH), "deepcnn": (1, 14, 14), "poolcnn": (1, 14, 14),
+                                          "poolcnn-s1": (1, 14, 14), "poolcnn-poly": (1, 14, 14), "lnvit": (4, PATCH),
+                                          "lnvit16": (N_TOK, PATCH)}[args.arch]
     if args.arch.startswith("lnvit"):
         check_softmax_ranges(model, xte[:2000])
     if args.arch in ("vit", "lnvit", "lnvit16") and not args.logits:
@@ -195,7 +262,7 @@ def main():
         print("wrote", args.out)
     if args.arch in ("vit", "lnvit", "lnvit16"):
         net.fuse_linear()  # token mean + head -> one matrix, saves a level
-    if args.arch.startswith("poolcnn"):
+    if baseline or args.arch.startswith("poolcnn"):
         net.compile()
         check_ranges(net, xtr[:args.calibration].double().numpy())
     # Accuracy of the network as encrypted inference computes it (the same
@@ -204,7 +271,7 @@ def main():
     torch_head = fhe_eval.accuracy(fhe_eval.predict(model, xte[:n_plain]), yte[:n_plain])
     print(f"fheml plaintext accuracy {plain_acc:.1%} on {n_plain} test images (torch: {torch_head:.1%} on them, "
           f"{acc:.1%} on all)")
-    if not args.packing and args.arch in ("deepcnn", "poolcnn", "poolcnn-s1"):
+    if not args.packing and (args.arch == "deepcnn" or args.arch.startswith("poolcnn")):
         # Compact activations: fewer slots, so fewer bootstrapping keys, and
         # max pooling compares only the slots up to its last input.
         net.set_gapped_layouts(False)

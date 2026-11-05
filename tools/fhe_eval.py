@@ -15,7 +15,7 @@ An example script defines its model and data and calls these in order:
 
 ``add_args`` gives every example the same encryption flags (--insecure,
 --bootstrap, --window, --digits, --level-budget, --ring, --boot-iterations,
---boot-precision, --packing, --n, --profile, --json). The metrics below
+--boot-precision, --scale-bits, --packing, --n, --profile, --json). The metrics below
 cover classification, segmentation, detection and sequence tasks.
 """
 import json
@@ -57,8 +57,8 @@ def add_args(ap, n=3):
     ap.add_argument("--boot-precision", type=int, default=0,
                     help="bits of precision of one bootstrap for --boot-iterations 2 (default: measured at keygen)")
     ap.add_argument("--scale-bits", type=int, default=0,
-                    help="CKKS scaling bits (0 = default: 40, 50 with bootstrapping); bootstrapping thousands of "
-                    "slots keeps far more precision at 59 (first modulus min(60, bits + 7))")
+                    help="CKKS scaling modulus bits (0 = 50). Toy runs of bootstrapped networks: 59 makes a "
+                    "4096-slot bootstrap about 2^-14 accurate instead of 2^-3 (128-bit ring 2^16 fits 50)")
     ap.add_argument("--seed", type=int, default=0)
     return ap
 
@@ -238,7 +238,7 @@ def check_ranges(net, xs):
     """Largest |input| of every Chebyshev / exact-relu / max-pool layer over
     xs, against its interval (the series diverge outside it; the comparison
     wraps around)."""
-    xs = [np.asarray(fheml._prepare(net, x)) for x in xs]  # (pads token inputs to the stride)
+    xs = [fheml._prepare(net, x) for x in xs]  # token inputs padded to the token stride
     for i, layer in enumerate(net.layers):
         if layer.type in ("chebyshev", "exactrelu", "maxpool2d"):
             peak = max(np.abs(x).max() for x in xs)
@@ -316,7 +316,7 @@ def context(net, args, level_budget):
         overrides["scale_mod_bits"] = args.scale_bits
         overrides["first_mod_bits"] = min(60, args.scale_bits + 7)
     if args.ring or (args.insecure and net.uses_bootstrapping):
-        overrides["ring_dim"] = args.ring or 4096
+        overrides["ring_dim"] = args.ring or max(4096, 2 * net.slots)  # toy ring: the smallest that bootstraps
     ctx = fheml.make_context(net, secure=not args.insecure, rotation_window=args.window, **overrides)
     setup = time.time() - t
     print(ctx.describe(), f"(setup {setup:.1f}s)")

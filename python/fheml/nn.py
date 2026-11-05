@@ -88,10 +88,19 @@ def _excess(x, lo, hi):
     return (torch.relu(x - hi) + torch.relu(lo - x)).pow(2).mean()
 
 
+def _sample_excess(x, lo, hi):
+    """Squared distance of x outside [lo, hi], summed per sample and averaged
+    over the batch. Activation maps have many values and a handful outside
+    the interval is enough to break an encrypted series, so the excess is
+    not diluted by the map size like a mean would."""
+    return (torch.relu(x - hi) + torch.relu(lo - x)).pow(2).sum() / max(len(x), 1)
+
+
 def range_loss(model):
     """Sum of how far the last training forward pushed LayerNorm variances,
-    softmax scores / row sums and Chebyshev activation inputs outside the
-    intervals their encrypted series cover (mean squared excess). Add ``weight * range_loss(model)`` to the
+    softmax scores / row sums, Chebyshev activation inputs and max-pool
+    inputs outside the intervals their encrypted series or comparisons
+    cover (mean squared excess). Add ``weight * range_loss(model)`` to the
     training loss so the model learns to stay inside them: the series
     diverge outside, and encrypted inference cannot clamp."""
     terms = [m._excess for m in model.modules() if getattr(m, "_excess", None) is not None]
@@ -107,10 +116,11 @@ class Chebyshev(nn.Module):
 
     The forward pass evaluates the polynomial itself, not the exact function,
     so training sees what encrypted inference computes. Inputs outside [a, b]
-    blow up quickly, as they do under encryption: keep activations in range.
-    While training, the series sees its input clamped to [a, b] and
-    ``range_loss`` counts how far it went outside, as for LayerNorm and
-    softmax attention.
+    blow up quickly, as they do under encryption. While training, the series
+    sees its input clamped to [a, b] (one stray pre-activation would
+    otherwise derail the step) and ``range_loss`` reports how far the batch
+    went outside, so the model learns to stay in range; check the ranges on
+    data before encrypting.
     """
 
     def __init__(self, fn, a, b, degree):
@@ -123,7 +133,7 @@ class Chebyshev(nn.Module):
 
     def forward(self, x):
         if self.training:
-            self._excess = _excess(x, self.a, self.b)
+            self._excess = _sample_excess(x, self.a, self.b)
             x = x.clamp(self.a, self.b)
         return _chebyshev_eval(self.c, self.a, self.b, x)
 
@@ -477,6 +487,11 @@ class MaxPool2d(nn.MaxPool2d):
         if not range > 0:
             raise ValueError("MaxPool2d: range must be positive")
         self.range = float(range)
+
+    def forward(self, x):
+        if self.training:
+            self._excess = _sample_excess(x, -self.range, self.range)
+        return super().forward(x)
 
     def extra_repr(self):
         return super().extra_repr() + f", range={self.range}"
