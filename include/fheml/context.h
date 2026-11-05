@@ -66,11 +66,10 @@ struct ContextOptions {
   // touch the first few slots of large ciphertexts (ArgMax) sets it to
   // that span: compare() then masks a - b to the compared slots, folds the
   // ciphertext onto period compare_slots (log2(slots / compare_slots)
-  // rotations) and switches only those. Its inputs then need three levels
-  // left instead of two, and the result repeats with period compare_slots
-  // (zeros in [count, compare_slots) of every period). A comparison of more
-  // slots switches compare_slots at a time and masks each chunk's result
-  // back into place: one more level, and zeros beyond count.
+  // rotations) and switches only those, compare_slots at a time for a wider
+  // comparison, and masks each result back into place: the inputs need three
+  // levels left instead of two, the result comes one level later, and it is
+  // [a < b] in the first count slots and 0 elsewhere, as with all slots.
   uint32_t compare_slots = 0;
 };
 

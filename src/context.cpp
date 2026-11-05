@@ -489,7 +489,7 @@ Ctxt FHEContext::compare(const Ctxt& a, const Ctxt& b, double range, size_t coun
   // Fewer compared slots than the ciphertext holds: a - b, masked to the
   // compared slots, folded onto period cs, is what a cs-slot (sparsely
   // packed) ciphertext with those values looks like. The result is a cs-slot
-  // ciphertext too: as a full one it repeats with period cs.
+  // ciphertext too, which as a full one repeats with period cs.
   const Ctxt d = cc_->EvalSub(a, b);
   auto switch_chunk = [&](Ctxt x, uint32_t m) {
     for (uint32_t s = cs; s < opts_.slots; s *= 2) cc_->EvalAddInPlace(x, rotate(x, static_cast<int32_t>(s)));
@@ -497,10 +497,13 @@ Ctxt FHEContext::compare(const Ctxt& a, const Ctxt& b, double range, size_t coun
     r->SetSlots(opts_.slots);
     return r;
   };
+  std::vector<double> head(opts_.slots, 0.0);
   if (n <= cs) {
-    std::vector<double> mask(opts_.slots, 0.0);
-    std::fill(mask.begin(), mask.begin() + n, 1.0);
-    return switch_chunk(cc_->EvalMult(d, encode(mask, level(d))), n);
+    // The switched result repeats with period cs; masking it to its first n
+    // slots (one level, as for chunks below) leaves zeros beyond count.
+    std::fill(head.begin(), head.begin() + n, 1.0);
+    Ctxt r = switch_chunk(cc_->EvalMult(d, encode(head, level(d))), n);
+    return cc_->EvalMult(r, encode(head, level(r)));
   }
   // More slots than one switch holds (compare_slots caps the switching
   // keys): cs slots at a time, each chunk rotated to the front, compared,
