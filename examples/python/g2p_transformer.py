@@ -304,10 +304,16 @@ def main():
 
 
 def logit_bound(model, src, tgt):
-    """Largest |logit| at the target positions over teacher-forced inputs."""
+    """Largest |logit| at the target positions over teacher-forced inputs.
+    Words whose activations leave the series intervals (the polynomials then
+    diverge, here as under encryption) are counted and left out."""
     with torch.no_grad():
         out = model(torch.tensor(teacher_inputs(src, tgt), dtype=next(model.parameters()).dtype))[:, S:]
-    return float(out.abs().max())
+    peak = out.abs().flatten(1).max(1).values
+    ok = torch.isfinite(peak) & (peak < 1e3)
+    if not ok.all():
+        print(f"  {int((~ok).sum())} of {len(ok)} words leave the series intervals")
+    return float(peak[ok].max())
 
 
 def server_decode(model, args, src_tr, tgt_tr, src_te, tgt_te, pred, words, phonemes, common):
