@@ -449,6 +449,24 @@ class FusedLinear : public LinearLayer {
   std::string what_;
 };
 
+// Moves values between slots: y[i] = x[index[i]] (0 where index[i] < 0),
+// from in_shape to out_shape. One level (a 0/1 slot matrix). Picks one
+// token out of a sequence, or writes values into another token's slots,
+// e.g. an encrypted decoder feeding its prediction back as its next input.
+class Select : public LinearLayer {
+ public:
+  Select(Shape in, Shape out, std::vector<int> index);
+  std::string type() const override { return "select"; }
+  std::string describe() const override;
+  Shape configure(const Shape& in) override;
+  SparseMatrix matrix() const override;
+  void save(std::ostream& os) const override;
+  const std::vector<int>& index() const { return index_; }
+
+ private:
+  std::vector<int> index_;
+};
+
 // x -> x^2 (CryptoNets). One level.
 class Square : public Layer {
  public:

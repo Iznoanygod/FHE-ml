@@ -52,4 +52,21 @@ x = rng.uniform(-1, 1, (2, 8, 8))
 err = np.abs(fheml.infer(cnn, ctx, x) - fheml.plain(cnn, x)).max()
 print(f"multiplexed cnn: max err {err:.1e}")
 assert err < 1e-3
+# Select: token 2's first 5 features into token 3 (picking one token out of a
+# sequence and writing it into another, as the encrypted G2P decoder does).
+sel = fheml.Network(fheml.Shape(n, 1, d))
+sel.add(fheml.Select(fheml.Shape(n, 1, d), fheml.Shape(1, 1, 5), [2 * d + j for j in range(5)]))
+put = [-1] * (n * d)
+for j in range(5):
+    put[3 * d + j] = j
+sel.add(fheml.Select(fheml.Shape(1, 1, 5), fheml.Shape(n, 1, d), put))
+sel.compile()
+xs = rng.normal(size=(n, d))
+want = np.zeros((n, d))
+want[3, :5] = xs[2, :5]
+assert np.allclose(fheml.plain(sel, xs).reshape(n, d), want)
+sctx = fheml.make_context(sel, secure=False)
+err = np.abs(fheml.infer(sel, sctx, xs).reshape(n, d) - want).max()
+assert err < 1e-6, err
+print(f"select: max err {err:.1e}")
 print("PASSED")

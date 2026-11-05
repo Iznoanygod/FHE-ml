@@ -137,6 +137,11 @@ PYBIND11_MODULE(_fheml, m) {
            "(set by place_bootstraps).")
       .def_property_readonly("range", &ExactReLU::range)
       .def_property("after_bootstrap", &ExactReLU::after_bootstrap, &ExactReLU::set_after_bootstrap);
+  py::class_<Select, LinearLayer, std::shared_ptr<Select>>(m, "Select")
+      .def(py::init<Shape, Shape, std::vector<int>>(), py::arg("in_shape"), py::arg("out_shape"), py::arg("index"),
+           "y[i] = x[index[i]] (0 where index[i] < 0): moves values between slots, e.g. one token out of a "
+           "sequence or into another token. One level.")
+      .def_property_readonly("index", &Select::index);
   py::class_<Bootstrap, Layer, std::shared_ptr<Bootstrap>>(m, "Bootstrap").def(py::init<>());
   py::class_<Residual, Layer, std::shared_ptr<Residual>>(m, "Residual")
       .def(py::init<std::vector<LayerPtr>>(), py::arg("body"));

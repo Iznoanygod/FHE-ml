@@ -652,6 +652,41 @@ void FusedLinear::save(std::ostream&) const {
   throw std::logic_error("fused layers are a runtime optimisation and are not serialised; save before fusing");
 }
 
+// ---------------------------------------------------------------------- Select
+
+Select::Select(Shape in, Shape out, std::vector<int> index) : index_(std::move(index)) {
+  if (index_.size() != out.size()) throw std::invalid_argument("select: need one index per output");
+  for (int i : index_)
+    if (i >= static_cast<int>(in.size())) throw std::invalid_argument("select: index past the input");
+  in_ = in;
+  out_ = out;
+}
+
+std::string Select::describe() const {
+  std::ostringstream os;
+  os << "select " << in_.c << "x" << in_.h << "x" << in_.w << " -> " << out_.c << "x" << out_.h << "x" << out_.w;
+  return os.str() + LinearLayer::describe();
+}
+
+Shape Select::configure(const Shape& in) {
+  if (in.size() != in_.size()) throw std::invalid_argument("select: input size mismatch");
+  in_ = in;
+  return out_;
+}
+
+SparseMatrix Select::matrix() const {
+  SparseMatrix m(out_.size(), in_.size());
+  for (size_t i = 0; i < index_.size(); ++i)
+    if (index_[i] >= 0) m.add(i, static_cast<size_t>(index_[i]), 1.0);
+  return m;
+}
+
+void Select::save(std::ostream& os) const {
+  os << "select " << in_.c << " " << in_.h << " " << in_.w << " " << out_.c << " " << out_.h << " " << out_.w << "\n";
+  std::vector<double> v(index_.begin(), index_.end());
+  write_vec(os, v);
+}
+
 // ---------------------------------------------------------------- Activations
 
 std::vector<double> Square::forward_plain(const std::vector<double>& x) const {

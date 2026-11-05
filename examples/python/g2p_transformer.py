@@ -133,6 +133,59 @@ def greedy(step, src, on_pass=None):
     return pred, T
 
 
+def decoder_network(model, logit_range):
+    """The whole greedy decoding as one encrypted network (server decoding).
+
+    T - 1 residual steps over the input sequence x (letters, <s>, zeros):
+    step t runs the transformer, picks the logits of target position t
+    (Select), takes their encrypted argmax over the 40 phonemes and </s>
+    (ArgMax, a one-hot) and writes it into the input slots of position t + 1
+    (Select), which the residual adds to x. Position t + 1 holds zeros
+    before, so x now carries the decoded prefix, and the causal mask makes
+    step t + 1 see exactly what the client loop would send. The output is
+    x after the last step: the client decrypts the one-hot phonemes at
+    positions 1 .. T - 1. Every step runs on every word, so the server does
+    not learn the length either; the last position's prediction would be
+    </s> for every word of at most T - 1 phonemes, so it is not computed.
+    """
+    width = None
+    steps = []
+    k = V - 2  # candidates: </s> and the 39 phonemes (ids 2 ..), never pad or <s>
+    for t in range(T - 1):
+        net = fheml.from_torch(model, (N, V), check=False)  # fresh layers per step (the planner rescales them)
+        width = net.input_shape.w
+        pick = fheml.Select(fheml.Shape(N, 1, V), fheml.Shape(1, 1, k), [(S + t) * V + 2 + j for j in range(k)])
+        put = [-1] * (N * width)
+        for j in range(k):
+            put[(S + t + 1) * width + 2 + j] = j
+        steps.append(fheml.Residual(list(net.layers) + [
+            pick, fheml.ArgMax(logit_range), fheml.Select(fheml.Shape(1, 1, k), fheml.Shape(N, 1, width), put)]))
+    dec = fheml.Network(fheml.Shape(N, 1, width))
+    for step in steps:
+        dec.add(step)
+    return dec
+
+
+def server_inputs(src):
+    """The encrypted input of server decoding: the letters and <s>, zeros after it."""
+    x = np.zeros((len(src), N, V))
+    x[np.arange(len(src))[:, None], np.arange(S), src] = 1
+    x[:, S, BOS] = 1
+    return x
+
+
+def read_decoded(y):
+    """Phoneme ids (T,) like the dataset's targets from the decrypted
+    decoder output (N, width): the one-hot at positions 1 .. T - 1, </s>
+    after the last one, pad after the first </s>."""
+    y = np.asarray(y).reshape(N, -1)[S + 1:, :V]
+    ids = np.where(y.max(-1) > 0.5, y.argmax(-1), PAD)
+    out = np.concatenate([ids, [EOS]])
+    end = int(np.argmax(out == EOS))
+    out[end + 1:] = PAD
+    return out
+
+
 def torch_step(model):
     def step(x):
         with torch.no_grad():
@@ -148,6 +201,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--arch", choices=("basic", "multihead"), default="basic",
                     help="single-head (basic) or 4-head attention")
+    ap.add_argument("--decode", choices=("server", "client"), default="server",
+                    help="server: the whole greedy decoding runs encrypted (argmax by scheme switching); client: "
+                    "one encrypted pass per phoneme, the client takes the argmax in the clear (baseline)")
     ap.add_argument("--plain-words", type=int, default=500, help="test words decoded with the fheml plaintext network")
     fhe_eval.add_args(ap)
     args = ap.parse_args()
@@ -192,6 +248,77 @@ def main():
     print(f"fheml plaintext greedy decoding, first {k} test words: phoneme accuracy {plain_tok:.1%}, word accuracy "
           f"{plain_word:.1%} (torch on them: {ref_tok:.1%}, {ref_word:.1%}; same output for {same:.1%})")
 
+    common = dict(arch=f"g2p-{args.arch}", decode=args.decode, teacher_forced_accuracy=tf_acc,
+                  torch_phoneme_accuracy=torch_tok, torch_word_accuracy=torch_word, plain_phoneme_accuracy=plain_tok,
+                  plain_word_accuracy=plain_word, plain_words=k, plain_same_as_torch=same, train_seconds=train_time)
+    if args.decode == "server":
+        server_decode(model, args, src_tr, tgt_tr, src_te, tgt_te, pred, words, phonemes, common)
+    else:
+        client_decode(model, net, args, xtr, src_te, tgt_te, pred, words, phonemes, common)
+
+
+def logit_bound(model, src, tgt):
+    """Largest |logit| at the target positions over teacher-forced inputs."""
+    with torch.no_grad():
+        out = model(torch.tensor(teacher_inputs(src, tgt), dtype=next(model.parameters()).dtype))[:, S:]
+    return float(out.abs().max())
+
+
+def server_decode(model, args, src_tr, tgt_tr, src_te, tgt_te, pred, words, phonemes, common):
+    """Greedy decoding inside the encryption: one encrypted network for the
+    whole word, the client encrypts the letters and decrypts the phonemes."""
+    model = model.double().eval()
+    # ArgMax compares logits within [-range, range]; place_bootstraps scales it
+    # with the calibration below.
+    bound = 1.25 * logit_bound(model, src_tr[:4000], tgt_tr[:4000])
+    dec = decoder_network(model, bound)
+    dec.compile()
+    print(f"server decoding network: {len(dec.layers)} steps, depth {dec.depth} before bootstrapping, "
+          f"logit range {bound:.1f}")
+
+    # The decoding network in the clear against the client loop (torch).
+    kd = min(args.plain_words, len(src_te), 100)
+    xs = server_inputs(src_te[:kd])
+    dec_pred = np.stack([read_decoded(fheml.plain(dec, x)) for x in xs])
+    dec_same = float(np.mean(np.all(dec_pred == pred[:kd], 1)))
+    dec_tok, dec_word = fhe_eval.sequence_accuracy(dec_pred, tgt_te[:kd])
+    print(f"decoding network in the clear, first {kd} test words: phoneme accuracy {dec_tok:.1%}, word accuracy "
+          f"{dec_word:.1%}; same output as torch greedy decoding for {dec_same:.1%}")
+    if args.n <= 0:
+        return
+
+    # Quadratic attention needs 6 levels in one stretch: level budget {2,2}
+    # with 4 key-switching digits gives 7.
+    args.bootstrap = True
+    args.level_budget = 2
+    args.digits = args.digits or 4
+    level_budget = fhe_eval.prepare(dec, args, server_inputs(src_tr[:args.calibration]))
+    ctx, setup = fhe_eval.context(dec, args, level_budget)
+
+    times, enc_pred = [], []
+    for i in range(min(args.n, len(src_te))):
+        t = time.time()
+        y = fheml.infer(dec, ctx, server_inputs(src_te[i:i + 1])[0])
+        times.append(time.time() - t)
+        enc_pred.append(read_decoded(y))
+        print(f"word {i} '{words[i]}': encrypted -> {spell(enc_pred[-1], phonemes)} | torch -> "
+              f"{spell(pred[i], phonemes)} | truth {spell(tgt_te[i], phonemes)}; {times[-1]:.1f}s")
+    enc_pred = np.stack(enc_pred)
+    n = len(enc_pred)
+    enc_tok, enc_word = fhe_eval.sequence_accuracy(enc_pred, tgt_te[:n])
+    agree = int(np.sum(np.all(enc_pred == pred[:n], 1)))
+    print(f"encrypted server decoding: phoneme accuracy {enc_tok:.1%}, word accuracy {enc_word:.1%} on {n} words; "
+          f"{agree}/{n} decoded exactly like torch; {np.mean(times):.1f}s per word")
+    run = dict(image_seconds=times, argmax_agree=agree, images=n)
+    fhe_eval.record(args, dec, ctx, setup, run, encrypted_phoneme_accuracy=enc_tok, encrypted_word_accuracy=enc_word,
+                    decode_plain_words=kd, decode_plain_same_as_torch=dec_same, **common)
+
+
+def client_decode(model, net, args, xtr, src_te, tgt_te, pred, words, phonemes, common):
+    """Greedy decoding by the client: one encrypted pass per phoneme, the
+    client decrypts the logits, takes the argmax and encrypts the next input
+    (the baseline: fewer levels, no comparisons, but the argmax runs in the
+    clear and the client is in the loop)."""
     if args.n <= 0:
         return
     level_budget = fhe_eval.prepare(net, args, xtr[:args.calibration].double().numpy())
@@ -228,11 +355,8 @@ def main():
           f"max |enc - torch| {max(errs):.1e}")
 
     run = dict(image_seconds=times, max_abs_err=errs, argmax_agree=agree, images=n)
-    fhe_eval.record(args, net, ctx, setup, run, arch=f"g2p-{args.arch}", teacher_forced_accuracy=tf_acc,
-                    torch_phoneme_accuracy=torch_tok, torch_word_accuracy=torch_word, plain_phoneme_accuracy=plain_tok,
-                    plain_word_accuracy=plain_word, plain_words=k, plain_same_as_torch=same,
-                    encrypted_phoneme_accuracy=enc_tok, encrypted_word_accuracy=enc_word,
-                    train_seconds=train_time)
+    fhe_eval.record(args, net, ctx, setup, run, encrypted_phoneme_accuracy=enc_tok, encrypted_word_accuracy=enc_word,
+                    **common)
 
 
 if __name__ == "__main__":
