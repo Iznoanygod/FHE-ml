@@ -61,6 +61,15 @@ struct ContextOptions {
   // "large precision" switching). Also sets the comparison resolution: a
   // difference of two values is resolved to about 2^(2 - logq) of the range.
   uint32_t fhew_log_q = 25;
+  // Slots the comparisons work on (a power of two, 0 = all). The switching
+  // keys and transforms grow with it, so a network whose comparisons only
+  // touch the first few slots of large ciphertexts (ArgMax) sets it to
+  // that span: compare() then masks a - b to the compared slots, folds the
+  // ciphertext onto period compare_slots (log2(slots / compare_slots)
+  // rotations) and switches only those. Its inputs then need three levels
+  // left instead of two, and the result repeats with period compare_slots
+  // (zeros in [count, compare_slots) of every period).
+  uint32_t compare_slots = 0;
 };
 
 // How FHEContext::rotate_many evaluates a set of rotations of one
@@ -137,6 +146,9 @@ class FHEContext {
   // Levels of a compare() result, i.e. what OpenFHE's FHEW-to-CKKS decoding
   // consumes (constant for the parameter sets used here).
   static uint32_t compare_depth() { return 12; }
+  uint32_t compare_slots() const {
+    return opts_.compare_slots && opts_.compare_slots < opts_.slots ? opts_.compare_slots : opts_.slots;
+  }
   bool scheme_switching() const { return opts_.scheme_switching; }
 
   // Rotates by k slots (any k): with the key for k directly, otherwise

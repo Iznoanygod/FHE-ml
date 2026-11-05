@@ -593,29 +593,32 @@ size_t ArgMax::min_slots() const {
   return std::max(in_layout_.span(in_), static_cast<size_t>(blocks()) * block());
 }
 
-// Two chains: the values (gather, then one product per round but the last;
-// each comparison needs its inputs two levels above the bottom) and the
-// one-hot bits, which start from the comparison results, fresh at
-// compare_depth() whatever the input level, and take one product per round
-// but the first, plus the scatter: compare_depth() + rounds in all. The
-// depth covers both (the value chain is shorter: rounds + 2 <= 12 + rounds).
+// Two chains. The one-hot bits start from the comparison results, fresh at
+// compare_depth() whatever the input level, take one product per round but
+// the first, and the scatter: compare_depth() + rounds. The values take the
+// gather, then from the first update on they sit just past the comparison
+// results (one level per round), and every comparison needs its inputs two
+// levels above the bottom, three when the context folds them onto fewer
+// compared slots (ContextOptions::compare_slots): compare_depth() + rounds + 2
+// covers both.
 uint32_t ArgMax::depth() const {
-  return bootstrapped_ ? rounds() + 1 : FHEContext::compare_depth() + rounds();
+  return bootstrapped_ ? rounds() + 2 : FHEContext::compare_depth() + rounds() + 2;
 }
 
 // Past a bootstrap the comparison results come back at compare_depth(),
 // higher than a bootstrap's output level (18-20), so the bits leave at most
 // `rounds` levels into the stretch whatever the input level; the input
-// needs rounds + 1 levels for the value chain.
+// needs rounds + 2 levels for the value chain (gather, rounds - 1 updates,
+// and compare()'s mask when the context compares fewer slots than it holds).
 uint32_t ArgMax::level_after(uint32_t d, uint32_t budget) const {
   if (!bootstrapped_) return Layer::level_after(d, budget);
-  return d + rounds() + 1 <= budget ? rounds() : kNoFit;
+  return d + rounds() + 2 <= budget ? rounds() : kNoFit;
 }
 
 uint32_t ArgMax::level_peak(uint32_t d, uint32_t budget) const {
   if (!bootstrapped_) return Layer::level_peak(d, budget);
   const uint32_t out = level_after(d, budget);
-  return out == kNoFit ? kNoFit : std::max(out, d + rounds() + 1);
+  return out == kNoFit ? kNoFit : std::max(out, d + rounds() + 2);
 }
 
 void ArgMax::compile(uint32_t slots) {
