@@ -273,43 +273,48 @@ under encryption; `fheml.infer` pads inputs to match.
 `examples/python/train_torch_mnist.py` trains, exports and runs the MNIST
 models encrypted. With 128-bit security:
 
-* **CNN:** 98.4% after 3 epochs, about 3 s per encrypted image.
+* **CNN:** 98.6% after 3 epochs with ReLU activations, about 14 s per encrypted image.
 * **ViT:** 94.8% after 15 epochs, about 16 s per encrypted image.
 * **Agreement:** the encrypted logits match torch to about 1e-6.
 
-The fully connected baseline is the 784-200-10 sigmoid MLP of the 2022
-prototype (`--arch mlp`), now encrypted end to end: the sigmoid is a degree-15
-Chebyshev series on [-16, 16] instead of a decrypt-sigmoid-re-encrypt round
-trip through the client. `--arch mlp-poly` is the same network with the
-CNN's quadratic activation. `examples/python/mnist_mlp_cnn.py` trains the
-MLPs and the CNN on the full 28×28 images and runs them side by side
-(128-bit, no bootstrapping; 6 encrypted test images each for the shallow
-models and 3-4 for the deep ones, all agreeing with torch). `--arch mlp-deep`
-and `mlp-deep-poly` are 784-512-256-128-10 versions of the two MLPs:
+The MNIST baselines use the activations of ordinary networks, ReLU and
+sigmoid, as degree-15 Chebyshev series (ReLU on [-8, 8], sigmoid on
+[-16, 16]), and the whole forward pass stays encrypted: no intermediate
+result goes back to the client. The fully connected baseline is the
+784-200-10 sigmoid MLP of the 2022 prototype (`--arch mlp`), which there
+decrypted the hidden layer, applied the sigmoid in the clear and
+re-encrypted it; `--arch mlp-relu` is the same network with ReLU, and
+`mlp-deep` / `mlp-deep-relu` are 784-512-256-128-10 versions. The CNN
+(`--arch cnn`) has the CryptoNets/LoLa shape (5×5 stride-2 convolution with
+5 channels, then 845-64-10) with ReLUs. The `-poly` variants replace every
+activation with the CryptoNets quadratic 0.5x + 0.25x² as a cost
+reference. `examples/python/mnist_mlp_cnn.py` trains them on the full 28×28
+images and runs them side by side (128-bit, no bootstrapping; 3-6 encrypted
+test images each, all agreeing with torch):
 
-| Model | Parameters | Accuracy (torch, 10k) | Depth | Ring | Rotation keys | s / image | max \|enc − torch\| |
-|---|---|---|---|---|---|---|---|
-| MLP 784-200-10, Chebyshev sigmoid | 159,410 | 97.1% | 8 | 2^15 | 49 (882 MB) | 4.0 | 5e-7 |
-| MLP 784-200-10, quadratic | 159,410 | 98.2% | 4 | 2^14 | 49 (257 MB) | 0.9 | 3e-7 |
-| MLP 784-512-256-128-10, Chebyshev sigmoid | 569,226 | 98.3% | 22 | 2^16 | 93 (8.1 GB) | 78 | 2e-6 |
-| MLP 784-512-256-128-10, quadratic | 569,226 | 98.8% | 10 | 2^15 | 93 (2.1 GB) | 16 | 6e-7 |
-| CNN (conv 5×5/2, 845-64-10), quadratic | 54,934 | 98.4% | 7 | 2^15 | 55 (907 MB) | 3.0 | 1e-6 |
+| Model | Activation | Parameters | Accuracy (torch, 10k) | Depth | Ring | Rotation keys | s / image | max \|enc − torch\| |
+|---|---|---|---|---|---|---|---|---|
+| MLP 784-200-10 | sigmoid | 159,410 | 97.1% | 8 | 2^15 | 49 (882 MB) | 4.0 | 5e-7 |
+| MLP 784-200-10 | ReLU | 159,410 | 98.2% | 8 | 2^15 | 49 (882 MB) | 4.5 | 8e-7 |
+| MLP 784-512-256-128-10 | sigmoid | 569,226 | 98.3% | 22 | 2^16 | 93 (8.1 GB) | 78 | 2e-6 |
+| MLP 784-512-256-128-10 | ReLU | 569,226 | 98.5% | 22 | 2^16 | 93 (8.1 GB) | 80 | 3e-6 |
+| CNN (conv 5×5/2, 845-64-10), multiplexed | ReLU | 55,062 | 98.6% | 15 | 2^16 | 40 (2.5 GB) | 14 | 3e-6 |
+| MLP 784-200-10 | quadratic | 159,410 | 98.2% | 4 | 2^14 | 49 (257 MB) | 0.9 | 3e-7 |
+| MLP 784-512-256-128-10 | quadratic | 569,226 | 98.8% | 10 | 2^15 | 93 (2.1 GB) | 16 | 6e-7 |
+| CNN (conv 5×5/2, 845-64-10), multiplexed | quadratic | 54,934 | 98.4% | 7 | 2^15 | 40 (660 MB) | 2.6 | 1e-6 |
 
-The dense 784→200 layer packs into 455 diagonals in 1024 slots, so the
-quadratic MLP is the cheapest model here; the sigmoid series costs six levels
-where the quadratic costs two, which doubles the ring and quadruples the time.
-Three hidden layers lift the sigmoid MLP from 97.1% to 98.3% and the
-quadratic one from 98.2% to 98.8%, but the 784→512 layer needs all 1024 diagonals and every layer adds
-rotation keys, so the deep MLPs cost 16 s (quadratic) and 78 s (sigmoid,
-whose depth 22 needs ring 2^16) per image. The CNN gets 98.4% with a tenth
-of the deep MLP's parameters, and
-multiplexed packing (`--packing multiplexed`: 2048 slots, 40 keys, 660 MB)
-brings it to 2.6 s per image.
+The CNN reaches the best accuracy of the ReLU and sigmoid models with a tenth
+of the deep MLP's parameters. Each Chebyshev activation costs six levels
+where the quadratic costs two, so the real activations need a ring one or two
+sizes larger and run four to six times slower; the 784→512 layer of the deep
+MLPs needs all 1024 diagonals, and their depth of 22 needs ring 2^16. The CNN
+rows use multiplexed packing (`--packing multiplexed`: 2048 slots, 40 keys);
+with the default gapped layout the ReLU CNN takes 17 s per image.
 
 ```sh
-PYTHONPATH=build/python python3 examples/python/mnist_mlp_cnn.py --n 6
+PYTHONPATH=build/python python3 examples/python/mnist_mlp_cnn.py --n 4
 PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch mlp --n 3
-PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch cnn --n 3
+PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch cnn --packing multiplexed --n 3
 PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch vit --out models/vit_torch.fheml
 ```
 
