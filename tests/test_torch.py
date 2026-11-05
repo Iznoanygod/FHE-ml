@@ -3,6 +3,9 @@ plaintext reference and encrypted inference against torch (toy parameters).
 
     PYTHONPATH=build/python python3 tests/test_torch.py
 """
+import os
+import tempfile
+
 import numpy as np
 import torch
 from torch import nn
@@ -51,6 +54,26 @@ pooled = nn.Sequential(nn.Conv2d(1, 2, 3, padding=1), hnn.MaxPool2d(2, range=2.0
 with torch.no_grad():
     pooled[0].weight.mul_(0.5)
 run("max pool", pooled, (1, 4, 4))
+
+# Encrypted argmax (scheme switching): a one-hot of the logits. 6 classes
+# pad to 8 blocks (the extra ones hold -range and never win).
+clf = nn.Sequential(nn.Linear(5, 6), hnn.ArgMax(range=4.0))
+net = run("argmax", clf, (5,))
+assert net.layers[-1].type == "argmax"
+# Per token and per group of 3 features (the pixel classes of a patch token),
+# in the token-strided layout of the previous layer.
+seg = nn.Sequential(nn.Linear(4, 8), hnn.PosEmbedding(3, 8), hnn.Residual(hnn.Attention(8, 3)), nn.Linear(8, 6),
+                    hnn.ArgMax(range=4.0, classes=3))
+net = run("token argmax", seg, (3, 4))
+path = os.path.join(tempfile.mkdtemp(), "argmax.fheml")
+net.save(path)
+x = rng.uniform(-1, 1, (3, 4))
+assert np.array_equal(fheml.plain(fheml.Network.load(path), x), fheml.plain(net, x)), "argmax save/load"
+
+# Per pixel over the channels of an image (CNN segmentation logits), on the
+# gapped layout a strided convolution leaves.
+pix = nn.Sequential(nn.Conv2d(1, 3, 3, stride=2, padding=1), hnn.ArgMax(range=4.0, dim=1))
+run("pixel argmax", pix, (1, 4, 4))
 
 # Plain nn.ReLU exports as the exact scheme-switching ReLU: the encrypted
 # result matches torch's true ReLU, not a polynomial.

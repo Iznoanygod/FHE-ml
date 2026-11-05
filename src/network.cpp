@@ -58,6 +58,30 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
     auto w = read_vec(is, static_cast<size_t>(i) * o, "dense weights");
     auto b = hb ? read_vec(is, o, "dense bias") : std::vector<double>{};
     layer = std::make_shared<Dense>(i, o, std::move(w), std::move(b));
+  } else if (tok == "argmax") {
+    double range;
+    is >> range;
+    int classes = 0;
+    double gain = 1.0;
+    bool channels = false;
+    for (;;) {  // optional "classes K", "channels", "gain G"
+      std::string next;
+      auto pos = is.tellg();
+      if (is >> next && next == "classes") {
+        is >> classes;
+      } else if (next == "channels") {
+        channels = true;
+      } else if (next == "gain") {
+        is >> gain;
+      } else {
+        is.clear();
+        is.seekg(pos);
+        break;
+      }
+    }
+    auto am = std::make_shared<ArgMax>(range, classes, channels);
+    am->set_gain(gain);
+    layer = am;
   } else if (tok == "avgpool2d") {
     int k, s;
     is >> k >> s;
@@ -343,8 +367,11 @@ Fold fold_kind(const Layer& l) {
   if (dynamic_cast<const Square*>(&l)) return Fold::kSquare;
   if (dynamic_cast<const PolyActivation*>(&l) || dynamic_cast<const ChebyshevActivation*>(&l) ||
       dynamic_cast<const ExactReLU*>(&l) || dynamic_cast<const Scale*>(&l) || dynamic_cast<const FusedLinear*>(&l) ||
-      dynamic_cast<const LayerNorm*>(&l) || dynamic_cast<const MaxPool2d*>(&l) || dynamic_cast<const Attention*>(&l))
-    return Fold::kAbsorb;  // MaxPool2d: max(c x) = c max(x), c > 0, taken by its gather
+      dynamic_cast<const LayerNorm*>(&l) || dynamic_cast<const MaxPool2d*>(&l) || dynamic_cast<const Attention*>(&l) ||
+      dynamic_cast<const ArgMax*>(&l))
+    // MaxPool2d: max(c x) = c max(x), c > 0, taken by its gather; ArgMax:
+    // argmax(c x) = argmax(x), its gather takes 1/c (the range stays put).
+    return Fold::kAbsorb;
   if (l.is_bootstrap()) return Fold::kPass;
   if (auto* lin = dynamic_cast<const LinearLayer*>(&l)) {
     if (lin->trainable()) return Fold::kAbsorb;
@@ -454,6 +481,7 @@ void absorb_input(std::shared_ptr<Layer>& l, double c) {
   if (auto* fu = dynamic_cast<FusedLinear*>(l.get())) return fu->scale(1.0 / c, 1.0);
   if (auto* ln = dynamic_cast<LayerNorm*>(l.get())) return ln->absorb_input_scale(c);
   if (auto* mp = dynamic_cast<MaxPool2d*>(l.get())) return mp->set_gain(mp->gain() / c);
+  if (auto* am = dynamic_cast<ArgMax*>(l.get())) return am->set_gain(am->gain() / c);
   if (auto* at = dynamic_cast<Attention*>(l.get())) {
     // q, k and v are linear in the input: their weights (not biases) take 1/c.
     std::vector<double> p = at->params();

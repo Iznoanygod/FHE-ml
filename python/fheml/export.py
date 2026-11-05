@@ -13,6 +13,10 @@
   segment: the source and target of an encoder-decoder).
 * ``(k,)`` vector: Linear, BatchNorm1d.
 
+Any of them may end with ``fheml.nn.ArgMax`` (a one-hot per group of the
+last dimension, or per pixel over an image's channels; exact, scheme
+switching).
+
 Activations must be ``fheml.nn`` polynomials (Poly, Square, Chebyshev).
 ``nn.ReLU`` exports only with ``exact_relu=RANGE``: it then becomes an
 ``fheml.ExactReLU`` (sign through CKKS<->FHEW scheme switching, inputs in
@@ -108,6 +112,14 @@ class _Exporter:
             c, h, w = state[1:]
             out.append(("maxpool2d", k, s, m.range))
             return ("image", c, (h - k) // s + 1, (w - k) // s + 1)
+        if isinstance(m, hnn.ArgMax):
+            if m.dim == 1:
+                self.need(kind, "image", "ArgMax(dim=1)")
+            last = state[-1]
+            if m.classes and last % m.classes:
+                raise ValueError(f"ArgMax: classes {m.classes} does not divide the last dimension {last}")
+            out.append(("argmax", m.range, int(m.classes or 0), m.dim == 1))
+            return state
         if isinstance(m, nn.AdaptiveAvgPool2d):
             self.need(kind, "image", name)
             c, h, w = state[1:]
@@ -284,6 +296,8 @@ def _build(s):
         return _fheml.AvgPool2d(*s[1:])
     if k == "maxpool2d":
         return _fheml.MaxPool2d(*s[1:])
+    if k == "argmax":
+        return _fheml.ArgMax(s[1], s[2], s[3])
     if k == "affine":
         return _fheml.ChannelAffine(_flat(s[1]), _flat(s[2]))
     if k == "dense":

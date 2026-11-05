@@ -540,6 +540,180 @@ void MaxPool2d::save(std::ostream& os) const {
   os << "\n";
 }
 
+// ---------------------------------------------------------------------- ArgMax
+
+ArgMax::ArgMax(double range, int classes, bool over_channels)
+    : range_(range), classes_(classes), over_channels_(over_channels) {
+  if (!(range > 0.0)) throw std::invalid_argument("argmax: range must be positive");
+  if (classes < 0) throw std::invalid_argument("argmax: classes must be positive (0 = the last dimension)");
+  if (classes && over_channels) throw std::invalid_argument("argmax: classes and over_channels exclude each other");
+}
+
+size_t ArgMax::logical(uint32_t i, uint32_t j) const {
+  if (over_channels_) return static_cast<size_t>(j) * in_.h * in_.w + i;
+  return static_cast<size_t>(i) * classes() + j;
+}
+
+std::string ArgMax::describe() const {
+  std::ostringstream os;
+  os << type() << " " << groups() << " groups of " << classes() << (over_channels_ ? " channels" : "") << " range "
+     << range_;
+  if (gain_ != 1.0) os << " gain " << gain_;
+  os << " (" << (blocks() - 1) * block() << " comparisons, " << rounds() << " rounds)";
+  return os.str();
+}
+
+Shape ArgMax::configure(const Shape& in) {
+  if (in.w < 1 || in.c < 1 || in.h < 1) throw std::invalid_argument("argmax: empty input");
+  if (classes_ && in.w % classes_) throw std::invalid_argument("argmax: classes must divide the last dimension");
+  in_ = out_ = in;
+  return out_;
+}
+
+// The one-hot comes back in the input's layout.
+Layout ArgMax::configure_layout(const Layout& in, Packing packing) {
+  (void)packing;
+  in_layout_ = out_layout_ = in;
+  return out_layout_;
+}
+
+uint32_t ArgMax::rounds() const {
+  uint32_t r = 0;
+  for (uint32_t n = classes(); n > 1; n = (n + 1) / 2) ++r;
+  return r;
+}
+
+uint32_t ArgMax::block() const {
+  uint32_t b = 1;
+  while (b < groups()) b *= 2;
+  return b;
+}
+
+size_t ArgMax::min_slots() const {
+  return std::max(in_layout_.span(in_), static_cast<size_t>(blocks()) * block());
+}
+
+// Two chains: the values (gather, then one product per round but the last;
+// each comparison needs its inputs two levels above the bottom) and the
+// one-hot bits, which start from the comparison results, fresh at
+// compare_depth() whatever the input level, and take one product per round
+// but the first, plus the scatter: compare_depth() + rounds in all. The
+// depth covers both (the value chain is shorter: rounds + 2 <= 12 + rounds).
+uint32_t ArgMax::depth() const {
+  return bootstrapped_ ? rounds() + 1 : FHEContext::compare_depth() + rounds();
+}
+
+// Past a bootstrap the comparison results come back at compare_depth(),
+// higher than a bootstrap's output level (18-20), so the bits leave at most
+// `rounds` levels into the stretch whatever the input level; the input
+// needs rounds + 1 levels for the value chain.
+uint32_t ArgMax::level_after(uint32_t d, uint32_t budget) const {
+  if (!bootstrapped_) return Layer::level_after(d, budget);
+  return d + rounds() + 1 <= budget ? rounds() : kNoFit;
+}
+
+uint32_t ArgMax::level_peak(uint32_t d, uint32_t budget) const {
+  if (!bootstrapped_) return Layer::level_peak(d, budget);
+  const uint32_t out = level_after(d, budget);
+  return out == kNoFit ? kNoFit : std::max(out, d + rounds() + 1);
+}
+
+void ArgMax::compile(uint32_t slots) {
+  slots_ = slots;
+  const uint32_t nb = blocks(), m = block(), k = classes(), g = groups();
+  SparseMatrix ga(static_cast<size_t>(nb) * m, slots), sc(slots, static_cast<size_t>(nb) * m);
+  pad_.assign(slots, 0.0);
+  for (uint32_t j = 0; j < nb; ++j)
+    for (uint32_t i = 0; i < g; ++i) {
+      const size_t r = static_cast<size_t>(j) * m + i;
+      if (j < k) {
+        const size_t col = in_layout_.slot(in_, logical(i, j));
+        ga.add(r, col, gain_);
+        sc.add(col, r, 1.0);
+      } else {
+        pad_[r] = -range_;
+      }
+    }
+  gather_ = LinearTransform(ga, slots);
+  scatter_ = LinearTransform(sc, slots);
+}
+
+std::vector<int32_t> ArgMax::rotation_indices() const {
+  std::vector<int32_t> r = gather_.rotation_indices();
+  for (int32_t x : scatter_.rotation_indices()) r.push_back(x);
+  const uint32_t m = block();
+  for (uint32_t h = blocks() / 2; h >= 1; h /= 2) {
+    r.push_back(static_cast<int32_t>(h * m));
+    // Copying a round's comparison onto the other blocks: right rotations.
+    for (uint32_t w = h; w < blocks(); w *= 2) r.push_back(static_cast<int32_t>(slots_ - w * m));
+  }
+  return r;
+}
+
+std::vector<double> ArgMax::forward_plain(const std::vector<double>& x) const {
+  std::vector<double> y(x.size() ? out_.size() : 0, 0.0);
+  const uint32_t k = classes();
+  for (uint32_t i = 0; i < groups(); ++i) {
+    uint32_t best = 0;
+    for (uint32_t j = 1; j < k; ++j)
+      if (x[logical(i, j)] > x[logical(i, best)]) best = j;
+    y[logical(i, best)] = 1.0;
+  }
+  return y;
+}
+
+Ctxt ArgMax::forward(const FHEContext& ctx, const Ctxt& x) const {
+  if (!ctx.scheme_switching())
+    throw std::logic_error("argmax needs a context with ContextOptions::scheme_switching");
+  if (gather_.slots() != ctx.slots()) throw std::invalid_argument("argmax: slot count mismatch with context");
+  const CC& cc = ctx.cc();
+  const uint32_t nb = blocks(), m = block(), g = groups();
+  Ctxt a = gather_.eval(ctx, x);
+  if (classes() < nb) {
+    Ptxt p = ctx.encode(pad_, a->GetLevel(), a->GetNoiseScaleDeg());
+    cc->EvalAddInPlace(a, p);
+  }
+  Ctxt alive;  // the "still winning" bit of every block (slots of real groups)
+  for (uint32_t h = nb / 2; h >= 1; h /= 2) {
+    const size_t n = static_cast<size_t>(h) * m;
+    Ctxt b = ctx.rotate(a, static_cast<int32_t>(n));
+    Ctxt sel = ctx.compare(a, b, range_, n);  // [a < b] in the first h blocks, 0 beyond
+    if (h > 1) a = cc->EvalAdd(a, cc->EvalMult(sel, cc->EvalSub(b, a)));
+    // The round's bits as a factor on every block: 1 - [a < b] on the a
+    // sides (block mod 2h < h), [a < b] on the b sides. sel holds the bits
+    // in blocks [0, h); rotations copy them onto every a side (period 2h)
+    // and from there onto the b sides, and a plaintext add finishes
+    // f = 1_a - A + B without spending a level.
+    Ctxt rep_a = sel;
+    for (uint32_t w = 2 * h; w < nb; w *= 2)
+      cc->EvalAddInPlace(rep_a, ctx.rotate(rep_a, -static_cast<int32_t>(w * m)));
+    Ctxt f = cc->EvalSub(ctx.rotate(rep_a, -static_cast<int32_t>(h * m)), rep_a);
+    std::vector<double> one(slots_, 0.0);
+    for (uint32_t j = 0; j < nb; ++j)
+      if ((j % (2 * h)) < h)
+        for (uint32_t i = 0; i < m; ++i) one[static_cast<size_t>(j) * m + i] = 1.0;
+    Ptxt po = ctx.encode(one, f->GetLevel(), f->GetNoiseScaleDeg());
+    cc->EvalAddInPlace(f, po);
+    alive = alive ? cc->EvalMult(alive, f) : f;
+  }
+  if (!alive) {  // one class: every group's one-hot is 1
+    std::vector<double> one(slots_, 0.0);
+    for (uint32_t i = 0; i < g; ++i) one[i] = 1.0;
+    alive = cc->EvalMult(a, 0.0);
+    Ptxt po = ctx.encode(one, alive->GetLevel(), alive->GetNoiseScaleDeg());
+    cc->EvalAddInPlace(alive, po);
+  }
+  return scatter_.eval(ctx, alive);
+}
+
+void ArgMax::save(std::ostream& os) const {
+  os << "argmax " << range_;
+  if (classes_) os << " classes " << classes_;
+  if (over_channels_) os << " channels";
+  if (gain_ != 1.0) os << " gain " << gain_;
+  os << "\n";
+}
+
 // --------------------------------------------------------------- ChannelAffine
 
 ChannelAffine::ChannelAffine(std::vector<double> scale, std::vector<double> shift)
