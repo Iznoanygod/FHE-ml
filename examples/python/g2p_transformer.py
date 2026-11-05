@@ -60,29 +60,58 @@ PAD, BOS, EOS = 0, 1, 2
 SEG = (S, T)
 
 
-def g2p(heads, d=32, hid=64):
+# Series intervals of the real-transformer layers (see text_transformer.py):
+# the training forward clamps to them and range_loss keeps the activations
+# inside. The decoder's first position attends to itself only, so its row
+# sum is one exp: range_loss keeps that score above log(sum_lo).
+SOFTMAX = dict(lo=-4.0, hi=4.0, exp_degree=7, inv_degree=7, newton=2, sum_lo=0.5, sum_hi=40.0)
+LN = dict(eps=0.05, var_min=0.0, var_max=8.0, degree=7, newton=1)
+LN_FINAL = dict(LN, var_max=16.0)
+GELU = ("gelu", -8.0, 8.0, 15)
+# Every slot of a ciphertext must stay inside the series intervals (one
+# diverging slot breaks the bootstrap and the decryption of all of them),
+# padding positions included: a strong range penalty.
+RANGE_WEIGHT = 10.0
+
+
+def g2p(heads, d=32, hid=64, attention="softmax", norm=True, act="gelu"):
+    """Pre-norm encoder-decoder over one sequence of S letters and T phonemes.
+
+    The default is a standard transformer: LayerNorm, softmax attention and
+    a GELU feed-forward block, all approximated by the polynomials fheml
+    evaluates encrypted. attention="quadratic", norm=False, act="square" give
+    the cheap HE-only variant (22 levels, no bootstrapping)."""
     m = hnn.encoder_decoder_masks(S, T)
-    act = lambda: hnn.Poly([0, 0.5, 0.25])  # noqa: E731
+    att = dict(softmax=SOFTMAX) if attention == "softmax" else {}
+    ln = (lambda o=LN: [hnn.LayerNorm(d, segments=SEG, **o)]) if norm else (lambda o=None: [])  # noqa: E731
+    activation = (lambda: hnn.Chebyshev(*GELU)) if act == "gelu" else (lambda: hnn.Poly([0, 0.5, 0.25]))  # noqa: E731
+
+    def ffn(side):
+        return hnn.Residual(*ln(), hnn.SegmentLinear(d, hid, SEG, active=[side]), activation(),
+                            hnn.SegmentLinear(hid, d, SEG, active=[side]))
+
     return nn.Sequential(
         hnn.SegmentLinear(V, d, SEG), hnn.PosEmbedding(N, d),
         # encoder self-attention + causal decoder self-attention, one layer
-        hnn.Residual(hnn.Attention(d, N, heads=heads, mask=m["encoder"] + m["causal"], segments=SEG)),
-        hnn.Residual(hnn.SegmentLinear(d, hid, SEG, active=[0]), act(),
-                     hnn.SegmentLinear(hid, d, SEG, active=[0])),                     # encoder FFN
-        hnn.Residual(hnn.Attention(d, N, heads=heads, mask=m["cross"], segments=SEG,
-                                   query_segments=[1], key_segments=[0])),            # cross-attention
-        hnn.Residual(hnn.SegmentLinear(d, hid, SEG, active=[1]), act(),
-                     hnn.SegmentLinear(hid, d, SEG, active=[1])),                     # decoder FFN
-        hnn.SegmentLinear(d, V, SEG, active=[1]))                                     # phoneme logits
+        hnn.Residual(*ln(), hnn.Attention(d, N, heads=heads, mask=m["encoder"] + m["causal"], segments=SEG, **att)),
+        ffn(0),                                                                        # encoder FFN
+        # cross-attention; the norm's source half is the encoder's final norm
+        hnn.Residual(*ln(), hnn.Attention(d, N, heads=heads, mask=m["cross"], segments=SEG,
+                                          query_segments=[1], key_segments=[0], **att)),
+        ffn(1),                                                                        # decoder FFN
+        *ln(LN_FINAL), hnn.SegmentLinear(d, V, SEG, active=[1]))                       # phoneme logits
 
 
 def inputs(src, prefix):
     """One-hot model inputs (B, N, V): the letters, then the decoder input
-    prefix (B, T) of phoneme ids (pad beyond the prefix)."""
+    prefix (B, T) of phoneme ids. Target positions past the prefix (pad) are
+    zero vectors, which is what server decoding holds there before it writes
+    its predictions in, so training sees (and range-limits) them too."""
     x = np.zeros((len(src), N, V), np.float32)
     b = np.arange(len(src))[:, None]
     x[b, np.arange(S), src] = 1
     x[b, S + np.arange(T), prefix] = 1
+    x[:, S:, PAD] = 0
     return x
 
 
@@ -159,9 +188,12 @@ def decoder_network(model, logit_range):
         for j in range(k):
             put[(S + t + 1) * width + 2 + j] = j
         steps.append(fheml.Residual(list(net.layers) + [
-            pick, fheml.ArgMax(logit_range), fheml.Select(fheml.Shape(1, 1, k), fheml.Shape(N, 1, width), put)]))
+            pick, fheml.ArgMax(range=logit_range), fheml.Select(fheml.Shape(1, 1, k), fheml.Shape(N, 1, width), put)]))
     dec = fheml.Network(fheml.Shape(N, 1, width))
-    for step in steps:
+    for t, step in enumerate(steps):
+        if t:
+            # x holds 0/1 values only, so it needs no scaling to bootstrap.
+            dec.add(fheml.Bootstrap())
         dec.add(step)
     return dec
 
@@ -201,9 +233,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--arch", choices=("basic", "multihead"), default="basic",
                     help="single-head (basic) or 4-head attention")
+    ap.add_argument("--attention", choices=("softmax", "quadratic"), default="softmax")
+    ap.add_argument("--no-norm", dest="norm", action="store_false", help="no LayerNorm")
+    ap.add_argument("--act", choices=("gelu", "square"), default="gelu", help="feed-forward activation")
     ap.add_argument("--decode", choices=("server", "client"), default="server",
                     help="server: the whole greedy decoding runs encrypted (argmax by scheme switching); client: "
                     "one encrypted pass per phoneme, the client takes the argmax in the clear (baseline)")
+    ap.add_argument("--weights", help="trained torch weights: loaded if the file exists, else saved after training")
     ap.add_argument("--plain-words", type=int, default=500, help="test words decoded with the fheml plaintext network")
     fhe_eval.add_args(ap)
     args = ap.parse_args()
@@ -221,9 +257,19 @@ def main():
     ytr, yte = torch.tensor(tgt_tr), torch.tensor(tgt_te)
     print(f"CMUdict: {len(xtr)} training and {len(xte)} test words")
 
-    model = g2p(1 if args.arch == "basic" else 4)
-    tf_acc, train_time = fhe_eval.train(model, xtr, ytr, xte, yte, args.epochs or 30, loss_fn=g2p_loss,
-                                        metric=phoneme_accuracy, lr=3e-3, batch=256)
+    model = g2p(1 if args.arch == "basic" else 4, attention=args.attention, norm=args.norm, act=args.act)
+    if args.weights and os.path.exists(args.weights):
+        model.load_state_dict(torch.load(args.weights))
+        tf_acc, train_time = phoneme_accuracy(fhe_eval.predict(model, xte), yte), 0.0
+        print(f"loaded {args.weights}: teacher-forced phoneme accuracy {tf_acc:.4f}")
+    else:
+        tf_acc, train_time = fhe_eval.train(model, xtr, ytr, xte, yte, args.epochs or 30, loss_fn=g2p_loss,
+                                            metric=phoneme_accuracy, lr=3e-3, batch=256,
+                                            range_weight=RANGE_WEIGHT)
+        if args.weights:
+            torch.save(model.state_dict(), args.weights)
+    if args.attention == "softmax" or args.norm:
+        fhe_eval.check_softmax_ranges(model, xte[:2000])
 
     # Greedy decoding of the whole test set in torch.
     model.eval()
@@ -273,7 +319,7 @@ def server_decode(model, args, src_tr, tgt_tr, src_te, tgt_te, pred, words, phon
     bound = 1.25 * logit_bound(model, src_tr[:4000], tgt_tr[:4000])
     dec = decoder_network(model, bound)
     dec.compile()
-    print(f"server decoding network: {len(dec.layers)} steps, depth {dec.depth} before bootstrapping, "
+    print(f"server decoding network: {T - 1} steps, depth {dec.depth} before bootstrapping, "
           f"logit range {bound:.1f}")
 
     # The decoding network in the clear against the client loop (torch).
@@ -287,11 +333,11 @@ def server_decode(model, args, src_tr, tgt_tr, src_te, tgt_te, pred, words, phon
     if args.n <= 0:
         return
 
-    # Quadratic attention needs 6 levels in one stretch: level budget {2,2}
-    # with 4 key-switching digits gives 7.
-    args.bootstrap = True
-    args.level_budget = 2
-    args.digits = args.digits or 4
+    args.bootstrap, args.level_budget = True, 2
+    if args.attention == "quadratic":
+        # Quadratic attention needs 6 levels in one stretch: level budget
+        # {2,2} with 4 key-switching digits gives 7.
+        args.digits = args.digits or 4
     level_budget = fhe_eval.prepare(dec, args, server_inputs(src_tr[:args.calibration]))
     ctx, setup = fhe_eval.context(dec, args, level_budget)
 
@@ -321,6 +367,9 @@ def client_decode(model, net, args, xtr, src_te, tgt_te, pred, words, phonemes, 
     clear and the client is in the loop)."""
     if args.n <= 0:
         return
+    if args.attention == "softmax" or args.norm or args.act == "gelu":
+        # Too deep for one ring: bootstrap, as in server decoding.
+        args.bootstrap, args.level_budget = True, 2
     level_budget = fhe_eval.prepare(net, args, xtr[:args.calibration].double().numpy())
     ctx, setup = fhe_eval.context(net, args, level_budget)
 

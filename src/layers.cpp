@@ -607,18 +607,25 @@ uint32_t ArgMax::depth() const {
 
 // Past a bootstrap the comparison results come back at compare_depth(),
 // higher than a bootstrap's output level (18-20), so the bits leave at most
-// `rounds` levels into the stretch whatever the input level; the input
-// needs rounds + 2 levels for the value chain (gather, rounds - 1 updates,
-// and compare()'s mask when the context compares fewer slots than it holds).
+// `rounds` levels into the stretch whatever the input level. The value
+// chain (one level per round) refreshes itself when a round's comparison
+// would run out of levels (see forward), so the input only needs the
+// gather and then two levels left for that refresh: d + 2 <= budget. The
+// output (the bits' chain and the scatter) sits at compare_depth() + rounds
+// + 1 absolute, i.e. that minus a bootstrap's output level into the
+// stretch; kMinBootstrapDepth is the shallowest bootstrap the library
+// configures (level budget {2,2}; forward() checks it).
 uint32_t ArgMax::level_after(uint32_t d, uint32_t budget) const {
   if (!bootstrapped_) return Layer::level_after(d, budget);
-  return d + rounds() + 2 <= budget ? rounds() : kNoFit;
+  if (d + 2 > budget) return kNoFit;
+  const uint32_t top = FHEContext::compare_depth() + rounds() + 1;
+  return std::max<uint32_t>(1, top > kMinBootstrapDepth ? top - kMinBootstrapDepth : 0);
 }
 
 uint32_t ArgMax::level_peak(uint32_t d, uint32_t budget) const {
   if (!bootstrapped_) return Layer::level_peak(d, budget);
   const uint32_t out = level_after(d, budget);
-  return out == kNoFit ? kNoFit : std::max(out, d + rounds() + 2);
+  return out == kNoFit ? kNoFit : std::max(out, d + 2);
 }
 
 void ArgMax::compile(uint32_t slots) {
@@ -677,8 +684,27 @@ Ctxt ArgMax::forward(const FHEContext& ctx, const Ctxt& x) const {
     cc->EvalAddInPlace(a, p);
   }
   Ctxt alive;  // the "still winning" bit of every block (slots of real groups)
+  if (bootstrapped_ && ctx.bootstrap_depth() && ctx.bootstrap_depth() < kMinBootstrapDepth)
+    throw std::logic_error("argmax: planned for bootstraps of depth >= " + std::to_string(kMinBootstrapDepth) +
+                           " (level budget {2,2} or more), the context's take " +
+                           std::to_string(ctx.bootstrap_depth()));
+  // Levels a comparison needs at its inputs (one more for the mask when the
+  // context compares fewer slots than it holds).
+  const uint32_t need = ctx.compare_slots() < ctx.slots() ? 3 : 2;
+  std::vector<double> span;  // the gathered blocks (refresh mask)
   for (uint32_t h = nb / 2; h >= 1; h /= 2) {
     const size_t n = static_cast<size_t>(h) * m;
+    // Bootstrapped networks: the value chain costs a level per round (the
+    // update after every comparison but the last), so a long tournament
+    // refreshes it (values within [-range, range]) while it still has the
+    // two levels a refresh needs.
+    if (bootstrapped_ && ctx.levels_left(a) < need + (h > 1 ? 1 : 0)) {
+      if (span.empty()) {
+        span.assign(slots_, 0.0);
+        std::fill(span.begin(), span.begin() + static_cast<long>(nb) * m, 1.0);
+      }
+      a = ctx.refresh(a, range_, span);
+    }
     Ctxt b = ctx.rotate(a, static_cast<int32_t>(n));
     Ctxt sel = ctx.compare(a, b, range_, n);  // [a < b] in the first h blocks, 0 beyond
     if (h > 1) a = cc->EvalAdd(a, cc->EvalMult(sel, cc->EvalSub(b, a)));

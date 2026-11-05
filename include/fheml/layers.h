@@ -474,6 +474,8 @@ class ArgMax : public Layer {
   uint32_t blocks() const { return 1u << rounds(); }
   uint32_t block() const;
   bool over_channels() const { return over_channels_; }
+  // Shallowest bootstrap (levels) the bootstrapped plan assumes: level budget {2,2}.
+  static constexpr uint32_t kMinBootstrapDepth = 18;
   // Logical (c, h, w row-major) index of class j of group i.
   size_t logical(uint32_t i, uint32_t j) const;
 
