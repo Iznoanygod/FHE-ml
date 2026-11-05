@@ -45,6 +45,7 @@ PYBIND11_MODULE(_fheml, m) {
       .def_readwrite("level_budget", &ContextOptions::level_budget)
       .def_readwrite("rotation_window", &ContextOptions::rotation_window)
       .def_readwrite("scheme_switching", &ContextOptions::scheme_switching)
+      .def_readwrite("compare_slots", &ContextOptions::compare_slots)
       .def_readwrite("fhew_log_q", &ContextOptions::fhew_log_q)
       .def_readwrite("bootstrap_iterations", &ContextOptions::bootstrap_iterations)
       .def_readwrite("bootstrap_precision", &ContextOptions::bootstrap_precision)
@@ -63,6 +64,14 @@ PYBIND11_MODULE(_fheml, m) {
       .def(
           "decrypt", [](const FHEContext& c, const Ciphertext& x, size_t n) { return c.decrypt(x.ct, n); },
           py::arg("ct"), py::arg("n"))
+      .def(
+          "compare",
+          [](const FHEContext& c, const Ciphertext& a, const Ciphertext& b, double range, size_t count) {
+            return Ciphertext{c.compare(a.ct, b.ct, range, count)};
+          },
+          py::arg("a"), py::arg("b"), py::arg("range") = 1.0, py::arg("count") = 0,
+          py::call_guard<py::gil_scoped_release>(),
+          "[a < b] per slot (scheme switching), for |a|, |b| <= range; count > 0 compares the first count slots.")
       .def_property_readonly("slots", &FHEContext::slots)
       .def_property_readonly("ring_dim", &FHEContext::ring_dim)
       .def_property_readonly("total_depth", &FHEContext::total_depth)
@@ -111,6 +120,14 @@ PYBIND11_MODULE(_fheml, m) {
   py::class_<MaxPool2d, Layer, std::shared_ptr<MaxPool2d>>(m, "MaxPool2d")
       .def(py::init<int, int, double>(), py::arg("k"), py::arg("stride"), py::arg("range") = 1.0,
            "Exact max pooling through CKKS<->FHEW scheme switching; inputs must lie in [-range, range].");
+  py::class_<ArgMax, Layer, std::shared_ptr<ArgMax>>(m, "ArgMax")
+      .def(py::init<double, int, bool>(), py::arg("range") = 1.0, py::arg("classes") = 0,
+           py::arg("over_channels") = false,
+           "Encrypted argmax over groups of `classes` consecutive features (0 = the last dimension), or over the "
+           "channels of every pixel: a one-hot per group, in the input's layout, through CKKS<->FHEW scheme "
+           "switching; inputs must lie in [-range, range].")
+      .def_property_readonly("range", &ArgMax::range)
+      .def_property_readonly("rounds", &ArgMax::rounds);
   py::class_<ChannelAffine, LinearLayer, std::shared_ptr<ChannelAffine>>(m, "ChannelAffine")
       .def(py::init<Vec, Vec>(), py::arg("scale"), py::arg("shift"));
   py::class_<Scale, LinearLayer, std::shared_ptr<Scale>>(m, "Scale").def(py::init<Vec>(), py::arg("factors"));

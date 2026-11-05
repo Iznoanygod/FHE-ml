@@ -77,14 +77,30 @@ def predict(model, x, batch=512):
         return torch.cat([model(x[i]) for i in batches(len(x), batch, shuffle=False)])
 
 
+def argmax_range(model, x, quantile=0.999, headroom=1.25):
+    """Comparison range for an encrypted ArgMax after model: the largest
+    logit magnitude of all but the top 0.1% of inputs, with 25% headroom.
+    The excluded inputs are ones whose polynomial activations left their
+    intervals; their logits run to thousands and are already wrong, and a
+    range that covered them would cost the comparisons of every other input
+    their precision (FHEW compares (a - b) / range to a fixed resolution)."""
+    logits = predict(model, x).abs().reshape(len(x), -1).amax(1)
+    bound = headroom * float(torch.quantile(logits.double(), quantile))
+    print(f"argmax range {bound:.1f} (largest training logit: median {logits.median():.1f}, "
+          f"{quantile:.1%} below {bound / headroom:.1f}, max {logits.max():.1f})")
+    return bound
+
+
 def train(model, xtr, ytr, xte, yte, epochs, loss_fn=None, metric=None, lr=2e-3, batch=128,
-          range_weight=RANGE_WEIGHT, clip=1.0, weight_decay=0.0, augment=None, log=print):
+          range_weight=RANGE_WEIGHT, clip=1.0, weight_decay=0.0, augment=None, augment_pairs=None, log=print):
     """Adam with a one-cycle schedule. loss_fn(outputs, targets) defaults to
     cross-entropy; metric(outputs, targets) -> float is printed after every
     epoch on the test set. fheml.nn.range_loss keeps polynomial arguments
     (layer norm variances, softmax scores and sums) inside the intervals the
     encrypted series cover; gradient clipping tames polynomial networks
-    early on. augment(x) -> x is applied to each training batch. Returns
+    early on. augment(x) -> x is applied to each training batch;
+    augment_pairs(x, y) -> (x, y) instead transforms inputs and targets
+    together (flipping an image and its segmentation mask). Returns
     (final metric, training seconds)."""
     loss_fn = loss_fn or nn.functional.cross_entropy
     metric = metric or accuracy
@@ -96,9 +112,13 @@ def train(model, xtr, ytr, xte, yte, epochs, loss_fn=None, metric=None, lr=2e-3,
         model.train()
         t = time.time()
         for idx in batches(len(xtr), batch):
-            xb = xtr[idx] if augment is None else augment(xtr[idx])
+            xb, yb = xtr[idx], ytr[idx]
+            if augment is not None:
+                xb = augment(xb)
+            if augment_pairs is not None:
+                xb, yb = augment_pairs(xb, yb)
             opt.zero_grad()
-            loss = loss_fn(model(xb), ytr[idx])
+            loss = loss_fn(model(xb), yb)
             (loss + range_weight * hnn.range_loss(model)).backward()
             if clip:
                 nn.utils.clip_grad_norm_(model.parameters(), clip)

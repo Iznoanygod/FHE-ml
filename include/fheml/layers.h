@@ -123,6 +123,9 @@ class Layer {
   virtual bool is_bootstrap() const { return false; }
   // Needs ContextOptions::scheme_switching (FHEContext::compare()).
   virtual bool uses_scheme_switching() const { return false; }
+  // Slots this layer's comparisons touch, from the first (0 = all of them;
+  // see ContextOptions::compare_slots).
+  virtual size_t compare_span() const { return 0; }
 
   // Bootstrapped networks (see Network::place_bootstraps). Levels are
   // counted from the output level of a bootstrap; a stretch between
@@ -386,6 +389,115 @@ class MaxPool2d : public Layer {
   double gain_ = 1.0;  // multiplies the gathered taps (absorbs a scale for free)
   bool bootstrapped_ = false;
   LinearTransform gather_, scatter_;
+};
+
+// Encrypted argmax over the last dimension: an input of shape (c, h, w) is
+// c * h groups (tokens, pixels) of w classes (logits), in whatever layout
+// the previous layer left. The output has the input's shape and layout and
+// holds a one-hot per group: 1 at the first maximal class, 0 at the other
+// classes (and in the padding slots).
+//
+// Like MaxPool2d it compares through CKKS -> FHEW -> CKKS scheme switching
+// (FHEContext::compare) and packs what it compares first: a gather (one
+// level) writes class j of every group into block j of M slots (M = the
+// group count rounded up to a power of two; the classes are rounded up to a
+// power of two K' of blocks, the extra blocks hold -range so they never
+// win). Each of the log2 K' rounds compares the lower half of the blocks
+// with the upper half rotated onto it, [a < b], keeps max(a, b) = a +
+// [a < b] (b - a), and multiplies a "still winning" bit per original block:
+// block j was the a side (1 - [a < b]) or the b side ([a < b]) of the pair
+// its current champion played, so the bits are the round's comparison
+// replicated over all blocks (log rotations) and an affine map with
+// plaintext masks. After the last round the bits are the one-hot; a scatter
+// (one level) writes them back to the input layout. That is (K' - 1) M FHEW
+// bootstraps, the same as finding the maximum, with no second comparison
+// against it.
+//
+// Ties go to the lower class index (exact ties only; differences smaller
+// than the comparison resolution, about 4 range / 2^(fhew_log_q - 1), are
+// resolved either way). The one-hot comes from the comparison results,
+// which are fresh at compare_depth() whatever the input level: the layer
+// costs compare_depth() + rounds + 3 levels, and past a bootstrap its output
+// sits `rounds` levels into the stretch (the comparisons come back above a
+// bootstrap's output level) while its input needs rounds + 3 levels left.
+//
+// The network sets ContextOptions::compare_slots to the span the
+// comparisons touch (blocks x block), so the scheme-switching keys stay
+// small however many slots the ciphertexts hold.
+//
+// `range` bounds the inputs, |x| <= range, as for MaxPool2d. `classes` > 0
+// splits the last dimension further: groups of `classes` consecutive
+// features (it must divide w), e.g. the per-pixel class logits of a patch
+// token. `over_channels` instead takes the argmax over the channels of an
+// image at every pixel (groups = h * w, classes = c), e.g. per-pixel
+// segmentation logits of a CNN.
+class ArgMax : public Layer {
+ public:
+  explicit ArgMax(double range = 1.0, int classes = 0, bool over_channels = false);
+  std::string type() const override { return "argmax"; }
+  std::string describe() const override;
+  Shape configure(const Shape& in) override;
+  Layout configure_layout(const Layout& in, Packing packing) override;
+  std::vector<double> forward_plain(const std::vector<double>& x) const override;
+  Ctxt forward(const FHEContext& ctx, const Ctxt& x) const override;
+  uint32_t depth() const override;
+  uint32_t level_after(uint32_t d, uint32_t budget) const override;
+  uint32_t level_peak(uint32_t d, uint32_t budget) const override;
+  std::vector<int32_t> rotation_indices() const override;
+  bool uses_scheme_switching() const override { return true; }
+  size_t compare_span() const override { return static_cast<size_t>(blocks()) * block(); }
+  bool composes_rotations() const override { return true; }
+  void set_bootstrapped(bool on) override { bootstrapped_ = on; }
+  // Past a bootstrap, a tournament longer than the stretch refreshes its
+  // running maxima (bounded by range) before the comparison that would not
+  // fit; the "still winning" bits never need it (see level_after()).
+  bool can_self_bootstrap() const override { return true; }
+  void set_self_bootstrapping(bool on) override { self_ = on; }
+  bool self_bootstrapping() const override { return self_; }
+  uint32_t internal_bootstraps(uint32_t d, uint32_t budget) const override;
+  void compile(uint32_t slots) override;
+  size_t min_slots() const override;
+  void save(std::ostream& os) const override;
+  double range() const { return range_; }
+  double gain() const { return gain_; }
+  // Inputs arriving multiplied by c > 0 (Network::place_bootstraps): the
+  // gather takes 1/c, so range stays that of the original logits.
+  void set_gain(double g) {
+    if (!(g > 0.0)) throw std::invalid_argument("argmax: gain must be positive");
+    gain_ = g;
+  }
+  void set_range(double r) {
+    if (!(r > 0.0)) throw std::invalid_argument("argmax: range must be positive");
+    range_ = r;
+  }
+  // Default: the last dimension; a vector (k x 1 x 1) is one group of k.
+  uint32_t classes() const {
+    if (over_channels_) return static_cast<uint32_t>(in_.c);
+    if (classes_) return static_cast<uint32_t>(classes_);
+    return static_cast<uint32_t>(in_.w == 1 && in_.h == 1 ? in_.c : in_.w);
+  }
+  uint32_t groups() const { return static_cast<uint32_t>(in_.size() / classes()); }
+  uint32_t rounds() const;
+  uint32_t blocks() const { return 1u << rounds(); }
+  uint32_t block() const;
+  bool over_channels() const { return over_channels_; }
+  // Logical (c, h, w row-major) index of class j of group i.
+  size_t logical(uint32_t i, uint32_t j) const;
+
+ private:
+  double range_;
+  int classes_;
+  bool over_channels_;
+  double gain_ = 1.0;
+  bool bootstrapped_ = false;
+  bool self_ = false;
+  uint32_t slots_ = 0;
+  LinearTransform gather_, scatter_;
+  // Walks the value chain entered at stretch level d with `top` levels in
+  // the stretch: false when it does not fit; refreshes counts the
+  // refreshes it needs.
+  bool plan_chain(uint32_t d, uint32_t top, uint32_t* refreshes) const;
+  std::vector<double> pad_;  // -range in the extra class blocks (times the gather's scale: none)
 };
 
 // Per-channel affine map (inference-time batch norm): y = scale[c] * x + shift[c].
