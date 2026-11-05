@@ -1,11 +1,12 @@
 """Encrypted grapheme-to-phoneme conversion with an encoder-decoder transformer.
 
 The task is the CMU pronouncing dictionary: spell a word, get its phonemes
-("knight" -> N AY T). The model is a one-layer encoder-decoder transformer
-trained in PyTorch and run encrypted by fheml:
+("knight" -> N AY T). The model is a one-layer pre-norm encoder-decoder
+transformer (LayerNorm, softmax attention, GELU feed-forward blocks) trained
+in PyTorch, and the whole greedy decoding runs encrypted on the server:
 
-    PYTHONPATH=build/python python3 examples/python/g2p_transformer.py --arch basic [--n 3] [--insecure]
-    PYTHONPATH=build/python python3 examples/python/g2p_transformer.py --arch multihead
+    PYTHONPATH=build/python python3 examples/python/g2p_transformer.py --arch basic --insecure --scale-bits 59 [--n 5]
+    PYTHONPATH=build/python python3 examples/python/g2p_transformer.py --arch multihead --insecure --scale-bits 59
 
 ``basic`` has single-head attention, ``multihead`` has 4 heads of width 8.
 Everything else is the same.
@@ -22,20 +23,23 @@ its pattern (see the README section on encoder-decoders):
     encoder FFN   source tokens only
     cross-attn    target queries x source keys
     decoder FFN   target tokens only
-    head          target tokens -> phoneme logits
+    head          final norm, target tokens -> phoneme logits
 
-The client decodes greedily. It encrypts the letters and the target prefix,
-the server returns encrypted next-phoneme logits for every target position,
-and the client decrypts them, appends the phoneme at the current position
-and sends the sequence again, until </s>. The server never sees a letter or a
-phoneme. The causal mask makes the logits at position t depend only on the
-prefix up to t, so one pass per output phoneme suffices.
+Each block is pre-norm (LayerNorm first, inside the residual).
 
-The script trains with teacher forcing, decodes the test words greedily in
-torch and with the fheml plaintext network (the encrypted computation in the
-clear), and then decodes --n test words encrypted. It reports phoneme and
-whole-word accuracy (word accuracy = 1 - WER) and compares every encrypted
-pass with torch.
+Server decoding (the default, see decoder_network): the client encrypts the
+letters and <s> once. The server unrolls greedy decoding into one network:
+each step runs the transformer, takes the encrypted argmax of the current
+position's logits (scheme-switching comparisons) and writes the one-hot
+phoneme into the next position's input. The client decrypts the finished
+phonemes. --decode client keeps the round-trip variant (the client takes
+each argmax in the clear and re-encrypts).
+
+The script trains with teacher forcing (or loads --weights), decodes the
+test words greedily in torch and with the fheml plaintext networks (the
+encrypted computation in the clear), and then decodes --n test words
+encrypted. It reports phoneme and whole-word accuracy (word accuracy = 1 -
+WER) and whether the encrypted output matches torch.
 """
 import argparse
 import os
@@ -316,6 +320,20 @@ def logit_bound(model, src, tgt):
     return float(peak[ok].max())
 
 
+def in_range_words(model, src, k):
+    """The first k words whose greedy decoding keeps every activation inside
+    the series intervals (bootstrap scaling is calibrated on them; a word
+    that leaves them would make the calibration meaningless)."""
+    peak = np.zeros(len(src[:4 * k]))
+
+    def watch(t, x, logits):
+        peak[:] = np.maximum(peak, np.nan_to_num(np.abs(logits[:, S:]).reshape(len(x), -1).max(1), nan=np.inf))
+
+    greedy(torch_step(model), src[:4 * k], on_pass=watch)
+    ok = np.flatnonzero(peak < 1e3)[:k]
+    return src[ok]
+
+
 def server_decode(model, args, src_tr, tgt_tr, src_te, tgt_te, pred, words, phonemes, common):
     """Greedy decoding inside the encryption: one encrypted network for the
     whole word, the client encrypts the letters and decrypts the phonemes."""
@@ -344,7 +362,7 @@ def server_decode(model, args, src_tr, tgt_tr, src_te, tgt_te, pred, words, phon
         # Quadratic attention needs 6 levels in one stretch: level budget
         # {2,2} with 4 key-switching digits gives 7.
         args.digits = args.digits or 4
-    level_budget = fhe_eval.prepare(dec, args, server_inputs(src_tr[:args.calibration]))
+    level_budget = fhe_eval.prepare(dec, args, server_inputs(in_range_words(model, src_tr, args.calibration)))
     ctx, setup = fhe_eval.context(dec, args, level_budget)
 
     times, enc_pred = [], []

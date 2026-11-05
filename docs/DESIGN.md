@@ -210,10 +210,24 @@ side's tokens, so its residual passes them through. Then:
 Every layer keeps the depth it has without a mask (6 for quadratic scores),
 and the planner places bootstraps as usual. The price of one sequence is
 that every layer touches all n tokens: an encoder block computes with
-zeros on the T target tokens. Generation is the usual client loop: the
-client decrypts the next-token logits, appends its choice to the target
-prefix and sends the encrypted sequence again; the server never sees a
-token. `fheml.nn.SegmentLinear`, `segments=` on `fheml.nn.LayerNorm` and
+zeros on the T target tokens.
+
+Generation stays encrypted from the letters to the last token. Greedy
+decoding unrolls into one network of T − 1 residual steps. Step t runs the
+model, and a `Select` (a 0/1 slot matrix, one level) picks target position
+t's logits. `ArgMax` turns them into an encrypted one-hot by a tournament
+of scheme-switching comparisons. A second `Select` writes the one-hot into
+the input slots of position t + 1, and the residual adds it to the
+sequence. That position held zeros, which is also how training pads the
+target, so every position stays inside the series intervals. The causal
+mask means step t + 1 sees exactly the decoded prefix. Every input runs
+every step, so neither the tokens nor the output length leak, and the
+client decrypts only the final sequence. In a bootstrapped network,
+`ArgMax` costs the stretch only its gather. The comparison bits come back
+fresh from the scheme switch, above a bootstrap's output level, and the
+running maxima are refreshed (`FHEContext::refresh`) whenever the next
+round's comparison would run out of levels, so tournaments of any length
+fit a stretch of two levels or more. `fheml.nn.SegmentLinear`, `segments=` on `fheml.nn.LayerNorm` and
 `fheml.nn.Attention` (with `query_segments` and `key_segments`) and
 `fheml.nn.encoder_decoder_masks(S, T)` are the torch twins. The model file
 writes `segments s_0 … s_{n-1}` after a layer's sizes and

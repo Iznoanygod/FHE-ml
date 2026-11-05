@@ -717,58 +717,89 @@ with the ladder (about 12 GB with `--digits 4`), more than the container's
 ### Encoder-decoder: grapheme to phoneme
 
 `examples/python/g2p_transformer.py` is a one-layer encoder-decoder
-transformer for the CMU pronouncing dictionary: it spells a word and gets
-its phonemes ("knight" → N AY T). Words have at most 8 letters and 7
-phonemes, giving 71,882 training and 8,095 test words. The source (8
-letters) and the target (`<s>` + 7 phonemes) form one encrypted sequence of
-16 one-hot tokens, as in [Encoder-decoders](#encoder-decoders-segments-and-masks).
+transformer for the CMU pronouncing dictionary. Given a word's spelling, it
+outputs the phonemes ("knight" → N AY T). Words have at most 8 letters and
+7 phonemes, which leaves 71,882 training and 8,095 test words. The source
+(8 letters) and the target (`<s>` + 7 phonemes) form one sequence of 16
+one-hot tokens, as in [Encoder-decoders](#encoder-decoders-segments-and-masks).
 `--arch basic` has single-head attention and `--arch multihead` has 4
 heads of width 8. Otherwise the two are the same, with d = 32 and an FFN
-width of 64:
+width of 64. It is a standard pre-norm transformer:
 
-| Layer | Tokens | Depth |
-| --- | --- | --- |
-| embedding: letters / phonemes → d, per segment, plus positions | all | 1 |
-| self-attention: encoder (source × source) and causal decoder (target × earlier target) as one masked layer | all | 6 |
-| encoder FFN (x² activation) | source | 4 |
-| cross-attention: target queries, source keys | target | 6 |
-| decoder FFN | target | 4 |
-| head: d → 42 phoneme logits | target | 1 |
+| Layer | Tokens |
+| --- | --- |
+| embedding: letters / phonemes → d, per segment, plus positions | all |
+| LayerNorm, then self-attention: encoder (source × source) and causal decoder (target × earlier target) as one masked softmax attention | all |
+| LayerNorm, encoder FFN (GELU) | source |
+| LayerNorm, cross-attention: target queries, source keys | target |
+| LayerNorm, decoder FFN (GELU) | target |
+| final LayerNorm, head: d → 42 phoneme logits | target |
 
 Encoder and decoder self-attention never read each other's tokens, so one
-attention layer with the block-diagonal mask runs both side by side. This
-saves 6 levels, so the network is 22 levels deep and fits a 128-bit ring
-2^16 without bootstrapping. The client decodes greedily. It encrypts the
-letters and the target prefix, and decrypts the logits. It then appends
-the phoneme at the current position and sends the sequence again, until
-`</s>`. That is one encrypted pass per output phoneme. Because of the causal
-mask, the logits at a position do not depend on later tokens
-(`tests/test_g2p.py` checks this). The server sees neither letters nor
-phonemes.
+attention layer with the block-diagonal mask runs both side by side. On
+the source tokens, the LayerNorm before cross-attention is the encoder's
+final norm. Softmax is the polynomial softmax, GELU is a degree-15
+Chebyshev series on [-8, 8], and LayerNorm's 1/√ is a Chebyshev series
+plus a Newton step. `--attention quadratic --no-norm --act square` gives
+the cheap variant that uses only HE-friendly polynomials.
+
+**Decoding runs encrypted.** The client encrypts the letters and `<s>`
+once and decrypts the finished phonemes. Greedy decoding happens on the
+server as one network, built by `decoder_network()`. It has 7 residual
+steps, and step t does the following:
+
+1. runs the transformer;
+2. `Select`s the 42 logits of target position t, keeping the 40
+   candidates (`</s>` and the 39 phonemes);
+3. takes their encrypted `ArgMax`, a one-hot built from a tournament of
+   scheme-switching comparisons;
+4. `Select`s the one-hot into the input slots of position t + 1. The
+   residual adds it to the sequence, where that position held zeros.
+
+The causal mask makes step t + 1 see exactly the prefix decoded so far.
+Every word runs all 7 steps, so the server learns neither the phonemes nor
+the word's length. The 8th position is never computed: for words of at
+most 7 phonemes, it is always `</s>`. `--decode client` keeps the
+round-trip variant, with one encrypted pass per phoneme and the argmax done
+by the client.
+
+Two things keep the long computation decodable:
+
+* Every slot has to stay inside the series intervals, including padding
+  tokens, because one diverging slot ruins the bootstrap of the whole
+  ciphertext. Target positions past the prefix are zero vectors both in
+  training and in server decoding, and training uses a strong range
+  penalty (`fheml.nn.range_loss`, weight 10).
+* `ArgMax` in a bootstrapped network refreshes its running maxima when a
+  round would run out of levels. Its comparison bits are fresh after each
+  scheme switch, so the tournament fits any stretch of at least 2 levels.
 
 ```sh
-PYTHONPATH=build/python python3 examples/python/g2p_transformer.py --arch basic --n 3
-PYTHONPATH=build/python python3 examples/python/g2p_transformer.py --arch multihead --n 3
+PYTHONPATH=build/python python3 examples/python/g2p_transformer.py --arch basic --insecure --scale-bits 59 --n 5
+PYTHONPATH=build/python python3 examples/python/g2p_transformer.py --arch multihead --insecure --scale-bits 59 --n 5
 ```
 
-Measured on 4 cores, 30 epochs (about 4.5 minutes of training), 128-bit security:
+Measured on 4 cores at toy parameters (ring 4096, 2048 slots, 59-bit
+scaling, `--insecure`), after 30 epochs of training (about 12 minutes):
 
 | | basic (1 head) | multihead (4 heads) |
 | --- | --- | --- |
-| Teacher-forced phoneme accuracy (torch) | 90.4% | 90.7% |
-| Greedy decoding, torch, 8,095 test words: phonemes / words | 85.0% / 56.7% | 85.5% / 57.7% |
-| fheml plaintext, first 500 test words (shuffled) | 82.5% / 51.2%, identical outputs to torch | 84.3% / 54.6%, identical outputs to torch |
-| Ring, slots, depth | 2^16, 2048, 22, no bootstraps | 2^16, 2048, 22, no bootstraps |
-| Setup | 16 s, 47 rotation keys (4.1 GB) | 14 s, 47 rotation keys (4.1 GB) |
-| Time per encrypted pass | 104 s | 90 s |
-| Time per word (6 to 8 passes) | 610 to 810 s | 545 to 710 s |
-| Peak memory | 7.3 GB | 7.3 GB |
-| Encrypted vs torch logits | ≤ 3.0e-5, 3/3 words decoded exactly like torch | ≤ 4.0e-5, 3/3 words decoded exactly like torch |
+| Teacher-forced phoneme accuracy (torch) | 91.5% | 92.1% |
+| Greedy decoding in torch, 8,095 test words (phonemes / words) | 86.6% / 60.0% | 87.9% / 62.9% |
+| fheml plaintext, first 500 test words (shuffled) | 85.1% / 54.6%, identical to torch | 86.7% / 59.6%, identical to torch |
+| Decoding network in the clear, first 100 words | 99/100 decoded exactly like torch | 100/100 |
+| Depth | 812 levels: 6 bootstraps between steps, 35 placed, 203 inside LayerNorm, softmax and ArgMax | same |
+| Setup | 5 s, 129 rotation keys (0.8 GB) | 5 s, 135 rotation keys (0.9 GB) |
+| Time per word (7 decoding steps, all encrypted) | 454 s | 453 s |
+| Peak memory | 2.7 GB | 2.7 GB |
+| Encrypted vs torch | 5/5 words decoded exactly like torch | 5/5 words decoded exactly like torch |
 
-Word accuracy is 1 − WER. The multi-head model is slightly more accurate
-and also about 13% faster per pass, because its heads need fewer
-rotations (see `docs/DESIGN.md`). Each pass recomputes the whole sequence,
-encoder included.
+Word accuracy is 1 − WER. The decoding network differs from torch on one
+word in 100. That word's activations leave the series intervals in the
+single-head model, so the polynomials give a different, but still
+deterministic, answer. At 50-bit scaling, bootstrapping at 2048 slots keeps
+too few bits. One of the five words then flipped a close phoneme decision,
+so use `--scale-bits 59`.
 
 ## Text transformers
 
