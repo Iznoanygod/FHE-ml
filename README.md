@@ -85,27 +85,29 @@ roadmap.
 
 ## Results
 
-Example MNIST CNN (CryptoNets/LoLa-style), trained with
-`tools/train_mnist.py`:
+Example MNIST CNN (CryptoNets/LoLa shape with ReLU activations,
+`models/mnist_cnn.fheml`), trained with
+`examples/python/train_torch_mnist.py --arch cnn`:
 
 ```
-conv2d 1->5 k=5 s=2 p=1   125 diagonals (gapped out)        depth 1
-poly 0.5x + 0.25x^2                                         depth 2
+conv2d 1->5 k=5 s=2 p=1   125 diagonals                     depth 1
+chebyshev relu [-8, 8] degree 15 (interval folded)          depth 6
 dense 845->64             126 diagonals (folded R=64)       depth 1
-poly 0.5x + 0.25x^2                                         depth 2
+chebyshev relu [-8, 8] degree 15 (interval folded)          depth 6
 dense 64->10               25 diagonals (folded R=16)       depth 1
 ```
 
-* **Accuracy:** 98.3% in plaintext on the 10k MNIST test set.
-* **Parameters:** CKKS at 128-bit security, ring 2^15, 4096 slots, depth 7.
-* **Speed:** about 3 s per encrypted image on 4 cores.
+* **Accuracy:** 98.6% in plaintext on the 10k MNIST test set.
+* **Parameters:** CKKS at 128-bit security, ring 2^16, depth 15; with
+  `--packing multiplexed`, 2048 slots and 40 rotation keys (2.5 GB).
+* **Speed:** about 14 s per encrypted image on 4 cores (multiplexed).
 * **Agreement:** the encrypted logits match plaintext to about 1e-6, and the
   predicted class is the same.
 * **With `--encrypt-weights`:**
-  * The 279 weight and bias ciphertexts take about 6 s to encrypt.
-  * Inference takes about 3.6 s per image.
-  * Peak memory is about 2 GB.
-  * The logits match plaintext to about 1e-4.
+  * The 216 weight and bias ciphertexts take about 27 s to encrypt.
+  * Inference takes about 16 s per image.
+  * Peak memory is about 5.5 GB.
+  * The logits match plaintext to about 2e-5.
 
 Tiny vision transformer on MNIST, trained with `tools/train_transformer.py`.
 Each image is 16 tokens of 7×7 patches, with d = 32, one attention block and
@@ -185,10 +187,12 @@ choose the device. `FHEContext::on_gpu()` reports what was picked. From
 Python, use `fheml.make_context(net, use_gpu=False)`, `ctx.on_gpu` and
 `fheml.gpu_device_count()`.
 
-To retrain the models (numpy only; MNIST is downloaded into `data/`):
+To retrain the models (MNIST is downloaded into `data/`; `tools/train_mnist.py`
+is a numpy-only trainer for the quadratic-activation version of the CNN):
 
 ```sh
-python3 tools/train_mnist.py --out models/mnist_cnn.fheml --samples models/mnist_test_samples.txt
+PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch cnn --out models/mnist_cnn.fheml
+python3 tools/train_mnist.py --out models/mnist_cnn_poly.fheml --samples models/mnist_test_samples.txt
 python3 tools/train_transformer.py --out models/mnist_transformer.fheml
 ```
 
@@ -464,7 +468,7 @@ Measured (OpenFHE 1.4.2, 4 cores; `examples/packing_bench`, `mnist_cnn --packing
 
 | | gapped | compact | multiplexed |
 |---|---|---|---|
-| MNIST CNN, 128-bit (ring 2^15), per image | 2.41 s | 4.98 s | **1.80 s** |
+| MNIST CNN (ReLU), 128-bit (ring 2^16), per image | 17.6 s | 36.6 s | **14.5 s** |
 | MNIST CNN, slots / rotation keys | 4096 / 55 | 1024 / 75 | 2048 / **40** |
 | CIFAR stack, slots (ring) | 65536 (2^17) | 16384 (2^15) | **16384 (2^15)** |
 | CIFAR stack, diagonals / rotation keys | 2657 / 136 | 26066 / 405 | 3822 / 146 |
@@ -475,6 +479,8 @@ slots, depth 2, only that layer's keys), so it compares the packings rather
 than giving an end-to-end number; activations and bootstraps also get 4×
 cheaper at ring 2^15 than at 2^17. The MNIST rows are full encrypted
 inference at 128-bit security (3 images, all correct, logit error < 3e-6).
+The quadratic-activation version of the CNN (depth 7, ring 2^15) takes
+2.4 s gapped and 1.8 s multiplexed.
 For the deep MNIST CNN (`mnist_deepcnn`) multiplexing keeps compact's 256
 slots with 202 diagonals instead of 470 and 33 rotation keys instead of 49.
 Multiplexed layouts also go through encrypted training (`test_train`).
@@ -598,12 +604,17 @@ exports them, checks the plaintext fheml model on 2000 test images, and
 runs `--n` images encrypted (`--profile` times each layer, `--json` appends
 a result record). Inputs are 14x14 MNIST.
 
-**poolcnn: max pooling.** This model is conv 1->4 3x3 stride 2, then exact
-MaxPool2d 2x2 by scheme switching, x², dense 36->32, x², dense 32->10. It
-has 22 levels and no bootstrapping.
+**poolcnn: max pooling.** This model is a small ReLU CNN: conv 1->4 3x3
+stride 2, BatchNorm, ReLU (degree-15 Chebyshev on [-8, 8]), exact MaxPool2d
+2x2 by scheme switching, dense 36->32, BatchNorm, ReLU, dense 32->10. The
+pool's 15 levels and two ReLUs make 30 levels, so `--bootstrap` places 3
+bootstraps and the image stays encrypted throughout. `poolcnn-poly` has
+the quadratic after the pool instead of the ReLUs: 22 levels and no
+bootstrapping.
 
 ```sh
-PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch poolcnn --window 1 --digits 2 --profile --n 1
+PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch poolcnn --bootstrap --insecure --n 2
+PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch poolcnn-poly --window 1 --digits 2 --profile --n 1
 ```
 
 **lnvit: LayerNorm, softmax, multi-head attention.** This is a vision
@@ -617,22 +628,23 @@ PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch lnvi
 
 Measured on 4 cores:
 
-| | poolcnn, 128-bit | poolcnn-s1, toy | lnvit, toy |
-| --- | --- | --- | --- |
-| Accuracy (torch, 10k test images) | 89.6% | 97.4% | 95.6% |
-| fheml plaintext (first 2000) | 87.0% (torch on the same images: 87.0%) | 96.6% | 94.0% (torch: 93.9%) |
-| Ring, slots | 2^16, 256 | 2048, 1024 | 4096, 512 |
-| Depth | 22, no bootstraps | 22 | 47: 3 bootstraps between layers, 12 inside LayerNorm and attention |
-| Setup | 104 s, 60 rotation keys (3.8 GB) | 3 s | 3 s |
-| Time per image | 362 s (MaxPool 347 s, conv 12 s) | 36 s | 22 s |
-| Peak memory | 12.9 GB | 1.9 GB | 2.0 GB |
-| Encrypted vs torch logits | 1.3e-3, same class | 4e-5, 2/2 same class | 3e-2 to 1.2e-1, 5/5 same class |
+| | poolcnn, toy | poolcnn-s1, toy | poolcnn-poly, 128-bit | lnvit, toy |
+| --- | --- | --- | --- | --- |
+| Accuracy (torch, 10k test images) | 89.1% | 97.5% | 89.6% | 95.6% |
+| fheml plaintext (first 2000) | 86.4% (torch: 86.4%) | 96.7% (torch: 96.7%) | 87.0% (torch on the same images: 87.0%) | 94.0% (torch: 93.9%) |
+| Ring, slots | 4096, 256 | 4096, 1024 | 2^16, 256 | 4096, 512 |
+| Depth | 30 → 16 with 3 bootstraps | 30 → 16 with 3 bootstraps | 22, no bootstraps | 47: 3 bootstraps between layers, 12 inside LayerNorm and attention |
+| Setup | 7 s, 111 rotation keys | 10 s, 174 rotation keys | 104 s, 60 rotation keys (3.8 GB) | 3 s |
+| Time per image | 20 s | 61 s | 362 s (MaxPool 347 s, conv 12 s) | 22 s |
+| Peak memory | 2.6 GB | not measured | 12.9 GB | 2.0 GB |
+| Encrypted vs torch logits | 4e-2, 2/2 same class | 6e-2, 2/2 same class | 1.3e-3, same class | 3e-2 to 1.2e-1, 5/5 same class |
 
 `poolcnn-s1` is the same model with a stride-1 convolution (4x14x14 into
 the pool, 1024 slots). Toy columns use insecure parameters. They show
-correctness and the operation count, not 128-bit timings.
+correctness and the operation count, not 128-bit timings. The toy logit
+errors are the precision of a bootstrap at ring 4096.
 
-poolcnn at 128-bit needs `--digits 2` and 256 slots: compare keys plus a
+poolcnn-poly at 128-bit needs `--digits 2` and 256 slots: compare keys plus a
 512-slot comparison go over the container's 14 GB. Almost all of its time
 is the 3 comparison rounds: one FHEW bootstrap per compared slot.
 
