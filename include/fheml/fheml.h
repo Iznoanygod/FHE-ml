@@ -6,6 +6,7 @@
 #include "fheml/layers.h"
 #include "fheml/linear.h"
 #include "fheml/network.h"
+#include "fheml/recurrent.h"
 #include "fheml/train.h"
 #include "fheml/transformer.h"
 

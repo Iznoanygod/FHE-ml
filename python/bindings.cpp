@@ -149,6 +149,26 @@ PYBIND11_MODULE(_fheml, m) {
            "[var_min, var_max] refined by `newton` Newton steps. With segments, gamma and beta hold one "
            "set of dim values per segment.")
       .def("inv_sqrt", &LayerNorm::inv_sqrt, py::arg("var"));
+  py::class_<Recurrent, Layer, std::shared_ptr<Recurrent>>(m, "Recurrent")
+      .def(py::init([](const std::string& cell, int n, int in, int hidden, Vec w_ih, Vec w_hh, Vec b_ih, Vec b_hh,
+                       double gate_a, uint32_t degree, double cell_a, uint32_t cell_degree, bool last) {
+             return std::make_shared<Recurrent>(Recurrent::parse_cell(cell), n, in, hidden, std::move(w_ih),
+                                                std::move(w_hh), std::move(b_ih), std::move(b_hh), gate_a, degree,
+                                                cell_a, cell_degree, last);
+           }),
+           py::arg("cell"), py::arg("tokens"), py::arg("inputs"), py::arg("hidden"), py::arg("w_ih"), py::arg("w_hh"),
+           py::arg("b_ih") = Vec{}, py::arg("b_hh") = Vec{}, py::arg("gate_a") = 8.0, py::arg("degree") = 13,
+           py::arg("cell_a") = 4.0, py::arg("cell_degree") = 13, py::arg("last") = false,
+           "Recurrent layer over a token sequence: cell 'rnn' (tanh), 'gru' or 'lstm' with torch's weight layout "
+           "(w_ih [G*hidden][inputs], w_hh [G*hidden][hidden], biases [G*hidden]; gates r,z,n / i,f,g,o). The "
+           "gates' sigmoid (rnn: tanh) is a Chebyshev series on [-gate_a, gate_a], the GRU candidate / LSTM cell "
+           "tanh one on [-cell_a, cell_a]. last: output only the final hidden state.")
+      .def_property_readonly("cell", [](const Recurrent& r) { return Recurrent::cell_name(r.cell()); })
+      .def_property_readonly("last", &Recurrent::last)
+      .def_property_readonly("bounds", &Recurrent::bounds)
+      .def("series_ranges", &Recurrent::series_ranges, py::arg("inputs"),
+           "Largest |argument| of the gate series and of the cell/candidate series (in units of their "
+           "intervals: must stay <= 1) over the inputs and every encrypted step.");
   py::class_<SoftmaxOptions>(m, "SoftmaxOptions")
       .def(py::init<>())
       .def_readwrite("lo", &SoftmaxOptions::lo)

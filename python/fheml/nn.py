@@ -3,7 +3,8 @@
 Train a model built from ``torch.nn.Sequential``, the supported ``torch.nn``
 layers (Conv2d, Linear, AvgPool2d, AdaptiveAvgPool2d(1), BatchNorm, Flatten,
 Dropout, Identity) and the modules below (``MaxPool2d`` is torch's with an
-input bound), then export it::
+input bound; ``RNN``, ``GRU`` and ``LSTM`` are torch's recurrent cells with
+Chebyshev sigmoid and tanh), then export it::
 
     import torch, fheml
     from fheml import nn as hnn
@@ -24,6 +25,7 @@ import torch
 from torch import nn
 
 __all__ = ["Poly", "Square", "Chebyshev", "Attention", "LayerNorm", "MaxPool2d", "Residual", "TokenMean",
+           "RNN", "GRU", "LSTM",
            "PosEmbedding", "Bootstrap", "SegmentLinear", "chebyshev_coefficients", "range_loss", "segment_ids",
            "causal_mask", "encoder_decoder_masks"]
 
@@ -490,3 +492,147 @@ class Bootstrap(nn.Module):
 
     def forward(self, x):
         return x
+
+
+class _Recurrent(nn.Module):
+    """Shared by RNN, GRU and LSTM: torch's single-layer, batch-first
+    recurrent cells with their sigmoid and tanh replaced by the Chebyshev
+    series the encrypted ``fheml.Recurrent`` evaluates.
+
+    Input (batch, tokens, input_size); output (batch, tokens, hidden_size),
+    every hidden state, or (batch, hidden_size) with ``last=True``. The
+    parameters have torch's names and layout (``weight_ih`` (G*hidden, in),
+    ``weight_hh`` (G*hidden, hidden), ``bias_ih``, ``bias_hh``; gates r, z, n
+    for GRU and i, f, g, o for LSTM), so ``load_torch`` copies a trained
+    ``nn.RNN`` / ``nn.GRU`` / ``nn.LSTM`` layer in.
+
+    ``gate_a``, ``degree``: the gates' sigmoid (RNN: the tanh) is a series on
+    [-gate_a, gate_a]; ``cell_a``, ``cell_degree``: the tanh of the GRU
+    candidate and of the LSTM cell state is one on [-cell_a, cell_a]. The
+    LSTM's candidate gate g = tanh(x) is evaluated as 2 sigmoid(2x) - 1 with
+    the gates' series, so its pre-activation must stay in [-gate_a/2,
+    gate_a/2]. While training, the series see their arguments clamped to the
+    intervals and ``range_loss`` penalises the excess, as for ``Chebyshev``.
+    """
+
+    GATES = 1
+
+    def __init__(self, input_size, hidden_size, gate_a, degree, cell_a, cell_degree, last=False, bias=True):
+        super().__init__()
+        g = self.GATES * hidden_size
+        self.input_size, self.hidden_size, self.last = int(input_size), int(hidden_size), bool(last)
+        self.gate_a, self.degree, self.cell_a, self.cell_degree = float(gate_a), int(degree), float(cell_a), int(cell_degree)
+        bound = 1 / math.sqrt(hidden_size)
+        self.weight_ih = nn.Parameter(torch.empty(g, input_size).uniform_(-bound, bound))
+        self.weight_hh = nn.Parameter(torch.empty(g, hidden_size).uniform_(-bound, bound))
+        if bias:
+            self.bias_ih = nn.Parameter(torch.empty(g).uniform_(-bound, bound))
+            self.bias_hh = nn.Parameter(torch.empty(g).uniform_(-bound, bound))
+        else:
+            self.register_buffer("bias_ih", torch.zeros(g))
+            self.register_buffer("bias_hh", torch.zeros(g))
+        fn = "tanh" if self.GATES == 1 else "sigmoid"
+        self.register_buffer("gate_c", _series_buffer(fn, -self.gate_a, self.gate_a, self.degree))
+        self.register_buffer("cell_c", _series_buffer("tanh", -self.cell_a, self.cell_a, self.cell_degree))
+
+    def load_torch(self, layer):
+        """Copies the weights of a single-layer, unidirectional torch.nn.RNN /
+        GRU / LSTM (``layer``) into this module."""
+        with torch.no_grad():
+            self.weight_ih.copy_(layer.weight_ih_l0)
+            self.weight_hh.copy_(layer.weight_hh_l0)
+            if getattr(layer, "bias_ih_l0", None) is not None:
+                self.bias_ih.copy_(layer.bias_ih_l0)
+                self.bias_hh.copy_(layer.bias_hh_l0)
+        return self
+
+    def _series(self, c, a, x):
+        if self.training:
+            self._terms.append(_excess(x, -a, a))
+            x = x.clamp(-a, a)
+        return _chebyshev_eval(c, -a, a, x)
+
+    def sigmoid(self, x):
+        return self._series(self.gate_c, self.gate_a, x)
+
+    def tanh(self, x):
+        """The cell / candidate tanh (RNN: the hidden tanh)."""
+        if self.GATES == 1:
+            return self._series(self.gate_c, self.gate_a, x)
+        return self._series(self.cell_c, self.cell_a, x)
+
+    def forward(self, x):
+        self._terms = []
+        b, n, _ = x.shape
+        u = x @ self.weight_ih.t() + self.bias_ih  # (b, n, G*hidden)
+        h = x.new_zeros(b, self.hidden_size)
+        state = self.init_state(h)
+        out = []
+        for t in range(n):
+            h, state = self.step(u[:, t], h @ self.weight_hh.t() + self.bias_hh, h, state)
+            out.append(h)
+        if self.training:
+            self._excess = sum(self._terms) / len(self._terms)
+        return h if self.last else torch.stack(out, 1)
+
+    def init_state(self, h):
+        return None
+
+    def extra_repr(self):
+        r = f"{self.input_size}, {self.hidden_size}, gate_a={self.gate_a}, degree={self.degree}"
+        if self.GATES > 1:
+            r += f", cell_a={self.cell_a}, cell_degree={self.cell_degree}"
+        return r + (", last" if self.last else "")
+
+
+class RNN(_Recurrent):
+    """Elman RNN, h_t = tanh(W_ih x_t + b_ih + W_hh h_{t-1} + b_hh), with tanh a
+    degree-``degree`` Chebyshev series on [-a, a]. See ``_Recurrent``."""
+
+    GATES = 1
+
+    def __init__(self, input_size, hidden_size, a=4.0, degree=13, last=False, bias=True):
+        super().__init__(input_size, hidden_size, a, degree, 1.0, 1, last, bias)
+
+    def step(self, ux, wh, h, state):
+        return self.tanh(ux + wh), None
+
+
+class GRU(_Recurrent):
+    """torch.nn.GRU's cell: r, z = sigmoid(.), n = tanh(W_in x + b_in + r (W_hn h
+    + b_hn)), h = (1 - z) n + z h. See ``_Recurrent``."""
+
+    GATES = 3
+
+    def __init__(self, input_size, hidden_size, gate_a=8.0, degree=13, cell_a=4.0, cell_degree=13, last=False,
+                 bias=True):
+        super().__init__(input_size, hidden_size, gate_a, degree, cell_a, cell_degree, last, bias)
+
+    def step(self, ux, wh, h, state):
+        H = self.hidden_size
+        r = self.sigmoid(ux[:, :H] + wh[:, :H])
+        z = self.sigmoid(ux[:, H:2 * H] + wh[:, H:2 * H])
+        n = self.tanh(ux[:, 2 * H:] + r * wh[:, 2 * H:])
+        return n + z * (h - n), None
+
+
+class LSTM(_Recurrent):
+    """torch.nn.LSTM's cell: i, f, o = sigmoid(.), g = tanh(.) evaluated as
+    2 sigmoid(2 .) - 1, c = f c + i g, h = o tanh(c). See ``_Recurrent``."""
+
+    GATES = 4
+
+    def __init__(self, input_size, hidden_size, gate_a=8.0, degree=13, cell_a=4.0, cell_degree=13, last=False,
+                 bias=True):
+        super().__init__(input_size, hidden_size, gate_a, degree, cell_a, cell_degree, last, bias)
+
+    def init_state(self, h):
+        return torch.zeros_like(h)
+
+    def step(self, ux, wh, h, c):
+        H = self.hidden_size
+        p = ux + wh
+        i, f, o = self.sigmoid(p[:, :H]), self.sigmoid(p[:, H:2 * H]), self.sigmoid(p[:, 3 * H:])
+        g = 2 * self.sigmoid(2 * p[:, 2 * H:3 * H]) - 1
+        c = f * c + i * g
+        return o * self.tanh(c), c

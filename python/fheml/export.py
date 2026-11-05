@@ -9,8 +9,9 @@
   ``nn.Linear`` for the head.
 * ``(n, d)`` token sequence: ``nn.Linear`` acts per token, plus Attention
   (quadratic or softmax scores, optional mask), LayerNorm, Residual,
-  PosEmbedding, TokenMean, and SegmentLinear (one weight set per token
-  segment: the source and target of an encoder-decoder).
+  PosEmbedding, TokenMean, SegmentLinear (one weight set per token
+  segment: the source and target of an encoder-decoder) and the recurrent
+  RNN, GRU and LSTM (every hidden state, or the last one as a vector).
 * ``(k,)`` vector: Linear, BatchNorm1d.
 
 Activations must be ``fheml.nn`` polynomials (Poly, Square, Chebyshev).
@@ -182,6 +183,15 @@ class _Exporter:
                 bs = [_np(l.bias) for l in projs]
             out.append(("attention", n, d, ws, bs, _np(m.score), m.heads, m.softmax, seg, _np(m.mask)))
             return state
+        if isinstance(m, hnn._Recurrent):
+            self.need(kind, "tokens", name)
+            n, d = state[1:]
+            self.need_width(d, m.input_size, name)
+            self.max_token_width = max(self.max_token_width, m.input_size, m.hidden_size)
+            cell = {hnn.RNN: "rnn", hnn.GRU: "gru", hnn.LSTM: "lstm"}[type(m)]
+            out.append(("recurrent", cell, n, m.input_size, m.hidden_size, _np(m.weight_ih), _np(m.weight_hh),
+                        _np(m.bias_ih), _np(m.bias_hh), m.gate_a, m.degree, m.cell_a, m.cell_degree, m.last))
+            return ("vector", m.hidden_size) if m.last else ("tokens", n, m.hidden_size)
         if isinstance(m, hnn.LayerNorm):
             self.need(kind, "tokens", name)
             n, d = state[1:]
@@ -233,6 +243,10 @@ class _Exporter:
         if isinstance(m, nn.Softmax):
             raise ValueError("nn.Softmax has no exact encrypted form: fheml.nn.Attention(dim, tokens, softmax={...}) "
                              "evaluates a polynomial softmax inside attention")
+        if isinstance(m, (nn.RNN, nn.GRU, nn.LSTM)):
+            raise ValueError(f"nn.{name} uses exact sigmoid/tanh: use fheml.nn.{name}(input_size, hidden_size, ...) "
+                             "(Chebyshev sigmoid and tanh, single layer, batch first) and its load_torch(layer) to "
+                             "copy trained weights in")
         if isinstance(m, nn.MultiheadAttention):
             raise ValueError(f"nn.{name} is not supported under encryption (see docs/DESIGN.md#transformers)"
                              " (fheml.nn.Attention(dim, tokens, heads=h) is the polynomial multi-head form)")
@@ -318,6 +332,10 @@ def _build(s):
     if k == "layernorm":
         _, n, d, gamma, beta, eps, var_min, var_max, degree, newton, seg = s
         return _fheml.LayerNorm(n, d, _flat(gamma), _flat(beta), eps, var_min, var_max, degree, newton, seg or [])
+    if k == "recurrent":
+        _, cell, n, i, h, wih, whh, bih, bhh, gate_a, degree, cell_a, cell_degree, last = s
+        return _fheml.Recurrent(cell, n, i, h, _flat(wih), _flat(whh), _flat(bih), _flat(bhh), gate_a, degree, cell_a,
+                                cell_degree, last)
     if k == "residual":
         return _fheml.Residual([_build(b) for b in s[1]])
     raise AssertionError(k)
@@ -364,6 +382,12 @@ def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range
             wp = np.zeros(w.shape[:-1] + (width,))
             wp[..., :i] = w
             specs[0] = ("tokendense", n, width, o, wp, b, seg)
+            net_shape = _fheml.Shape(n, 1, width)
+        elif width > d and specs and specs[0][0] == "recurrent":
+            w = specs[0][5]
+            wp = np.zeros((w.shape[0], width))
+            wp[:, :w.shape[1]] = w
+            specs[0] = specs[0][:3] + (width, specs[0][4], wp) + specs[0][6:]
             net_shape = _fheml.Shape(n, 1, width)
 
     net = _fheml.Network(net_shape)

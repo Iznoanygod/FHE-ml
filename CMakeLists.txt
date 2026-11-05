@@ -38,6 +38,7 @@ add_library(fheml
   src/linear.cpp
   src/layers.cpp
   src/network.cpp
+  src/recurrent.cpp
   src/train.cpp
   src/transformer.cpp)
 target_include_directories(fheml PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

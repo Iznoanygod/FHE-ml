@@ -212,14 +212,19 @@ def plain_score(net, x, y, metric=None, n=2000, outputs=False):
 
 
 def check_ranges(net, xs):
-    """Largest |input| of every Chebyshev / exact-relu / max-pool layer over
-    xs, against its interval (the series diverge outside it; the comparison
-    wraps around)."""
+    """Largest |input| of every Chebyshev / exact-relu / max-pool layer, and
+    the series arguments of every recurrent layer, over xs, against their
+    intervals (the series diverge outside them; the comparison wraps
+    around)."""
     xs = [fheml._prepare(net, x) for x in xs]  # token inputs padded to the token stride
     for i, layer in enumerate(net.layers):
         if layer.type in ("chebyshev", "exactrelu", "maxpool2d"):
             peak = max(np.abs(x).max() for x in xs)
             print(f"  layer {i} {layer.describe()}: max |input| {peak:.2f} over {len(xs)} inputs")
+        if layer.type == "recurrent":
+            g, c = layer.series_ranges(xs)
+            print(f"  layer {i} {layer.describe()}: max |series argument| gates {g:.2f}, cell {c:.2f} (must be <= 1) "
+                  f"over {len(xs)} inputs and every step")
         xs = [np.asarray(layer.forward_plain(x)) for x in xs]
 
 

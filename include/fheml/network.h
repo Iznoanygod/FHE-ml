@@ -22,6 +22,9 @@
 //   attention N D HAS_BIAS [heads H]              followed by Wq Wk Wv Wo [, bq bk bv bo], 3 score coefficients
 //                                                 (3 per head with "heads H")
 //   residual K                                    followed by K layers (y = body(x) + x)
+//   recurrent CELL N IN H GATE_A DEGREE CELL_A CELL_DEGREE LAST OUT_SCALE SELFBOOT B1..B10
+//                                                 CELL rnn|gru|lstm; followed by w_ih, w_hh, b_ih, b_hh
+//                                                 (torch layout); 10 refresh bounds (see recurrent.h)
 //   end
 //
 // Optional: "budget B" (any line before "end": the stretch budget
