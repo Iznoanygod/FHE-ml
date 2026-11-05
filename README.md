@@ -644,6 +644,62 @@ column at ring 4096 works because one bootstrap there is accurate to
 1.2e-3, ten times better. So the remaining gap at 128 bits is bootstrap
 precision, not depth or the planner.
 
+### Encoder-decoder: grapheme to phoneme
+
+`examples/python/g2p_transformer.py` is a one-layer encoder-decoder
+transformer for the CMU pronouncing dictionary: it spells a word and gets
+its phonemes ("knight" → N AY T). Words have at most 8 letters and 7
+phonemes, giving 71,882 training and 8,095 test words. The source (8
+letters) and the target (`<s>` + 7 phonemes) form one encrypted sequence of
+16 one-hot tokens, as in [Encoder-decoders](#encoder-decoders-segments-and-masks).
+`--arch basic` has single-head attention and `--arch multihead` has 4
+heads of width 8. Otherwise the two are the same, with d = 32 and an FFN
+width of 64:
+
+| Layer | Tokens | Depth |
+| --- | --- | --- |
+| embedding: letters / phonemes → d, per segment, plus positions | all | 1 |
+| self-attention: encoder (source × source) and causal decoder (target × earlier target) as one masked layer | all | 6 |
+| encoder FFN (x² activation) | source | 4 |
+| cross-attention: target queries, source keys | target | 6 |
+| decoder FFN | target | 4 |
+| head: d → 42 phoneme logits | target | 1 |
+
+Encoder and decoder self-attention never read each other's tokens, so one
+attention layer with the block-diagonal mask runs both side by side. This
+saves 6 levels, so the network is 22 levels deep and fits a 128-bit ring
+2^16 without bootstrapping. The client decodes greedily. It encrypts the
+letters and the target prefix, and decrypts the logits. It then appends
+the phoneme at the current position and sends the sequence again, until
+`</s>`. That is one encrypted pass per output phoneme. Because of the causal
+mask, the logits at a position do not depend on later tokens
+(`tests/test_g2p.py` checks this). The server sees neither letters nor
+phonemes.
+
+```sh
+PYTHONPATH=build/python python3 examples/python/g2p_transformer.py --arch basic --n 3
+PYTHONPATH=build/python python3 examples/python/g2p_transformer.py --arch multihead --n 3
+```
+
+Measured on 4 cores, 30 epochs (about 4.5 minutes of training), 128-bit security:
+
+| | basic (1 head) | multihead (4 heads) |
+| --- | --- | --- |
+| Teacher-forced phoneme accuracy (torch) | 90.4% | 90.7% |
+| Greedy decoding, torch, 8,095 test words: phonemes / words | 85.0% / 56.7% | 85.5% / 57.7% |
+| fheml plaintext, first 500 test words (shuffled) | 82.5% / 51.2%, identical outputs to torch | 84.3% / 54.6%, identical outputs to torch |
+| Ring, slots, depth | 2^16, 2048, 22, no bootstraps | 2^16, 2048, 22, no bootstraps |
+| Setup | 16 s, 47 rotation keys (4.1 GB) | 14 s, 47 rotation keys (4.1 GB) |
+| Time per encrypted pass | 104 s | 90 s |
+| Time per word (6 to 8 passes) | 610 to 810 s | 545 to 710 s |
+| Peak memory | 7.3 GB | 7.3 GB |
+| Encrypted vs torch logits | ≤ 3.0e-5, 3/3 words decoded exactly like torch | ≤ 4.0e-5, 3/3 words decoded exactly like torch |
+
+Word accuracy is 1 − WER. The multi-head model is slightly more accurate
+and also about 13% faster per pass, because its heads need fewer
+rotations (see `docs/DESIGN.md`). Each pass recomputes the whole sequence,
+encoder included.
+
 ## Text transformers
 
 `examples/python/text_transformer.py` trains encoder-only transformers for
@@ -990,9 +1046,9 @@ still need their own key).
 | --- | --- |
 | `include/fheml/`, `src/` | the library: backend selection (`backend.h`: OpenFHE or FIDESlib), context, linear transforms, layers, network, encrypted training (`train.h`) |
 | `examples/` | `mnist_cnn` (encrypted MNIST), `conv_demo` (network built in code), `packing_bench` (gapped vs compact vs multiplexed packing) and `rotation_bench` (hoisted rotation trees vs. plain composed rotations) |
-| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py` |
+| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py`, `test_eval.py`, `test_g2p.py` (the encoder-decoder example) |
 | `python/` | pybind11 bindings and the `fheml` Python package (`fheml.nn` + `fheml.from_torch`: PyTorch export) |
-| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `mnist_mlp_cnn.py` compares the MLP and CNN; `train_encrypted_mnist.py` trains on encrypted data |
+| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `mnist_mlp_cnn.py` compares the MLP and CNN; `train_encrypted_mnist.py` trains on encrypted data; `text_transformer.py` classifies text (AG News, SST-2) with encoder transformers; `g2p_transformer.py` is an encoder-decoder (CMUdict grapheme to phoneme) decoded greedily under encryption |
 | `tools/train_mnist.py`, `tools/train_transformer.py` | HE-friendly CNN / transformer training and export (numpy) |
 | `models/` | trained example models and 200 test images |
 | `legacy/` | the original PALISADE capstone code |
