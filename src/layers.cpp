@@ -613,13 +613,14 @@ uint32_t ArgMax::depth() const {
 // would run out of levels (see forward), so the input only needs the
 // gather and then two levels left for that refresh: d + 2 <= budget. The
 // output (the bits' chain and the scatter) sits at compare_depth() + rounds
-// + 1 absolute, i.e. that minus a bootstrap's output level into the
-// stretch; kMinBootstrapDepth is the shallowest bootstrap the library
-// configures (level budget {2,2}; forward() checks it).
+// + 2 absolute (one level for the mask of a folded or chunked comparison),
+// i.e. that minus a bootstrap's output level into the stretch;
+// kMinBootstrapDepth is the shallowest bootstrap the library configures
+// (level budget {2,2}; forward() checks it).
 uint32_t ArgMax::level_after(uint32_t d, uint32_t budget) const {
   if (!bootstrapped_) return Layer::level_after(d, budget);
   if (d + 2 > budget) return kNoFit;
-  const uint32_t top = FHEContext::compare_depth() + rounds() + 1;
+  const uint32_t top = FHEContext::compare_depth() + rounds() + 2;
   return std::max<uint32_t>(1, top > kMinBootstrapDepth ? top - kMinBootstrapDepth : 0);
 }
 
