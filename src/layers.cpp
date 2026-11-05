@@ -599,10 +599,11 @@ size_t ArgMax::min_slots() const {
 // gather, then from the first update on they sit just past the comparison
 // results (one level per round), and every comparison needs its inputs two
 // levels above the bottom, three when the context folds them onto fewer
-// compared slots (ContextOptions::compare_slots): compare_depth() + rounds + 2
-// covers both.
+// compared slots (ContextOptions::compare_slots), and the results come one
+// level later when a comparison is switched in chunks: compare_depth() +
+// rounds + 3 covers both.
 uint32_t ArgMax::depth() const {
-  return bootstrapped_ ? rounds() + 2 : FHEContext::compare_depth() + rounds() + 2;
+  return bootstrapped_ ? rounds() + 2 : FHEContext::compare_depth() + rounds() + 3;
 }
 
 // Past a bootstrap the comparison results come back at compare_depth(),

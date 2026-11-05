@@ -983,17 +983,35 @@ uint32_t Network::compare_slots() const {
   visit(layers_);
   if (all || !span) return 0;
   uint32_t p = 1;
-  while (p < span) p *= 2;
+  while (p < span && p < kMaxCompareSlots) p *= 2;
   return p < slots_ ? p : 0;
+}
+
+uint32_t Network::compare_span() const {
+  size_t span = 0;
+  std::function<void(const std::vector<std::shared_ptr<Layer>>&)> visit = [&](const auto& layers) {
+    for (const auto& l : layers) {
+      if (auto* r = dynamic_cast<const Residual*>(l.get())) visit(r->body());
+      if (l->uses_scheme_switching()) span = std::max(span, l->compare_span());
+    }
+  };
+  visit(layers_);
+  return static_cast<uint32_t>(span);
 }
 
 std::vector<int32_t> Network::rotation_indices(bool ladder) const {
   if (!slots_) throw std::logic_error("compile() the network first");
   std::set<int32_t> s;
   collect_rotations(layers_, ladder, s);
-  // compare() folds onto compare_slots before switching.
-  if (const uint32_t cs = compare_slots(); cs && !ladder)
+  // compare() folds onto compare_slots before switching, and moves chunks
+  // of compare_slots to the front and back when a comparison spans more.
+  if (const uint32_t cs = compare_slots(); cs && !ladder) {
     for (uint32_t r = cs; r < slots_; r *= 2) s.insert(static_cast<int32_t>(r));
+    for (uint32_t r = cs; r < compare_span(); r += cs) {
+      s.insert(static_cast<int32_t>(r));
+      s.insert(static_cast<int32_t>(slots_ - r));
+    }
+  }
   return std::vector<int32_t>(s.begin(), s.end());
 }
 

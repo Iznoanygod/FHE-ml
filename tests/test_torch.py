@@ -70,10 +70,26 @@ net.save(path)
 x = rng.uniform(-1, 1, (3, 4))
 assert np.array_equal(fheml.plain(fheml.Network.load(path), x), fheml.plain(net, x)), "argmax save/load"
 
+# Comparisons on fewer switched slots than the ciphertext holds
+# (ContextOptions.compare_slots): one fold for 8 slots, chunks of 8 for 32.
+o = fheml.ContextOptions()
+o.mult_depth, o.slots, o.secure, o.scheme_switching, o.compare_slots = 16, 64, False, True, 8
+cctx = fheml.Context(o)
+cctx.keygen([8, 16, 24, 32, 40, 48, 56, -8 % 64, -16 % 64, -24 % 64])
+a, b = rng.uniform(-1, 1, 64), rng.uniform(-1, 1, 64)
+for count in (8, 32):
+    r = np.array(cctx.decrypt(cctx.compare(cctx.encrypt(list(a)), cctx.encrypt(list(b)), 1.0, count), 64))
+    assert np.abs(r[:count] - (a < b)[:count]).max() < 1e-3, count
+    assert np.abs(r[count:]).max() < 1e-3, "zeros beyond count"
+print("--- compare_slots: folded and chunked comparisons OK")
+
 # Per pixel over the channels of an image (CNN segmentation logits), on the
 # gapped layout a strided convolution leaves.
 pix = nn.Sequential(nn.Conv2d(1, 3, 3, stride=2, padding=1), hnn.ArgMax(range=4.0, dim=1))
 run("pixel argmax", pix, (1, 4, 4))
+# 64 pixels x 5 channels (8 blocks of 64): wider than the 256 slots switched
+# at once, so the comparisons fold (256) and chunk (512) under one context.
+run("wide pixel argmax", nn.Sequential(hnn.ArgMax(range=1.5, dim=1)), (5, 8, 8))
 
 # Plain nn.ReLU exports as the exact scheme-switching ReLU: the encrypted
 # result matches torch's true ReLU, not a polynomial.

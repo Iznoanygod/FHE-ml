@@ -137,8 +137,14 @@ class Network {
   // that cannot compose them (attention); linear layers compose theirs.
   std::vector<int32_t> rotation_indices(bool ladder = false) const;
   // ContextOptions::compare_slots for this network: the widest span its
-  // comparisons touch when every comparing layer reports one, else 0 (all).
+  // comparisons touch when every comparing layer reports one, else 0 (all),
+  // capped at kMaxCompareSlots (wider comparisons switch in chunks: the
+  // switching keys grow with the slots switched at once; at ring 2^14 and
+  // 26 levels about 0.6 GB for 256 slots, 1.6 GB for 1024).
+  static constexpr uint32_t kMaxCompareSlots = 256;
   uint32_t compare_slots() const;
+  // Widest span (slots from the first) any comparing layer touches.
+  uint32_t compare_span() const;
 
   // Level to encrypt inputs at: with bootstrapping the first segment only
   // needs depth_before_first_bootstrap() levels, and OpenFHE only refreshes

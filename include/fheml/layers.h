@@ -417,7 +417,7 @@ class MaxPool2d : public Layer {
 // than the comparison resolution, about 4 range / 2^(fhew_log_q - 1), are
 // resolved either way). The one-hot comes from the comparison results,
 // which are fresh at compare_depth() whatever the input level: the layer
-// costs compare_depth() + rounds + 2 levels, and past a bootstrap its output
+// costs compare_depth() + rounds + 3 levels, and past a bootstrap its output
 // sits `rounds` levels into the stretch (the comparisons come back above a
 // bootstrap's output level) while its input needs rounds + 2 levels left.
 //
