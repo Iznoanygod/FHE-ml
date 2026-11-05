@@ -79,8 +79,8 @@ class Recurrent : public Layer {
   // candidate / LSTM cell on [-cell_a, cell_a] (unused by rnn). last: output
   // only the final hidden state.
   Recurrent(Cell cell, int n, int in, int hidden, std::vector<double> w_ih, std::vector<double> w_hh,
-            std::vector<double> b_ih, std::vector<double> b_hh, double gate_a = 8.0, uint32_t degree = 13,
-            double cell_a = 4.0, uint32_t cell_degree = 13, bool last = false);
+            std::vector<double> b_ih, std::vector<double> b_hh, double gate_a = 16.0, uint32_t degree = 13,
+            double cell_a = 8.0, uint32_t cell_degree = 13, bool last = false);
   std::string type() const override { return "recurrent"; }
   std::string describe() const override;
   Shape configure(const Shape& in) override;

@@ -157,8 +157,8 @@ PYBIND11_MODULE(_fheml, m) {
                                                 cell_a, cell_degree, last);
            }),
            py::arg("cell"), py::arg("tokens"), py::arg("inputs"), py::arg("hidden"), py::arg("w_ih"), py::arg("w_hh"),
-           py::arg("b_ih") = Vec{}, py::arg("b_hh") = Vec{}, py::arg("gate_a") = 8.0, py::arg("degree") = 13,
-           py::arg("cell_a") = 4.0, py::arg("cell_degree") = 13, py::arg("last") = false,
+           py::arg("b_ih") = Vec{}, py::arg("b_hh") = Vec{}, py::arg("gate_a") = 16.0, py::arg("degree") = 13,
+           py::arg("cell_a") = 8.0, py::arg("cell_degree") = 13, py::arg("last") = false,
            "Recurrent layer over a token sequence: cell 'rnn' (tanh), 'gru' or 'lstm' with torch's weight layout "
            "(w_ih [G*hidden][inputs], w_hh [G*hidden][hidden], biases [G*hidden]; gates r,z,n / i,f,g,o). The "
            "gates' sigmoid (rnn: tanh) is a Chebyshev series on [-gate_a, gate_a], the GRU candidate / LSTM cell "

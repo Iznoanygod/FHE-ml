@@ -797,8 +797,10 @@ torch's layout (`load_torch(layer)` copies a trained `nn.RNN` / `nn.GRU` /
 `nn.LSTM` in). It outputs every hidden state, so layers stack, or only the
 last one (`last=True`) for a classifier. The cells keep their real
 activations: the gates' sigmoid is a Chebyshev series on [-gate_a, gate_a]
-(default 8, degree 13), the tanh of the RNN, the GRU candidate and the LSTM
-cell one on [-a, a] (default 4). The LSTM's candidate gate uses
+(default 16, degree 13), the tanh of the RNN, the GRU candidate and the LSTM
+cell one on [-a, a] (default 8). Wide intervals matter here: an LSTM cell
+state accumulates over the whole sequence, and with [-8, 8] / [-4, 4] most
+sequential-MNIST inputs left them. The LSTM's candidate gate uses
 tanh(x) = 2 sigmoid(2x) - 1, so all four gates share one series evaluation.
 
 ```python

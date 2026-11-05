@@ -298,6 +298,9 @@ def context(net, args, level_budget):
     t = time.time()
     overrides = {"level_budget": level_budget, "key_switch_digits": args.digits,
                  "bootstrap_iterations": args.boot_iterations, "bootstrap_precision": args.boot_precision}
+    if getattr(args, "scale_bits", None):
+        overrides["scale_mod_bits"] = args.scale_bits
+        overrides["first_mod_bits"] = min(60, args.scale_bits + 7)
     if args.ring or (args.insecure and net.uses_bootstrapping):
         overrides["ring_dim"] = args.ring or max(4096, 2 * net.slots)  # toy ring: the smallest that bootstraps
     ctx = fheml.make_context(net, secure=not args.insecure, rotation_window=args.window, **overrides)

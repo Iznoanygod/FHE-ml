@@ -591,7 +591,7 @@ class RNN(_Recurrent):
 
     GATES = 1
 
-    def __init__(self, input_size, hidden_size, a=4.0, degree=13, last=False, bias=True):
+    def __init__(self, input_size, hidden_size, a=8.0, degree=13, last=False, bias=True):
         super().__init__(input_size, hidden_size, a, degree, 1.0, 1, last, bias)
 
     def step(self, ux, wh, h, state):
@@ -604,7 +604,7 @@ class GRU(_Recurrent):
 
     GATES = 3
 
-    def __init__(self, input_size, hidden_size, gate_a=8.0, degree=13, cell_a=4.0, cell_degree=13, last=False,
+    def __init__(self, input_size, hidden_size, gate_a=16.0, degree=13, cell_a=8.0, cell_degree=13, last=False,
                  bias=True):
         super().__init__(input_size, hidden_size, gate_a, degree, cell_a, cell_degree, last, bias)
 
@@ -622,7 +622,7 @@ class LSTM(_Recurrent):
 
     GATES = 4
 
-    def __init__(self, input_size, hidden_size, gate_a=8.0, degree=13, cell_a=4.0, cell_degree=13, last=False,
+    def __init__(self, input_size, hidden_size, gate_a=16.0, degree=13, cell_a=8.0, cell_degree=13, last=False,
                  bias=True):
         super().__init__(input_size, hidden_size, gate_a, degree, cell_a, cell_degree, last, bias)
 

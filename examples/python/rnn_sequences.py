@@ -42,10 +42,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "tools"))
 import fhe_eval  # noqa: E402
 from datasets import AGNEWS_CLASSES, SST2_CLASSES, load_agnews, load_mnist, load_sst2  # noqa: E402
 
+RANGE_WEIGHT = 20.0
 CELLS = {"rnn": hnn.RNN, "gru": hnn.GRU, "lstm": hnn.LSTM}
 TASKS = {
     # tokens, (vocabulary), classes, default epochs
-    "smnist": dict(tokens=28, classes=[str(d) for d in range(10)], epochs=6),
+    "smnist": dict(tokens=28, classes=[str(d) for d in range(10)], epochs=5),
     "sst2": dict(load=load_sst2, tokens=32, vocab=12000, classes=SST2_CLASSES, epochs=8),
     "agnews": dict(load=load_agnews, tokens=16, vocab=20000, classes=AGNEWS_CLASSES, epochs=4),
 }
@@ -75,11 +76,15 @@ def main():
     ap.add_argument("--hidden", type=int, default=32, help="hidden state size")
     ap.add_argument("--dim", type=int, default=32, help="word vector size (text tasks)")
     ap.add_argument("--lr", type=float, default=3e-3)
+    ap.add_argument("--scale-bits", type=int, help="CKKS scaling bits (default 59 for bootstrapped toy runs)")
+    ap.add_argument("--threads", type=int, help="torch threads for training")
     ap.add_argument("--train-size", type=int, help="use only this many training sequences")
     fhe_eval.add_args(ap)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
+    if args.threads:
+        torch.set_num_threads(args.threads)
     task = TASKS[args.task]
     classes, tokens = task["classes"], task["tokens"]
     if args.task == "smnist":
@@ -99,8 +104,10 @@ def main():
     model = recurrent(args.cell, inputs, args.hidden, classes)
     embed = Embed(len(data["vocab"]), args.dim) if args.task != "smnist" else nn.Identity()
     full = nn.Sequential(embed, model)
+    # A strong range penalty: the series run on every step and diverge
+    # outside their intervals, and encrypted inference cannot clamp.
     acc, train_time = fhe_eval.train(full, xtr, ytr, xte, yte, args.epochs or task["epochs"], lr=args.lr,
-                                     weight_decay=1e-5)
+                                     weight_decay=1e-5, range_weight=RANGE_WEIGHT)
 
     # From here on the encrypted input is the pixel rows or the word vectors.
     with torch.no_grad():
@@ -126,6 +133,10 @@ def main():
         # one or three per step at 5 levels.
         args.budget = 10 if args.cell == "rnn" else 12
     level_budget = fhe_eval.prepare(net, args, vcal)
+    if args.bootstrap and args.insecure and not args.scale_bits:
+        # At 4096 slots a 50-bit scale leaves bootstrapping only a few bits of
+        # precision; 59 bits keeps about 12 (toy rings have room for it).
+        args.scale_bits = 59
     ctx, setup = fhe_eval.context(net, args, level_budget)
 
     def describe(i, enc, ref):
