@@ -603,23 +603,47 @@ size_t ArgMax::min_slots() const {
 // level later when a comparison is switched in chunks: compare_depth() +
 // rounds + 3 covers both.
 uint32_t ArgMax::depth() const {
-  return bootstrapped_ ? rounds() + 2 : FHEContext::compare_depth() + rounds() + 3;
+  return bootstrapped_ ? rounds() + 3 : FHEContext::compare_depth() + rounds() + 3;
 }
 
 // Past a bootstrap the comparison results come back at compare_depth(),
 // higher than a bootstrap's output level (18-20), so the bits leave at most
-// `rounds` levels into the stretch whatever the input level; the input
-// needs rounds + 2 levels for the value chain (gather, rounds - 1 updates,
-// and compare()'s mask when the context compares fewer slots than it holds).
+// `rounds` levels into the stretch whatever the input level. The running
+// maxima spend one level on the gather and one on each update, and every
+// compare() needs three levels left (two for the slots-to-coefficients
+// transform, one for its mask when the context compares fewer slots than
+// it holds): rounds + 3 levels in all. A self-bootstrapping layer refreshes
+// the maxima (|a| <= range) before a comparison that would not fit, which
+// takes one level for the refresh's scaling and one left for the bootstrap.
+bool ArgMax::plan_chain(uint32_t d, uint32_t top, uint32_t* refreshes) const {
+  uint32_t s = d + 1, n = 0;
+  const uint32_t r = rounds();
+  for (uint32_t k = 0; k < r; ++k) {
+    if (s + 3 > top) {
+      if (!self_ || s + 2 > top) return false;
+      s = 0;
+      ++n;
+    }
+    if (k + 1 < r) ++s;
+  }
+  if (refreshes) *refreshes = n;
+  return true;
+}
+
 uint32_t ArgMax::level_after(uint32_t d, uint32_t budget) const {
   if (!bootstrapped_) return Layer::level_after(d, budget);
-  return d + rounds() + 2 <= budget ? rounds() : kNoFit;
+  return plan_chain(d, budget, nullptr) ? rounds() : kNoFit;
 }
 
 uint32_t ArgMax::level_peak(uint32_t d, uint32_t budget) const {
   if (!bootstrapped_) return Layer::level_peak(d, budget);
   const uint32_t out = level_after(d, budget);
-  return out == kNoFit ? kNoFit : std::max(out, d + rounds() + 2);
+  return out == kNoFit ? kNoFit : std::max(out, std::min(d + rounds() + 3, budget));
+}
+
+uint32_t ArgMax::internal_bootstraps(uint32_t d, uint32_t budget) const {
+  uint32_t n = 0;
+  return bootstrapped_ && self_ && plan_chain(d, budget, &n) ? n : 0;
 }
 
 void ArgMax::compile(uint32_t slots) {
@@ -678,8 +702,10 @@ Ctxt ArgMax::forward(const FHEContext& ctx, const Ctxt& x) const {
     cc->EvalAddInPlace(a, p);
   }
   Ctxt alive;  // the "still winning" bit of every block (slots of real groups)
+  const uint32_t top = ctx.stretch_budget() + 1;  // the context's levels per stretch
   for (uint32_t h = nb / 2; h >= 1; h /= 2) {
     const size_t n = static_cast<size_t>(h) * m;
+    if (self_ && ctx.stretch_budget() && ctx.stretch_level(a) + 3 > top) a = ctx.refresh(a, 1.25 * range_);
     Ctxt b = ctx.rotate(a, static_cast<int32_t>(n));
     Ctxt sel = ctx.compare(a, b, range_, n);  // [a < b] in the first h blocks, 0 beyond
     if (h > 1) a = cc->EvalAdd(a, cc->EvalMult(sel, cc->EvalSub(b, a)));
