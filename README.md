@@ -568,9 +568,11 @@ of the examples, from mirrors that stay reachable from restricted networks:
 | `load_pets(size=64)` | Oxford-IIIT Pet: 37 breeds, cat/dog, pixel trimaps (pet, background, border), pet head boxes | segmentation, detection |
 | `load_coco(split, size, max_images, masks)` | COCO 2017 instances: boxes and masks of 80 categories, squashed to size×size; `val` whole, `train` fetched image by image from the archive | detection, segmentation |
 | `load_cmudict` | CMU pronouncing dictionary: spelling → phonemes (39), ≤ 8 letters/phonemes, 10% test by word hash | sequence to sequence |
+| `load_agnews(max_tokens=16)` | AG News: 120k/7.6k news articles, 4 topics, title + description as word ids | text classification |
+| `load_sst2(max_tokens=32)` | SST-2: 7.8k/1.8k movie-review sentences, positive/negative, as word ids | text classification |
 
 ```sh
-python3 tools/datasets.py cifar10 pets coco cmudict   # fetch and cache once
+python3 tools/datasets.py cifar10 pets coco cmudict agnews sst2   # fetch and cache once
 ```
 
 `tools/fhe_eval.py` is what every example script shares: the encryption
@@ -697,6 +699,88 @@ Word accuracy is 1 − WER. The multi-head model is slightly more accurate
 and also about 13% faster per pass, because its heads need fewer
 rotations (see `docs/DESIGN.md`). Each pass recomputes the whole sequence,
 encoder included.
+
+## Text transformers
+
+`examples/python/text_transformer.py` trains encoder-only transformers for
+text classification and runs them encrypted, in two forms that differ only
+in the attention: a basic transformer with one head of width d (`--heads 1`)
+and a multi-head one that splits the same d into heads (`--heads 4`, same
+parameter count). The client tokenizes its text, looks the words up in the
+embedding table that comes with the model (like the tokenizer) and encrypts
+the (tokens, d) matrix of word vectors; the server computes the rest:
+
+```text
+token Linear d -> d (+ learned positions)
+residual { LayerNorm, softmax self-attention, 1 or 4 heads }
+residual { LayerNorm, Linear d -> 2d, 0.5x + 0.25x², Linear 2d -> d }
+LayerNorm, mean over tokens, Linear d -> classes
+```
+
+with d = 32. AG News (4 news topics) uses the first 16 words of title and
+description, SST-2 (sentence sentiment) 32 words. Every series runs on a
+fixed interval (scores [-4, 4], row sums [0.5, 100], block-norm variance
+[0, 8], final-norm variance [0, 16]); the range loss keeps the training
+data inside them and the script prints how the test data fits. The network
+is 56 levels deep: `--bootstrap` places one bootstrap between layers, and
+LayerNorm and softmax attention bootstrap inside (14 refreshes, 16 for 4
+heads on SST-2).
+
+```sh
+PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 1 --bootstrap --insecure --n 10
+PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 4 --bootstrap --insecure --n 10
+PYTHONPATH=build/python python3 examples/python/text_transformer.py --task sst2 --heads 4 --bootstrap --insecure --n 10
+```
+
+Measured on 4 cores (toy parameters: correctness and operation count, not
+128-bit timings; see lnvit above for why the softmax/LayerNorm models need
+ring 2^17 at 128 bits):
+
+| | AG News, 1 head | AG News, 4 heads | SST-2, 1 head | SST-2, 4 heads |
+| --- | --- | --- | --- | --- |
+| Accuracy (torch, whole test set) | 88.9% | 88.9% | 76.6% | 78.1% |
+| fheml plaintext | 88.4% (first 2000; torch on them 88.4%) | 88.2% (torch 88.2%) | 76.6% (all 1821) | 78.1% |
+| Ring, slots | 4096, 2048 | 4096, 2048 | 8192, 4096 | 8192, 4096 |
+| Rotation keys | 115 (711 MB) | 122 (754 MB) | 131 (1.6 GB) | 110 (1.4 GB) |
+| Time per text | 29 s | 27 s | 59 s | 63 s |
+| Peak memory | 2.1 GB | 2.2 GB | 3.9 GB | 3.6 GB |
+| Encrypted vs torch logits | 4e-2 to 1.8e-1, 10/10 same class | 2e-2 to 2.4e-1, 10/10 | 2e-2 to 2.9e-1, 10/10 | 1e-2 to 1.9e-1, 10/10 |
+
+The logit error is the toy ring's bootstrap error (about 1e-3 per refresh)
+amplified through 14 refreshes; it does not change a single prediction.
+Multi-head attention costs no levels and here no time over the single
+head: the heads sit in slot sub-blocks of each token, so there are no
+split or concatenation rotations. Models whose polynomials leave their
+intervals on some input (one AG News test text drives the 4-head model's
+last LayerNorm variance to 311 against [0, 16]) are counted at their real
+encrypted output in the fheml plaintext accuracy.
+
+`--attention quadratic --no-norm` is the same model with the polynomial
+score `A = c0 + c1 S + c2 S²` and no LayerNorm, shallow enough to run at
+128-bit security without bootstrapping:
+
+```sh
+PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 4 --attention quadratic --no-norm --window 1 --n 3
+```
+
+Measured at 128-bit security, ring 2^15, 40-bit scale, depth 12, rotation-key
+ladder (`--window 1`), 4 cores, 3 test texts each:
+
+| | AG News, 1 head | AG News, 4 heads | SST-2, 1 head | SST-2, 4 heads |
+| --- | --- | --- | --- | --- |
+| Accuracy (torch, whole test set) | 88.9% | 89.0% | 79.6% | 79.6% |
+| fheml plaintext | 88.4% (first 2000; torch on them 88.4%) | 88.1% (torch 88.1%) | 79.6% (all 1821) | 79.6% |
+| Slots, rotation keys | 2048, 38 (969 MB) | 2048, 38 (969 MB) | 4096, 55 (1.4 GB) | 4096, 55 (1.4 GB) |
+| Setup | 3 s | 3 s | 4 s | 4 s |
+| Time per text | 14.5 s | 14.8 s | 21.7 s | 18.2 s |
+| Peak memory | 2.3 GB | 2.3 GB | 3.2 GB | 3.1 GB |
+| Encrypted vs torch logits | 6e-7 to 9e-7, 3/3 same class | 4e-7 to 8e-7, 3/3 | 3e-7 to 6e-7, 3/3 | 9e-8 to 4e-7, 3/3 |
+
+Without bootstrapping the error stays at CKKS noise, and polynomial
+attention loses nothing in accuracy against softmax on these short texts
+(on SST-2 it does slightly better). Four heads are as fast as one, or
+faster when the token blocks are wide (SST-2): each head's window sums and
+broadcasts need log2(d/heads) rotations instead of log2(d).
 
 ## Encrypted training
 
@@ -964,7 +1048,7 @@ still need their own key).
 | `examples/` | `mnist_cnn` (encrypted MNIST), `conv_demo` (network built in code), `packing_bench` (gapped vs compact vs multiplexed packing) and `rotation_bench` (hoisted rotation trees vs. plain composed rotations) |
 | `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py`, `test_eval.py`, `test_g2p.py` (the encoder-decoder example) |
 | `python/` | pybind11 bindings and the `fheml` Python package (`fheml.nn` + `fheml.from_torch`: PyTorch export) |
-| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `mnist_mlp_cnn.py` compares the MLP and CNN; `train_encrypted_mnist.py` trains on encrypted data; `g2p_transformer.py` is an encoder-decoder (CMUdict grapheme to phoneme) decoded greedily under encryption |
+| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `mnist_mlp_cnn.py` compares the MLP and CNN; `train_encrypted_mnist.py` trains on encrypted data; `text_transformer.py` classifies text (AG News, SST-2) with encoder transformers; `g2p_transformer.py` is an encoder-decoder (CMUdict grapheme to phoneme) decoded greedily under encryption |
 | `tools/train_mnist.py`, `tools/train_transformer.py` | HE-friendly CNN / transformer training and export (numpy) |
 | `models/` | trained example models and 200 test images |
 | `legacy/` | the original PALISADE capstone code |
