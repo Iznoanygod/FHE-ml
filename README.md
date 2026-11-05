@@ -450,6 +450,46 @@ about 8e-3. At 128-bit security the four ReLUs alone would take about
 4 × 412 s ≈ 28 minutes per image, against seconds for the Chebyshev model. The trainer has no
 backward pass for it yet; the FIDESlib backend has no scheme switching.
 
+## Encrypted argmax
+
+A prediction is a non-polynomial step as well, so it runs under encryption
+too: `ArgMax(range)` returns a one-hot in place of the logits, 1 at the first
+maximum of every group and 0 elsewhere, in the input's own layout. The
+client decrypts the class (or a label per pixel) and never sees a logit.
+
+```python
+model = nn.Sequential(trained, hnn.ArgMax(range=R))            # over the last dimension
+model = nn.Sequential(trained, hnn.ArgMax(range=R, classes=3)) # groups of 3 features (per-pixel classes of a patch token)
+model = nn.Sequential(cnn, hnn.ArgMax(range=R, dim=1))         # per pixel over an image's channels
+net = fheml.from_torch(model, shape)
+```
+
+The layer packs class j of every group into block j of M slots (a gather,
+one level; the classes are rounded up to K' blocks, the extra ones hold
+−range), then plays a tournament of comparisons like max pooling: each round
+compares the lower half of the blocks with the upper half, keeps
+`a + [a < b](b − a)`, and multiplies a "still winning" bit into every
+original block, the round's comparison copied onto the blocks by rotations.
+The bits after the last round are the one-hot, and a scatter writes them
+back. That is (K' − 1)·M FHEW bootstraps, the same as finding the maximum,
+and `compare_depth() + rounds + 3` levels. Past a bootstrap the bits sit
+above the stretch (the comparisons return at level 12, a bootstrap at
+18–20), so the layer leaves its output `rounds` levels into the stretch and
+needs `rounds + 3` levels of input. `range` bounds the logits, as for max
+pooling; ties go to the lower class.
+
+The scheme-switching keys grow with the number of slots switched at once,
+not with the comparisons: the network sets `ContextOptions::compare_slots`
+to the span its argmax touches, capped at 256. `compare()` masks `a − b` to
+the compared slots, folds the ciphertext onto that period and switches only
+those, in chunks of 256 slots for a wider comparison (each chunk rotated to
+the front and its result masked back). A folded result repeats with the
+switched period, so it is masked to its first `count` slots too: the
+argmax rotates its comparison bits across its whole span, which can be
+wider than 256 slots (16 blocks of 16 for nine channels on a 4×4 map). The switching keys of a 26-level
+toy context at ring 2^14 take about 0.6 GB this way; switching all 8192
+slots does not fit 14 GB.
+
 ## Multiplexed packing
 
 A gapped stride-2 output needs `C·H·W` slots where a compact one needs a
@@ -538,7 +578,9 @@ Two more things make deep transformers fit:
 
 * **Range loss.** `fheml.nn.range_loss(model)` penalises LayerNorm
   variances, attention scores and softmax row sums that leave their
-  intervals. Add it to the training loss so the calibrated intervals stay
+  intervals, and Chebyshev activation and max-pool inputs that leave
+  theirs (summed per image, since a single stray activation is enough to
+  break a bootstrap). Add it to the training loss so the calibrated intervals stay
   narrow. A narrow interval matters because bootstrap error is absolute
   (see below), and a wide `1/x` interval magnifies it.
 * **Iterative bootstrapping.** With `bootstrap_iterations=2`, OpenFHE
@@ -595,7 +637,7 @@ python3 tools/datasets.py cifar10 pets coco cmudict agnews sst2   # fetch and ca
 
 `tools/fhe_eval.py` is what every example script shares: the encryption
 flags (`add_args`: `--insecure`, `--bootstrap`, `--window`, `--digits`,
-`--level-budget`, `--ring`, `--boot-iterations`, `--packing`, `--n`,
+`--level-budget`, `--ring`, `--boot-iterations`, `--scale-bits`, `--packing`, `--n`,
 `--profile`, `--json`), torch training with the range loss (`train`), the
 plaintext score of the exported network (`plain_score`), range checks,
 bootstrap placement (`prepare`), the context (`context`), the encrypted
@@ -668,6 +710,57 @@ column at ring 4096 works because one bootstrap there is accurate to
 1.2e-3, ten times better. So the remaining gap at 128 bits is bootstrap
 precision, not depth or the planner.
 
+### CIFAR-10
+
+`examples/python/train_torch_cifar10.py` classifies encrypted 32x32 colour
+images. The client normalises the image, encrypts all 3072 values (4096
+slots) and decrypts the ten logits. Every layer in between runs encrypted,
+with bootstraps where the depth requires them. All three models use two
+stride-2 stages with multiplexed packing, so the 16x16 and 8x8 maps stay
+in the 4096 input slots. They are trained with random crops and flips.
+
+| Model | Layers | What it exercises |
+| --- | --- | --- |
+| `cnn` | conv 3→16 s2, conv 16→32 s2, conv 32→32 (BatchNorm folded), `x/2 + x²/4` activations, 2x2 average pool, dense 512→10 | the CryptoNets-style quadratic baseline: 11 levels, no bootstrapping |
+| `deepcnn` | six conv blocks (16, 16, 32, 32, 64, 64 channels, three stride-2) with degree-7 Chebyshev ReLU on [-8, 8], global average pool, dense 64→10 | ReLU networks: 38 levels, folded to 32 with 6 bootstraps |
+| `poolcnn` | four of those conv/ReLU blocks, exact 2x2 MaxPool2d, dense 512→10 | conv, ReLU, exact max pooling by scheme switching and bootstrapping in one network |
+
+```sh
+PYTHONPATH=build/python python3 examples/python/train_torch_cifar10.py --arch cnn --window 1 --n 5
+PYTHONPATH=build/python python3 examples/python/train_torch_cifar10.py --arch deepcnn --bootstrap --level-budget 3 --digits 4 --insecure --ring 8192 --scale-bits 59 --n 10
+PYTHONPATH=build/python python3 examples/python/train_torch_cifar10.py --arch poolcnn --bootstrap --level-budget 3 --digits 4 --insecure --ring 8192 --scale-bits 59 --n 5
+```
+
+Measured on 4 cores. The plaintext and encrypted columns use a fixed
+shuffle of the test set, since the cached copy is sorted by class:
+
+| | cnn, 128-bit | cnn, toy | deepcnn, toy | poolcnn, toy |
+| --- | --- | --- | --- | --- |
+| Accuracy (torch, 10k test images) | 74.3% | 74.3% | 75.1% | 74.0% |
+| fheml plaintext (2000 images; torch identical) | 72.5% | 72.5% | 74.4% | 73.4% |
+| Ring, slots, scale | 2^15, 4096, 40 bits | 8192, 4096, 40 bits | 8192, 4096, 59 bits | 8192, 4096, 59 bits |
+| Depth | 11 | 11 | 32: 6 bootstraps | 24: 4 bootstraps, MaxPool 15 |
+| Setup, rotation keys | 2 s, 23 (ladder, 552 MB) | 1 s, 71 | 10 s, 169 (2.9 GB) | 25 s, 249 (4.2 GB) |
+| Time per image | 13.0 s | 2.3 s | 25.6 s (bootstraps 18 s) | 105 s (MaxPool 99 s) |
+| Peak memory | 2.6 GB | 2.2 GB | 5.5 GB | 10.1 GB |
+| Encrypted vs torch logits | 3e-7, 5/5 same class | 1e-7, 10/10 | 2.6e-3, 10/10 | 1.5e-3, 5/5 |
+
+The deep ReLU network beats the quadratic one by less than a point. With
+16 to 64 channels and a degree-7 ReLU, both models are about the size
+CKKS handles comfortably, not that of state-of-the-art CIFAR models. The
+max pool is exact, but at one FHEW bootstrap per compared slot (1024, then
+512) it takes 95% of poolcnn's time.
+
+**Bootstrap precision and slot count.** At 4096 slots and 50-bit
+scaling, a bootstrap keeps only about 3 bits (1 bit with
+`key_switch_digits=4`, against 6 bits at 256 slots), and six of them leave
+deepcnn's logits off by 2 to 5. A larger ring alone does not help. A larger
+scale does: 55 bits keep 8 bits and 59 bits keep 12, hence `--scale-bits
+59` on the toy runs. At 128-bit security, ring 2^16 fits only 50-bit
+scaling. The 4096-slot bootstrapping keys also take 100 rotation keys even
+with the ladder (about 12 GB with `--digits 4`), more than the container's
+14 GB, so the bootstrapped CIFAR models run on toy parameters here.
+
 ### Encoder-decoder: grapheme to phoneme
 
 `examples/python/g2p_transformer.py` is a one-layer encoder-decoder
@@ -732,59 +825,72 @@ in the attention: a basic transformer with one head of width d (`--heads 1`)
 and a multi-head one that splits the same d into heads (`--heads 4`, same
 parameter count). The client tokenizes its text, looks the words up in the
 embedding table that comes with the model (like the tokenizer) and encrypts
-the (tokens, d) matrix of word vectors; the server computes the rest:
+the (tokens, d) matrix of word vectors. Everything after that runs
+encrypted, including every non-polynomial step: the client decrypts only the
+class logits.
 
 ```text
 token Linear d -> d (+ learned positions)
 residual { LayerNorm, softmax self-attention, 1 or 4 heads }
-residual { LayerNorm, Linear d -> 2d, 0.5x + 0.25x², Linear 2d -> d }
+residual { LayerNorm, Linear d -> 2d, GELU, Linear 2d -> d }
 LayerNorm, mean over tokens, Linear d -> classes
 ```
 
 with d = 32. AG News (4 news topics) uses the first 16 words of title and
-description, SST-2 (sentence sentiment) 32 words. Every series runs on a
-fixed interval (scores [-4, 4], row sums [0.5, 100], block-norm variance
-[0, 8], final-norm variance [0, 16]); the range loss keeps the training
-data inside them and the script prints how the test data fits. The network
-is 56 levels deep: `--bootstrap` places one bootstrap between layers, and
-LayerNorm and softmax attention bootstrap inside (14 refreshes, 16 for 4
-heads on SST-2).
+description, SST-2 (sentence sentiment) 32 words. Every non-polynomial
+function is a series on a fixed interval: GELU degree 7 on [-8, 8], exp
+on scores [-4, 4], 1/x on row sums [0.5, 100], 1/sqrt on block-norm
+variances [0, 8] and final-norm variances [0, 16]. The range loss keeps the
+training data inside, and the script prints how the test data fits. The
+network is 58 levels deep. `--bootstrap` places two bootstraps between
+layers, and LayerNorm and softmax attention bootstrap inside (13 refreshes,
+15 for 4 heads on SST-2).
 
 ```sh
-PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 1 --bootstrap --insecure --n 10
-PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 4 --bootstrap --insecure --n 10
-PYTHONPATH=build/python python3 examples/python/text_transformer.py --task sst2 --heads 4 --bootstrap --insecure --n 10
+PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 1 --bootstrap --insecure --scale-bits 59 --n 10
+PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 4 --bootstrap --insecure --scale-bits 59 --n 10
+PYTHONPATH=build/python python3 examples/python/text_transformer.py --task sst2 --heads 4 --bootstrap --insecure --scale-bits 59 --n 10
 ```
 
-Measured on 4 cores (toy parameters: correctness and operation count, not
-128-bit timings; see lnvit above for why the softmax/LayerNorm models need
-ring 2^17 at 128 bits):
+Measured on 4 cores with toy parameters (59-bit scaling). These show
+correctness and operation count, not 128-bit timings.
 
 | | AG News, 1 head | AG News, 4 heads | SST-2, 1 head | SST-2, 4 heads |
 | --- | --- | --- | --- | --- |
-| Accuracy (torch, whole test set) | 88.9% | 88.9% | 76.6% | 78.1% |
-| fheml plaintext | 88.4% (first 2000; torch on them 88.4%) | 88.2% (torch 88.2%) | 76.6% (all 1821) | 78.1% |
+| Accuracy (torch, whole test set) | 88.9% | 88.9% | 75.8% | 77.4% |
+| fheml plaintext | 88.2% (first 2000; torch on them 88.2%) | 88.5% (torch 88.5%) | 75.8% (all 1821) | 77.4% |
 | Ring, slots | 4096, 2048 | 4096, 2048 | 8192, 4096 | 8192, 4096 |
-| Rotation keys | 115 (711 MB) | 122 (754 MB) | 131 (1.6 GB) | 110 (1.4 GB) |
-| Time per text | 29 s | 27 s | 59 s | 63 s |
-| Peak memory | 2.1 GB | 2.2 GB | 3.9 GB | 3.6 GB |
-| Encrypted vs torch logits | 4e-2 to 1.8e-1, 10/10 same class | 2e-2 to 2.4e-1, 10/10 | 2e-2 to 2.9e-1, 10/10 | 1e-2 to 1.9e-1, 10/10 |
+| Rotation keys | 115 (733 MB) | 122 (777 MB) | 131 (1.7 GB) | 110 (1.4 GB) |
+| Time per text | 22 s | 24 s | 61 s | 62 s |
+| Peak memory | 2.1 GB | 2.2 GB | 3.8 GB | 3.6 GB |
+| Encrypted vs torch logits | 6e-5 to 4e-4, 10/10 same class | 9e-5 to 5e-4, 10/10 | 4e-5 to 8e-4, 10/10 | 2e-5 to 2e-4, 10/10 |
 
-The logit error is the toy ring's bootstrap error (about 1e-3 per refresh)
-amplified through 14 refreshes; it does not change a single prediction.
-Multi-head attention costs no levels and here no time over the single
-head: the heads sit in slot sub-blocks of each token, so there are no
-split or concatenation rotations. Models whose polynomials leave their
-intervals on some input (one AG News test text drives the 4-head model's
-last LayerNorm variance to 311 against [0, 16]) are counted at their real
-encrypted output in the fheml plaintext accuracy.
+Use 59-bit scaling for these runs. At the default 50 bits, one bootstrap
+over thousands of slots keeps only a few bits. The logits then drift by
+1e-1 through 13 refreshes, and on SST-2 (4096 slots) one text differed
+from torch and another failed to decode. Multi-head attention costs no
+levels and no time over the single head: the heads sit in slot sub-blocks
+of each token, so there are no split or concatenation rotations. When a
+polynomial leaves its interval on some input, the fheml plaintext accuracy
+counts that input at its real encrypted output. One AG News test text drives
+the 4-head model's block-norm variance far past [0, 8].
 
-`--attention quadratic --no-norm` is the same model with the polynomial
-score `A = c0 + c1 S + c2 S²` and no LayerNorm, shallow enough to run at
-128-bit security without bootstrapping:
+The same model also decodes at 128-bit security when made small enough for
+this machine's 14 GB. That run used AG News cut to 8 words, d = 16, MLP
+width 16 and 256 slots (`--tokens 8 --dim 16 --mlp-ratio 1 --bootstrap
+--window 1 --level-budget 3 --digits 4 --boot-iterations 2`). Torch scores
+85.9% and the fheml plaintext 85.0%. The run took 62 s of setup, 57
+rotation keys (7.5 GB) and 11.6 GB peak, at 10 minutes per text, and 2/2
+texts gave the same class as torch (logit error 5.5e-2). At 512 slots and
+more, key generation runs out of memory here.
+
+`--attention quadratic --no-norm --activation quadratic` replaces softmax with
+the polynomial score `A = c0 + c1 S + c2 S²`, drops LayerNorm and uses
+`0.5x + 0.25x²` in the MLP. The result is shallow enough to run at 128-bit
+security without bootstrapping:
 
 ```sh
-PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 4 --attention quadratic --no-norm --window 1 --n 3
+PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 4 --attention quadratic --no-norm --activation quadratic --window 1 --n 3
 ```
 
 Measured at 128-bit security, ring 2^15, 40-bit scale, depth 12, rotation-key
@@ -805,6 +911,71 @@ attention loses nothing in accuracy against softmax on these short texts
 (on SST-2 it does slightly better). Four heads are as fast as one, or
 faster when the token blocks are wide (SST-2): each head's window sums and
 broadcasts need log2(d/heads) rotations instead of log2(d).
+
+## Vision transformers
+
+`examples/python/vision_transformers.py` runs a ViT classifier on CIFAR-10
+and a segmentation transformer on Oxford-IIIT Pet trimaps (pet, background,
+border), both at 32x32 with 64 tokens of 4x4 patches. Each comes with a
+single-head and a multi-head (`--heads 4`) variant. The client patchifies
+and encrypts the image, and it decrypts a one-hot: the class, or a label for
+every pixel. The patch embedding, the blocks, the head and the argmax all
+run on ciphertexts.
+
+The default block is a standard pre-norm transformer: LayerNorm, softmax
+attention, LayerNorm and a GELU MLP, with a final LayerNorm. The segmentation
+head is a per-patch linear decoder (as in SETR-naive): every output token
+holds the logits of its patch's 16 pixels, and `ArgMax(classes=3)` picks
+each pixel's class (1024 pixels, 3072 comparisons). The model trains with
+the series' arguments clamped to their intervals and penalised outside them
+(range weight 10). It then runs on intervals 1.5x wider at degree 15, so
+test images that stray past the training ranges stay accurate. `--block
+basic` is the very basic transformer instead: a quadratic attention score,
+no LayerNorm and a square activation. It is 12 levels deep and runs at
+128-bit security without bootstrapping.
+
+```sh
+F="--bootstrap --level-budget 3 --digits 4 --scale-bits 59 --window 1 --insecure --ring 16384"
+PYTHONPATH=build/python python3 examples/python/vision_transformers.py --task cifar --heads 4 $F
+PYTHONPATH=build/python python3 examples/python/vision_transformers.py --task pets --heads 4 $F
+```
+
+Measured on 4 cores. The transformer columns use toy parameters (ring
+2^14, 59-bit scaling), with d = 32, MLP 64 and one block. CIFAR is top-1
+accuracy and Pets is mean IoU over the three classes:
+
+| | CIFAR, 1 head | CIFAR, 4 heads | Pets, 1 head | Pets, 4 heads |
+| --- | --- | --- | --- | --- |
+| torch (all test images) | 57.7% | 58.9% | 0.484 | 0.499 |
+| fheml plaintext (2000 / 500 test images) | 57.1% (torch on them: 57.1%) | 59.8% (torch: 59.8%) | 0.483 (torch: 0.483) | 0.503 (torch: 0.503) |
+| Depth | 71: 3 bootstraps between layers, 17 inside LayerNorm, softmax and argmax | 71: 3 + 23 | 68: 3 + 16 | 68: 3 + 22 |
+| Setup, rotation keys | 27 s, 229 keys (7.8 GB) | 19 s, 153 keys (5.2 GB) | 30 s, 232 keys (7.9 GB) | 21 s, 177 keys (6.0 GB) |
+| Time per image | 133-136 s | 163-169 s | 408-409 s | 376-397 s (argmax 225 s) |
+| Peak memory | 11.9 GB | 9.0 GB | 12.3 GB | 9.8 GB |
+| Encrypted vs torch | one-hots within 4e-6, 3/3 same class | 1e-5, 3/3 | 1.5e-5, every pixel the same (2 images) | 1.5e-5, every pixel the same (2 images) |
+
+The heads are sub-blocks of each token's slots, so they need no split or
+concat rotations, and the 4-head models need fewer rotation keys than the
+single-head ones. Time follows the refreshes instead: the 4-head CIFAR
+model's attention plans 23 bootstraps inside its layers against 17, so it is
+about 25% slower, while the 4-head Pets model is a little faster. d = 64
+does not fit: the keys for 16384-slot ciphertexts exceed 14 GB even at toy
+parameters.
+
+The basic block at d = 64 runs at 128-bit security on ring 2^15 (12 levels,
+99 rotation keys, 2.5 GB). Its output is the logits (`--logits`), because
+the argmax's scheme-switching levels do not fit without bootstrapping:
+
+| basic, 128-bit | CIFAR, 1 head | CIFAR, 4 heads | Pets, 1 head | Pets, 4 heads |
+| --- | --- | --- | --- | --- |
+| torch | 54.0% | 56.6% | 0.464 | 0.476 |
+| fheml plaintext | 55.5% (2000 images) | 57.6% | 0.467 (500 images) | 0.479 |
+| Time per image | 43 s | 36 s | 43 s | 41 s |
+| Peak memory | 6.1 GB | 6.2 GB | 5.5 GB | 5.5 GB |
+| Encrypted vs torch (5 images) | 5e-6, 5/5 | 3e-6, 5/5 | every pixel | every pixel |
+
+`train_torch_mnist.py --arch vit` and `--arch lnvit` use the same GELU MLP
+and end in the encrypted argmax as well (`--logits` drops it).
 
 ## Recurrent networks
 
@@ -1145,9 +1316,9 @@ still need their own key).
 | --- | --- |
 | `include/fheml/`, `src/` | the library: backend selection (`backend.h`: OpenFHE or FIDESlib), context, linear transforms, layers, network, encrypted training (`train.h`) |
 | `examples/` | `mnist_cnn` (encrypted MNIST), `conv_demo` (network built in code), `packing_bench` (gapped vs compact vs multiplexed packing) and `rotation_bench` (hoisted rotation trees vs. plain composed rotations) |
-| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py`, `test_eval.py`, `test_g2p.py` (the encoder-decoder example), `test_recurrent.py` (RNN, GRU, LSTM) |
+| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py`, `test_eval.py`, `test_g2p.py` (the encoder-decoder example), `test_vision_transformers.py`, `test_recurrent.py` (RNN, GRU, LSTM) |
 | `python/` | pybind11 bindings and the `fheml` Python package (`fheml.nn` + `fheml.from_torch`: PyTorch export) |
-| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `mnist_mlp_cnn.py` compares the MLP and CNN; `train_encrypted_mnist.py` trains on encrypted data; `text_transformer.py` classifies text (AG News, SST-2) with encoder transformers; `rnn_sequences.py` runs RNN, GRU and LSTM classifiers (sequential MNIST, SST-2, AG News); `g2p_transformer.py` is an encoder-decoder (CMUdict grapheme to phoneme) decoded greedily under encryption |
+| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` and `train_torch_cifar10.py` train in torch and run encrypted; `mnist_mlp_cnn.py` compares the MLP and CNN; `train_encrypted_mnist.py` trains on encrypted data; `text_transformer.py` classifies text (AG News, SST-2) with encoder transformers; `rnn_sequences.py` runs RNN, GRU and LSTM classifiers (sequential MNIST, SST-2, AG News); `g2p_transformer.py` is an encoder-decoder (CMUdict grapheme to phoneme) decoded greedily under encryption; `vision_transformers.py` is a CIFAR-10 ViT and an Oxford Pets segmentation transformer |
 | `tools/train_mnist.py`, `tools/train_transformer.py` | HE-friendly CNN / transformer training and export (numpy) |
 | `models/` | trained example models and 200 test images |
 | `legacy/` | the original PALISADE capstone code |

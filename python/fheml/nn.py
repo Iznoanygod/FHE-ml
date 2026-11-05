@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from torch import nn
 
-__all__ = ["Poly", "Square", "Chebyshev", "Attention", "LayerNorm", "MaxPool2d", "Residual", "TokenMean",
+__all__ = ["Poly", "Square", "Chebyshev", "Attention", "LayerNorm", "MaxPool2d", "ArgMax", "Residual", "TokenMean",
            "RNN", "GRU", "LSTM",
            "PosEmbedding", "Bootstrap", "SegmentLinear", "chebyshev_coefficients", "range_loss", "segment_ids",
            "causal_mask", "encoder_decoder_masks"]
@@ -90,9 +90,18 @@ def _excess(x, lo, hi):
     return (torch.relu(x - hi) + torch.relu(lo - x)).pow(2).mean()
 
 
+def _sample_excess(x, lo, hi):
+    """Squared distance of x outside [lo, hi], summed per sample and averaged
+    over the batch. Activation maps have many values and a handful outside
+    the interval is enough to break an encrypted series, so the excess is
+    not diluted by the map size like a mean would."""
+    return (torch.relu(x - hi) + torch.relu(lo - x)).pow(2).sum() / max(len(x), 1)
+
+
 def range_loss(model):
-    """Sum of how far the last training forward pushed Chebyshev activation
-    inputs, LayerNorm variances and softmax scores / row sums outside the intervals their encrypted series
+    """Sum of how far the last training forward pushed LayerNorm variances,
+    softmax scores / row sums, Chebyshev activation inputs and max-pool
+    inputs outside the intervals their encrypted series or comparisons
     cover (mean squared excess). Add ``weight * range_loss(model)`` to the
     training loss so the model learns to stay inside them: the series
     diverge outside, and encrypted inference cannot clamp."""
@@ -109,10 +118,11 @@ class Chebyshev(nn.Module):
 
     The forward pass evaluates the polynomial itself, not the exact function,
     so training sees what encrypted inference computes. Inputs outside [a, b]
-    blow up quickly, as they do under encryption: while training, the series
-    sees its input clamped to [a, b] and records how far the input went
-    outside, which ``range_loss`` turns into a penalty that pulls the
-    pre-activations back inside. Check the ranges on data before encrypting.
+    blow up quickly, as they do under encryption. While training, the series
+    sees its input clamped to [a, b] (one stray pre-activation would
+    otherwise derail the step) and ``range_loss`` reports how far the batch
+    went outside, so the model learns to stay in range; check the ranges on
+    data before encrypting.
     """
 
     def __init__(self, fn, a, b, degree):
@@ -125,7 +135,7 @@ class Chebyshev(nn.Module):
 
     def forward(self, x):
         if self.training:
-            self._excess = _excess(x, self.a, self.b)
+            self._excess = _sample_excess(x, self.a, self.b)
             x = x.clamp(self.a, self.b)
         return _chebyshev_eval(self.c, self.a, self.b, x)
 
@@ -480,8 +490,57 @@ class MaxPool2d(nn.MaxPool2d):
             raise ValueError("MaxPool2d: range must be positive")
         self.range = float(range)
 
+    def forward(self, x):
+        if self.training:
+            self._excess = _sample_excess(x, -self.range, self.range)
+        return super().forward(x)
+
     def extra_repr(self):
         return super().extra_repr() + f", range={self.range}"
+
+
+class ArgMax(nn.Module):
+    """Encrypted argmax, exported to ``fheml.ArgMax`` (CKKS <-> FHEW scheme switching).
+
+    Returns a one-hot of the input's shape: within every group of ``classes``
+    consecutive features of the last dimension (default: all of it), 1 at
+    the first maximum and 0 elsewhere. ``dim=1`` on an image (batch, C, H, W)
+    takes the argmax over the channels of every pixel instead. Put it after a trained model, as the
+    last layer to export (it has no gradient)::
+
+        net = fheml.from_torch(nn.Sequential(model, hnn.ArgMax(range=R)), shape)
+
+    ``range`` bounds the inputs, ``|x| <= range`` (the comparison wraps
+    around outside it): take it from the logits on training data. Groups of
+    K classes cost ceil(log2 K) comparison rounds, (K' - 1) M FHEW
+    bootstraps (K', M: K and the group count rounded up to powers of two)
+    and 12 + ceil(log2 K) + 2 levels.
+    """
+
+    def __init__(self, range=1.0, classes=None, dim=-1):
+        super().__init__()
+        if not range > 0:
+            raise ValueError("ArgMax: range must be positive")
+        if classes is not None and classes < 1:
+            raise ValueError("ArgMax: classes must be positive")
+        if dim not in (-1, 1) or (dim == 1 and classes):
+            raise ValueError("ArgMax: dim is -1 (last, optionally in groups of classes) or 1 (image channels)")
+        self.range, self.classes, self.dim = float(range), classes, dim
+
+    def forward(self, x):
+        if self.dim == 1:
+            if x.dim() != 4:
+                raise ValueError("ArgMax(dim=1) expects images (batch, C, H, W)")
+            return nn.functional.one_hot(x.argmax(1), x.shape[1]).to(x.dtype).permute(0, 3, 1, 2)
+        k = self.classes or x.shape[-1]
+        if x.shape[-1] % k:
+            raise ValueError("ArgMax: classes must divide the last dimension")
+        g = x.reshape(*x.shape[:-1], x.shape[-1] // k, k)
+        return nn.functional.one_hot(g.argmax(-1), k).to(x.dtype).reshape(x.shape)
+
+    def extra_repr(self):
+        return (f"range={self.range}" + (f", classes={self.classes}" if self.classes else "")
+                + (", dim=1" if self.dim == 1 else ""))
 
 
 class Bootstrap(nn.Module):

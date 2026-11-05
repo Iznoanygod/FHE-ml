@@ -3,6 +3,9 @@ plaintext reference and encrypted inference against torch (toy parameters).
 
     PYTHONPATH=build/python python3 tests/test_torch.py
 """
+import os
+import tempfile
+
 import numpy as np
 import torch
 from torch import nn
@@ -51,6 +54,42 @@ pooled = nn.Sequential(nn.Conv2d(1, 2, 3, padding=1), hnn.MaxPool2d(2, range=2.0
 with torch.no_grad():
     pooled[0].weight.mul_(0.5)
 run("max pool", pooled, (1, 4, 4))
+
+# Encrypted argmax (scheme switching): a one-hot of the logits. 6 classes
+# pad to 8 blocks (the extra ones hold -range and never win).
+clf = nn.Sequential(nn.Linear(5, 6), hnn.ArgMax(range=4.0))
+net = run("argmax", clf, (5,))
+assert net.layers[-1].type == "argmax"
+# Per token and per group of 3 features (the pixel classes of a patch token),
+# in the token-strided layout of the previous layer.
+seg = nn.Sequential(nn.Linear(4, 8), hnn.PosEmbedding(3, 8), hnn.Residual(hnn.Attention(8, 3)), nn.Linear(8, 6),
+                    hnn.ArgMax(range=4.0, classes=3))
+net = run("token argmax", seg, (3, 4))
+path = os.path.join(tempfile.mkdtemp(), "argmax.fheml")
+net.save(path)
+x = rng.uniform(-1, 1, (3, 4))
+assert np.array_equal(fheml.plain(fheml.Network.load(path), x), fheml.plain(net, x)), "argmax save/load"
+
+# Comparisons on fewer switched slots than the ciphertext holds
+# (ContextOptions.compare_slots): one fold for 8 slots, chunks of 8 for 32.
+o = fheml.ContextOptions()
+o.mult_depth, o.slots, o.secure, o.scheme_switching, o.compare_slots = 16, 64, False, True, 8
+cctx = fheml.Context(o)
+cctx.keygen([8, 16, 24, 32, 40, 48, 56, -8 % 64, -16 % 64, -24 % 64])
+a, b = rng.uniform(-1, 1, 64), rng.uniform(-1, 1, 64)
+for count in (8, 32):
+    r = np.array(cctx.decrypt(cctx.compare(cctx.encrypt(list(a)), cctx.encrypt(list(b)), 1.0, count), 64))
+    assert np.abs(r[:count] - (a < b)[:count]).max() < 1e-3, count
+    assert np.abs(r[count:]).max() < 1e-3, "zeros beyond count"
+print("--- compare_slots: folded and chunked comparisons OK")
+
+# Per pixel over the channels of an image (CNN segmentation logits), on the
+# gapped layout a strided convolution leaves.
+pix = nn.Sequential(nn.Conv2d(1, 3, 3, stride=2, padding=1), hnn.ArgMax(range=4.0, dim=1))
+run("pixel argmax", pix, (1, 4, 4))
+# 64 pixels x 5 channels (8 blocks of 64): wider than the 256 slots switched
+# at once, so the comparisons fold (256) and chunk (512) under one context.
+run("wide pixel argmax", nn.Sequential(hnn.ArgMax(range=1.5, dim=1)), (5, 8, 8))
 
 # Plain nn.ReLU exports as the exact scheme-switching ReLU: the encrypted
 # result matches torch's true ReLU, not a polynomial.
@@ -159,6 +198,23 @@ with torch.no_grad():
     y1 = encdec(xs2)
 assert torch.allclose(y0[0, :-1], y1[0, :-1]) and not torch.allclose(y0[0, -1], y1[0, -1]), "causality"
 assert torch.all(y0[0, :S] == 0), "head acts on the target segment only"
+
+# Chebyshev activations and exact max pools report inputs outside their
+# intervals to range_loss while training (the series clamp them); in eval
+# mode the series is evaluated as is, like encrypted inference.
+cheb, pool = hnn.Chebyshev("relu", -2, 2, 7).double(), hnn.MaxPool2d(2, 2, range=2.0)
+xr = torch.tensor([[[[0.5, 3.0], [-1.0, 1.0]]]], dtype=torch.float64)
+cheb.train()(xr)
+pool.train()(xr)
+assert abs(cheb._excess.item() - 1.0) < 1e-12, cheb._excess          # (3 - 2)^2, summed per sample
+assert abs(pool._excess.item() - 1.0) < 1e-12, pool._excess
+assert abs(hnn.range_loss(nn.Sequential(cheb, pool)).item() - 2.0) < 1e-12
+inside = torch.linspace(-2, 2, 9, dtype=torch.float64)
+assert torch.allclose(cheb.train()(inside), cheb.eval()(inside)), "clamping only changes out-of-range inputs"
+out = torch.tensor([3.0], dtype=torch.float64)
+assert abs(cheb.eval()(out).item() - hnn._chebyshev_eval(cheb.c, -2.0, 2.0, out).item()) < 1e-12, "eval: no clamp"
+assert abs(cheb.train()(out).item() - cheb.eval()(torch.tensor([2.0], dtype=torch.float64)).item()) < 1e-12
+print("range loss: chebyshev and max pool inputs")
 
 # A short training run: the exported model reproduces the trained one.
 x = torch.rand(256, 1, 8, 8, dtype=torch.float64)

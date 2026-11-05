@@ -59,6 +59,30 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
     auto w = read_vec(is, static_cast<size_t>(i) * o, "dense weights");
     auto b = hb ? read_vec(is, o, "dense bias") : std::vector<double>{};
     layer = std::make_shared<Dense>(i, o, std::move(w), std::move(b));
+  } else if (tok == "argmax") {
+    double range;
+    is >> range;
+    int classes = 0;
+    double gain = 1.0;
+    bool channels = false;
+    for (;;) {  // optional "classes K", "channels", "gain G"
+      std::string next;
+      auto pos = is.tellg();
+      if (is >> next && next == "classes") {
+        is >> classes;
+      } else if (next == "channels") {
+        channels = true;
+      } else if (next == "gain") {
+        is >> gain;
+      } else {
+        is.clear();
+        is.seekg(pos);
+        break;
+      }
+    }
+    auto am = std::make_shared<ArgMax>(range, classes, channels);
+    am->set_gain(gain);
+    layer = am;
   } else if (tok == "avgpool2d") {
     int k, s;
     is >> k >> s;
@@ -364,8 +388,10 @@ Fold fold_kind(const Layer& l) {
   if (dynamic_cast<const PolyActivation*>(&l) || dynamic_cast<const ChebyshevActivation*>(&l) ||
       dynamic_cast<const ExactReLU*>(&l) || dynamic_cast<const Scale*>(&l) || dynamic_cast<const FusedLinear*>(&l) ||
       dynamic_cast<const LayerNorm*>(&l) || dynamic_cast<const MaxPool2d*>(&l) || dynamic_cast<const Attention*>(&l) ||
-      dynamic_cast<const Recurrent*>(&l))
-    return Fold::kAbsorb;  // MaxPool2d: max(c x) = c max(x), c > 0, taken by its gather
+      dynamic_cast<const Recurrent*>(&l) || dynamic_cast<const ArgMax*>(&l))
+    // MaxPool2d: max(c x) = c max(x), c > 0, taken by its gather; ArgMax:
+    // argmax(c x) = argmax(x), its gather takes 1/c (the range stays put).
+    return Fold::kAbsorb;
   if (l.is_bootstrap()) return Fold::kPass;
   if (auto* lin = dynamic_cast<const LinearLayer*>(&l)) {
     if (lin->trainable()) return Fold::kAbsorb;
@@ -477,6 +503,7 @@ void absorb_input(std::shared_ptr<Layer>& l, double c) {
   if (auto* ln = dynamic_cast<LayerNorm*>(l.get())) return ln->absorb_input_scale(c);
   if (auto* mp = dynamic_cast<MaxPool2d*>(l.get())) return mp->set_gain(mp->gain() / c);
   if (auto* rec = dynamic_cast<Recurrent*>(l.get())) return rec->absorb_input_scale(c);
+  if (auto* am = dynamic_cast<ArgMax*>(l.get())) return am->set_gain(am->gain() / c);
   if (auto* at = dynamic_cast<Attention*>(l.get())) {
     // q, k and v are linear in the input: their weights (not biases) take 1/c.
     std::vector<double> p = at->params();
@@ -957,10 +984,50 @@ void collect_rotations(const std::vector<std::shared_ptr<Layer>>& layers, bool l
 
 }  // namespace
 
+uint32_t Network::compare_slots() const {
+  if (!slots_) throw std::logic_error("compile() the network first");
+  size_t span = 0;
+  bool all = false;
+  std::function<void(const std::vector<std::shared_ptr<Layer>>&)> visit = [&](const auto& layers) {
+    for (const auto& l : layers) {
+      if (auto* r = dynamic_cast<const Residual*>(l.get())) visit(r->body());
+      if (!l->uses_scheme_switching()) continue;
+      if (!l->compare_span()) all = true;
+      span = std::max(span, l->compare_span());
+    }
+  };
+  visit(layers_);
+  if (all || !span) return 0;
+  uint32_t p = 1;
+  while (p < span && p < kMaxCompareSlots) p *= 2;
+  return p < slots_ ? p : 0;
+}
+
+uint32_t Network::compare_span() const {
+  size_t span = 0;
+  std::function<void(const std::vector<std::shared_ptr<Layer>>&)> visit = [&](const auto& layers) {
+    for (const auto& l : layers) {
+      if (auto* r = dynamic_cast<const Residual*>(l.get())) visit(r->body());
+      if (l->uses_scheme_switching()) span = std::max(span, l->compare_span());
+    }
+  };
+  visit(layers_);
+  return static_cast<uint32_t>(span);
+}
+
 std::vector<int32_t> Network::rotation_indices(bool ladder) const {
   if (!slots_) throw std::logic_error("compile() the network first");
   std::set<int32_t> s;
   collect_rotations(layers_, ladder, s);
+  // compare() folds onto compare_slots before switching, and moves chunks
+  // of compare_slots to the front and back when a comparison spans more.
+  if (const uint32_t cs = compare_slots(); cs && !ladder) {
+    for (uint32_t r = cs; r < slots_; r *= 2) s.insert(static_cast<int32_t>(r));
+    for (uint32_t r = cs; r < compare_span(); r += cs) {
+      s.insert(static_cast<int32_t>(r));
+      s.insert(static_cast<int32_t>(slots_ - r));
+    }
+  }
   return std::vector<int32_t>(s.begin(), s.end());
 }
 
@@ -971,6 +1038,7 @@ ContextOptions Network::context_options(bool secure) const {
   o.secure = secure;
   o.bootstrapping = uses_bootstrapping();
   o.scheme_switching = uses_scheme_switching();
+  if (o.scheme_switching) o.compare_slots = compare_slots();
   // +1: EvalBootstrap needs one level left when its input arrives.
   o.mult_depth = o.bootstrapping ? depth_between_bootstraps() + 1 : depth();
   if (o.bootstrapping) {

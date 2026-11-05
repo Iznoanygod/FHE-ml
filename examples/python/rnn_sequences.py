@@ -76,7 +76,6 @@ def main():
     ap.add_argument("--hidden", type=int, default=32, help="hidden state size")
     ap.add_argument("--dim", type=int, default=32, help="word vector size (text tasks)")
     ap.add_argument("--lr", type=float, default=3e-3)
-    ap.add_argument("--scale-bits", type=int, help="CKKS scaling bits (default 59 for bootstrapped toy runs)")
     ap.add_argument("--threads", type=int, help="torch threads for training")
     ap.add_argument("--train-size", type=int, help="use only this many training sequences")
     fhe_eval.add_args(ap)

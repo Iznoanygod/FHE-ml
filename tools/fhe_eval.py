@@ -15,7 +15,7 @@ An example script defines its model and data and calls these in order:
 
 ``add_args`` gives every example the same encryption flags (--insecure,
 --bootstrap, --budget, --window, --digits, --level-budget, --ring, --boot-iterations,
---boot-precision, --packing, --n, --profile, --json). The metrics below
+--boot-precision, --scale-bits, --packing, --n, --profile, --json). The metrics below
 cover classification, segmentation, detection and sequence tasks.
 """
 import json
@@ -58,6 +58,9 @@ def add_args(ap, n=3):
                     help="2 = iterative bootstrapping: about twice the bits of precision for twice the time")
     ap.add_argument("--boot-precision", type=int, default=0,
                     help="bits of precision of one bootstrap for --boot-iterations 2 (default: measured at keygen)")
+    ap.add_argument("--scale-bits", type=int, default=0,
+                    help="CKKS scaling modulus bits (0 = 50). Toy runs of bootstrapped networks: 59 makes a "
+                    "4096-slot bootstrap about 2^-14 accurate instead of 2^-3 (128-bit ring 2^16 fits 50)")
     ap.add_argument("--seed", type=int, default=0)
     return ap
 
@@ -76,14 +79,30 @@ def predict(model, x, batch=512):
         return torch.cat([model(x[i]) for i in batches(len(x), batch, shuffle=False)])
 
 
+def argmax_range(model, x, quantile=0.999, headroom=1.25):
+    """Comparison range for an encrypted ArgMax after model: the largest
+    logit magnitude of all but the top 0.1% of inputs, with 25% headroom.
+    The excluded inputs are ones whose polynomial activations left their
+    intervals; their logits run to thousands and are already wrong, and a
+    range that covered them would cost the comparisons of every other input
+    their precision (FHEW compares (a - b) / range to a fixed resolution)."""
+    logits = predict(model, x).abs().reshape(len(x), -1).amax(1)
+    bound = headroom * float(torch.quantile(logits.double(), quantile))
+    print(f"argmax range {bound:.1f} (largest training logit: median {logits.median():.1f}, "
+          f"{quantile:.1%} below {bound / headroom:.1f}, max {logits.max():.1f})")
+    return bound
+
+
 def train(model, xtr, ytr, xte, yte, epochs, loss_fn=None, metric=None, lr=2e-3, batch=128,
-          range_weight=RANGE_WEIGHT, clip=1.0, weight_decay=0.0, augment=None, log=print):
+          range_weight=RANGE_WEIGHT, clip=1.0, weight_decay=0.0, augment=None, augment_pairs=None, log=print):
     """Adam with a one-cycle schedule. loss_fn(outputs, targets) defaults to
     cross-entropy; metric(outputs, targets) -> float is printed after every
     epoch on the test set. fheml.nn.range_loss keeps polynomial arguments
     (layer norm variances, softmax scores and sums) inside the intervals the
     encrypted series cover; gradient clipping tames polynomial networks
-    early on. augment(x) -> x is applied to each training batch. Returns
+    early on. augment(x) -> x is applied to each training batch;
+    augment_pairs(x, y) -> (x, y) instead transforms inputs and targets
+    together (flipping an image and its segmentation mask). Returns
     (final metric, training seconds)."""
     loss_fn = loss_fn or nn.functional.cross_entropy
     metric = metric or accuracy
@@ -95,9 +114,13 @@ def train(model, xtr, ytr, xte, yte, epochs, loss_fn=None, metric=None, lr=2e-3,
         model.train()
         t = time.time()
         for idx in batches(len(xtr), batch):
-            xb = xtr[idx] if augment is None else augment(xtr[idx])
+            xb, yb = xtr[idx], ytr[idx]
+            if augment is not None:
+                xb = augment(xb)
+            if augment_pairs is not None:
+                xb, yb = augment_pairs(xb, yb)
             opt.zero_grad()
-            loss = loss_fn(model(xb), ytr[idx])
+            loss = loss_fn(model(xb), yb)
             (loss + range_weight * hnn.range_loss(model)).backward()
             if clip:
                 nn.utils.clip_grad_norm_(model.parameters(), clip)
@@ -298,7 +321,7 @@ def context(net, args, level_budget):
     t = time.time()
     overrides = {"level_budget": level_budget, "key_switch_digits": args.digits,
                  "bootstrap_iterations": args.boot_iterations, "bootstrap_precision": args.boot_precision}
-    if getattr(args, "scale_bits", None):
+    if args.scale_bits:
         overrides["scale_mod_bits"] = args.scale_bits
         overrides["first_mod_bits"] = min(60, args.scale_bits + 7)
     if args.ring or (args.insecure and net.uses_bootstrapping):
