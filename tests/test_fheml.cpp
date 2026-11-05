@@ -1215,6 +1215,195 @@ void self_bootstrap_tests(bool quick) {
   }
 }
 
+// Exact attention with token segments and a mask, from the layer's weights:
+// token t uses projection weight set segments[t]; masked pairs are left out
+// of the softmax (or get no score); a row with no allowed key outputs 0
+// before W_o.
+std::vector<double> exact_masked_attention(const Attention& att, const std::vector<double>& x, int n, int d) {
+  const std::vector<int>& seg = att.segments();
+  auto proj = [&](int i, const std::vector<double>& in) {
+    const std::vector<double>& w = att.weights(i);
+    const std::vector<double>& b = att.bias(i);
+    std::vector<double> out(n * d, 0.0);
+    for (int t = 0; t < n; ++t) {
+      const size_t base = seg.empty() ? 0 : static_cast<size_t>(seg[t]) * d * d;
+      for (int o = 0; o < d; ++o) {
+        double acc = b.empty() ? 0.0 : b.size() == static_cast<size_t>(d) ? b[o] : b[t * d + o];
+        for (int c = 0; c < d; ++c) acc += w[base + o * d + c] * in[t * d + c];
+        out[t * d + o] = acc;
+      }
+    }
+    return out;
+  };
+  std::vector<double> q = proj(0, x), k = proj(1, x), v = proj(2, x);
+  const int heads = att.heads(), dh = d / heads;
+  std::vector<double> o(n * d, 0.0);
+  for (int h = 0; h < heads; ++h)
+    for (int i = 0; i < n; ++i) {
+      std::vector<double> a(n, 0.0);
+      double sum = 0.0;
+      for (int j = 0; j < n; ++j) {
+        if (att.allowed(i, j) == 0.0) continue;
+        double sc = 0;
+        for (int c = h * dh; c < (h + 1) * dh; ++c) sc += q[i * d + c] * k[j * d + c];
+        a[j] = att.softmax() ? std::exp(sc) : att.score_coeff(h, 0) + att.score_coeff(h, 1) * sc + att.score_coeff(h, 2) * sc * sc;
+        sum += a[j];
+      }
+      const double inv = att.softmax() ? (sum > 0 ? 1.0 / sum : 0.0) : 1.0;
+      for (int j = 0; j < n; ++j)
+        for (int c = h * dh; c < (h + 1) * dh; ++c) o[i * d + c] += a[j] * inv * v[j * d + c];
+    }
+  return proj(3, o);
+}
+
+// Encoder-decoder over one sequence of S source and T target tokens
+// (segments 0 and 1): encoder self-attention (source x source), causal
+// decoder self-attention, cross-attention (target queries, source keys),
+// segment-wise embeddings, layer norm and head. Checked against an exact
+// reference, for causality, encrypted, and with bootstrapping inside.
+void encoder_decoder_tests(bool quick) {
+  const int S = 3, T = 3, n = S + T, in = 8, d = 8, heads = 2;
+  std::vector<int> seg(n, 0);
+  for (int t = S; t < n; ++t) seg[t] = 1;
+  auto mask_of = [&](auto f) {
+    std::vector<double> m(n * n, 0.0);
+    for (int i = 0; i < n; ++i)
+      for (int j = 0; j < n; ++j) m[i * n + j] = f(i, j) ? 1.0 : 0.0;
+    return m;
+  };
+  const auto enc_mask = mask_of([&](int i, int j) { return i < S && j < S; });
+  const auto causal = mask_of([&](int i, int j) { return i >= S && j >= S && j <= i; });
+  const auto cross = mask_of([&](int i, int j) { return i >= S && j < S; });
+  // Projection weights per segment; `on` picks the segments a projection
+  // acts on (the others get zero weights and biases, so the residual
+  // passes their tokens through).
+  auto proj_w = [&](bool on0, bool on1) {
+    std::vector<double> w = rand_vec(2 * d * d, -0.3, 0.3);
+    for (int g = 0; g < 2; ++g)
+      if (!(g ? on1 : on0)) std::fill(w.begin() + g * d * d, w.begin() + (g + 1) * d * d, 0.0);
+    return w;
+  };
+  auto proj_b = [&](bool on0, bool on1) {
+    std::vector<double> b = rand_vec(n * d, -0.1, 0.1);
+    for (int t = 0; t < n; ++t)
+      if (!(seg[t] ? on1 : on0)) std::fill(b.begin() + t * d, b.begin() + (t + 1) * d, 0.0);
+    return b;
+  };
+  auto attention = [&](const std::vector<double>& mask, bool q0, bool q1, bool kv0, bool kv1, bool softmax) {
+    auto a = std::make_shared<Attention>(n, d, proj_w(q0, q1), proj_w(kv0, kv1), proj_w(kv0, kv1), proj_w(q0, q1),
+                                         proj_b(q0, q1), proj_b(kv0, kv1), proj_b(kv0, kv1), proj_b(q0, q1),
+                                         std::vector<double>{0.3, 0.2, 0.05}, heads, seg, mask);
+    if (softmax) {
+      SoftmaxOptions o;
+      o.lo = -1.5;
+      o.hi = 1.5;
+      o.exp_degree = 15;
+      o.inv_degree = 15;
+      o.newton = 2;
+      o.sum_lo = 0.15;  // a causal row of one key sums to exp(lo) = 0.22
+      o.sum_hi = 14.0;  // 3 e^hi
+      a->set_softmax(o);
+    }
+    return a;
+  };
+  const auto we = rand_vec(2 * in * d, -0.4, 0.4), be = rand_vec(n * d, -0.2, 0.2);
+  const auto wo = rand_vec(2 * d * 4, -0.4, 0.4), g = rand_vec(2 * d, 0.5, 1.5), bt = rand_vec(2 * d, -0.2, 0.2);
+  auto enc = attention(enc_mask, true, false, true, false, false);
+  auto dec = attention(causal, false, true, false, true, true);
+  auto crs = attention(cross, false, true, true, false, false);
+  auto make = [&] {
+    auto copy = [](const std::shared_ptr<Attention>& a) {
+      auto c = std::make_shared<Attention>(a->tokens(), a->dim(), a->weights(0), a->weights(1), a->weights(2),
+                                           a->weights(3), a->bias(0), a->bias(1), a->bias(2), a->bias(3),
+                                           std::vector<double>{0.3, 0.2, 0.05}, a->heads(), a->segments(), a->mask());
+      if (a->softmax()) c->set_softmax(a->softmax_options());
+      return c;
+    };
+    Network net(Shape{n, 1, in});
+    net.emplace<TokenDense>(n, in, d, we, be, seg)
+        .add(std::make_shared<Residual>(std::vector<std::shared_ptr<Layer>>{copy(enc)}))
+        .add(std::make_shared<Residual>(std::vector<std::shared_ptr<Layer>>{
+            std::make_shared<LayerNorm>(n, d, g, bt, 0.05, 0.0, 3.0, 15, 1, seg), copy(dec)}))
+        .add(std::make_shared<Residual>(std::vector<std::shared_ptr<Layer>>{copy(crs)}))
+        .emplace<TokenDense>(n, d, 4, wo, std::vector<double>{}, seg);
+    return net;
+  };
+  Network net = make();
+  net.compile();
+  check(net.layers()[1]->describe().find("masked (5/6 offsets)") != std::string::npos,
+        "encoder self-attention skips the offsets that pair nothing", net.layers()[1]->describe());
+
+  // Exact reference, layer by layer.
+  auto x = rand_vec(n * in);
+  std::vector<double> h(n * d);
+  for (int t = 0; t < n; ++t)
+    for (int o = 0; o < d; ++o) {
+      double acc = be[t * d + o];
+      for (int c = 0; c < in; ++c) acc += we[seg[t] * in * d + o * in + c] * x[t * in + c];
+      h[t * d + o] = acc;
+    }
+  auto add = [](std::vector<double> a, const std::vector<double>& b) {
+    for (size_t i = 0; i < a.size(); ++i) a[i] += b[i];
+    return a;
+  };
+  h = add(h, exact_masked_attention(*enc, h, n, d));
+  std::vector<double> z(n * d);
+  for (int t = 0; t < n; ++t) {
+    double mean = 0, var = 0;
+    for (int j = 0; j < d; ++j) mean += h[t * d + j] / d;
+    for (int j = 0; j < d; ++j) var += (h[t * d + j] - mean) * (h[t * d + j] - mean) / d;
+    for (int j = 0; j < d; ++j)
+      z[t * d + j] = g[seg[t] * d + j] * (h[t * d + j] - mean) / std::sqrt(var + 0.05) + bt[seg[t] * d + j];
+  }
+  h = add(h, exact_masked_attention(*dec, z, n, d));
+  h = add(h, exact_masked_attention(*crs, h, n, d));
+  std::vector<double> ref(n * 4);
+  for (int t = 0; t < n; ++t)
+    for (int o = 0; o < 4; ++o) {
+      double acc = 0;
+      for (int c = 0; c < d; ++c) acc += wo[seg[t] * d * 4 + o * d + c] * h[t * d + c];
+      ref[t * 4 + o] = acc;
+    }
+  const auto y = net.forward_plain(x);
+  check_err("encoder-decoder plain vs exact", max_err(ref, y, ref.size()), 1e-5);
+
+  // Causality: a later target token does not change earlier outputs; a
+  // source token changes every target output.
+  auto x2 = x;
+  for (int c = 0; c < in; ++c) x2[(n - 1) * in + c] += 0.5;
+  const auto y2 = net.forward_plain(x2);
+  check(max_err(y, y2, (n - 1) * 4) == 0.0, "decoder is causal");
+  auto x3 = x;
+  x3[0] += 0.5;
+  const auto y3 = net.forward_plain(x3);
+  bool all = true;
+  for (int t = S; t < n; ++t) all = all && std::fabs(y3[t * 4] - y[t * 4]) > 1e-9;
+  check(all, "every target token sees the source (cross-attention)");
+
+  const char* path = "test_encdec.fheml";
+  net.save(path);
+  Network back = Network::load(path);
+  std::remove(path);
+  check_err("encoder-decoder save/load round trip", max_err(y, back.forward_plain(x), y.size()), 1e-12);
+  check_encrypted("encoder-decoder (segments, masks, causal softmax)", net, 1e-3);
+  if (quick) return;
+  // Bootstrapping inside the masked softmax and the segmented layer norm.
+  std::vector<std::vector<double>> calib;
+  for (int i = 0; i < 8; ++i) calib.push_back(rand_vec(n * in));
+  Network boot = make();
+  boot.place_bootstraps(8, calib);
+  boot.compile();
+  check(boot.internal_bootstraps() > 0, "encoder-decoder bootstraps inside its layers",
+        "(" + std::to_string(boot.internal_bootstraps()) + " inside)");
+  check_err("encoder-decoder bootstrapped keeps the function", max_err(y, boot.forward_plain(x), y.size()), 1e-9);
+  auto opts = boot.context_options(false);
+  opts.ring_dim = 4096;
+  FHEContext ctx(opts);
+  ctx.keygen(boot.rotation_indices());
+  auto got = boot.decrypt_output(ctx, boot.forward(ctx, ctx.encrypt(x, boot.input_level(ctx))));
+  check_err("encrypted encoder-decoder, bootstrapped", max_err(y, got, y.size()), 2e-2);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1230,6 +1419,7 @@ int main(int argc, char** argv) {
   transformer_tests();
   softmax_tests(quick);
   self_bootstrap_tests(quick);
+  encoder_decoder_tests(quick);
   std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");
   return g_failures ? 1 : 0;
 }

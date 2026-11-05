@@ -24,7 +24,8 @@ import torch
 from torch import nn
 
 __all__ = ["Poly", "Square", "Chebyshev", "Attention", "LayerNorm", "MaxPool2d", "Residual", "TokenMean",
-           "PosEmbedding", "Bootstrap", "chebyshev_coefficients", "range_loss"]
+           "PosEmbedding", "Bootstrap", "SegmentLinear", "chebyshev_coefficients", "range_loss", "segment_ids",
+           "causal_mask", "encoder_decoder_masks"]
 
 
 class Poly(nn.Module):
@@ -124,6 +125,99 @@ class Chebyshev(nn.Module):
         return f"{self.fn}, a={self.a}, b={self.b}, degree={self.degree}"
 
 
+def segment_ids(segments):
+    """Token segment ids from segment lengths, e.g. ``(3, 2) -> [0, 0, 0, 1, 1]``.
+
+    A sequence may consist of segments (the source and the target of an
+    encoder-decoder): the per-token modules then hold one weight set per
+    segment, which costs nothing extra under encryption (see
+    ``fheml.TokenDense``).
+    """
+    if segments is None:
+        return None
+    lengths = [int(v) for v in segments]
+    if not lengths or min(lengths) < 1:
+        raise ValueError("segments: give the segment lengths, each at least 1")
+    return [g for g, n in enumerate(lengths) for _ in range(n)]
+
+
+def _segment_ids(segments, tokens=None):
+    ids = segment_ids(segments)
+    if ids is None:
+        return None
+    if tokens is not None and len(ids) != tokens:
+        raise ValueError(f"segments cover {len(ids)} tokens, the layer has {tokens}")
+    return torch.as_tensor(ids, dtype=torch.long)
+
+
+def causal_mask(n, start=0):
+    """(n, n) mask, 1 where query i may attend to key j: tokens start.. attend
+    to themselves and earlier tokens from start on; the others to nothing."""
+    m = torch.zeros(n, n)
+    for i in range(start, n):
+        m[i, start:i + 1] = 1
+    return m
+
+
+def encoder_decoder_masks(src, tgt):
+    """The three attention masks of an encoder-decoder over one sequence of
+    ``src`` source tokens followed by ``tgt`` target tokens: ``encoder``
+    (source x source), ``causal`` (target x earlier target) and ``cross``
+    (target queries x source keys)."""
+    n = src + tgt
+    enc = torch.zeros(n, n)
+    enc[:src, :src] = 1
+    cross = torch.zeros(n, n)
+    cross[src:, :src] = 1
+    return dict(encoder=enc, causal=causal_mask(n, src), cross=cross)
+
+
+class SegmentLinear(nn.Module):
+    """Per-token linear map with one weight set per token segment.
+
+    Input (batch, tokens, in). Token t uses ``weight[g]``, ``bias[g]`` with
+    ``g = segment_ids(segments)[t]``. ``active`` lists the segments the map
+    acts on (default all); the others get fixed zero weights and biases, so
+    inside a ``Residual`` their tokens pass through unchanged (an encoder
+    block acting on the source segment only, say). Exports to
+    ``fheml.TokenDense(..., segments=...)``.
+    """
+
+    def __init__(self, in_features, out_features, segments, active=None, bias=True):
+        super().__init__()
+        seg = _segment_ids(segments)
+        groups = int(seg.max()) + 1
+        self.in_features, self.out_features = in_features, out_features
+        self.register_buffer("seg", seg)
+        on = torch.zeros(groups)
+        on[list(range(groups)) if active is None else list(active)] = 1
+        self.register_buffer("on", on)
+        bound = 1 / math.sqrt(in_features)
+        self.weight = nn.Parameter(torch.empty(groups, out_features, in_features).uniform_(-bound, bound))
+        self.bias = nn.Parameter(torch.empty(groups, out_features).uniform_(-bound, bound)) if bias else None
+
+    def weights(self):
+        """(groups, out, in), inactive segments zeroed."""
+        return self.weight * self.on.view(-1, 1, 1)
+
+    def token_bias(self):
+        """(tokens, out) or None, inactive segments zeroed."""
+        if self.bias is None:
+            return None
+        return (self.bias * self.on.view(-1, 1))[self.seg]
+
+    def forward(self, x):
+        w = self.weights()[self.seg]  # (tokens, out, in)
+        y = torch.einsum("bti,toi->bto", x, w)
+        b = self.token_bias()
+        return y if b is None else y + b
+
+    def extra_repr(self):
+        active = [g for g in range(len(self.on)) if self.on[g]]
+        return (f"in={self.in_features}, out={self.out_features}, segments={len(self.on)}, "
+                f"active={active}")
+
+
 class LayerNorm(nn.Module):
     """Per-token layer norm over the last dimension, as ``fheml.LayerNorm`` computes it.
 
@@ -133,9 +227,12 @@ class LayerNorm(nn.Module):
     the encrypted layer. Keep the per-token variance inside the interval (the
     series diverges outside it); ``eps`` of 1e-2..1e-1 keeps the function
     smooth down to ``var_min = 0``. ``dim`` must be a power of two.
+    ``segments`` (see ``segment_ids``) gives every token segment its own
+    gamma and beta, shape (segments, dim).
     """
 
-    def __init__(self, dim, eps=1e-2, var_min=0.0, var_max=1.0, degree=15, newton=1, elementwise_affine=True):
+    def __init__(self, dim, eps=1e-2, var_min=0.0, var_max=1.0, degree=15, newton=1, elementwise_affine=True,
+                 segments=None):
         super().__init__()
         if dim < 2 or dim & (dim - 1):
             raise ValueError("dim must be a power of two, at least 2")
@@ -143,7 +240,12 @@ class LayerNorm(nn.Module):
             raise ValueError("need 0 <= var_min < var_max and eps >= 0")
         self.dim, self.eps, self.var_min, self.var_max = int(dim), float(eps), float(var_min), float(var_max)
         self.degree, self.newton = int(degree), int(newton)
+        seg = _segment_ids(segments)
+        self.register_buffer("seg", seg)
+        groups = 1 if seg is None else int(seg.max()) + 1
         g, b = torch.ones(dim), torch.zeros(dim)
+        if seg is not None:
+            g, b = torch.ones(groups, dim), torch.zeros(groups, dim)
         if elementwise_affine:
             self.gamma, self.beta = nn.Parameter(g), nn.Parameter(b)
         else:
@@ -166,7 +268,8 @@ class LayerNorm(nn.Module):
     def forward(self, x):
         mean = x.mean(-1, keepdim=True)
         var = (x * x).mean(-1, keepdim=True) - mean * mean
-        return self.gamma * (x - mean) * self.inv_sqrt(var) + self.beta
+        g, b = (self.gamma, self.beta) if self.seg is None else (self.gamma[self.seg], self.beta[self.seg])
+        return g * (x - mean) * self.inv_sqrt(var) + b
 
     def extra_repr(self):
         return (f"dim={self.dim}, eps={self.eps}, var=[{self.var_min}, {self.var_max}], degree={self.degree}, "
@@ -194,12 +297,24 @@ class Attention(nn.Module):
     scheme switching under encryption), ``sum_lo, sum_hi`` (row-sum interval,
     0 = derived from ``lo, hi``). The forward pass evaluates the same series,
     so train with the scores inside ``[lo, hi]``.
+
+    ``mask`` (tokens x tokens, 1 where query i may attend to key j) and
+    ``segments`` make the other attention patterns of a transformer: causal
+    self-attention, and with segments (see ``segment_ids``) the attention of
+    an encoder-decoder over one sequence of source and target tokens. The
+    projections then hold one weight set per segment: q and o act on
+    ``query_segments``, k and v on ``key_segments`` (default: all), the other
+    segments get zeros. Cross-attention is ``query_segments=[1],
+    key_segments=[0]`` with ``encoder_decoder_masks(...)["cross"]``. Masked
+    pairs get no weight; a query with no allowed key outputs 0 (plus o's
+    bias). Under encryption, token offsets that pair nothing are skipped.
     """
 
     SOFTMAX_DEFAULTS = dict(lo=-4.0, hi=4.0, exp_degree=15, inv_degree=15, newton=1, subtract_max=False,
                             sum_lo=0.0, sum_hi=0.0)
 
-    def __init__(self, dim, tokens, score=None, bias=True, heads=1, softmax=None):
+    def __init__(self, dim, tokens, score=None, bias=True, heads=1, softmax=None, mask=None, segments=None,
+                 query_segments=None, key_segments=None):
         super().__init__()
         if heads < 1 or dim % heads:
             raise ValueError("heads must divide dim")
@@ -211,7 +326,21 @@ class Attention(nn.Module):
         if score.shape != (heads, 3):
             raise ValueError("score must be (c0, c1, c2) or (heads, 3)")
         self.tokens, self.heads = tokens, heads
-        self.q, self.k, self.v, self.o = (nn.Linear(dim, dim, bias=bias) for _ in range(4))
+        if segments is None:
+            if query_segments is not None or key_segments is not None:
+                raise ValueError("query_segments / key_segments need segments")
+            self.q, self.k, self.v, self.o = (nn.Linear(dim, dim, bias=bias) for _ in range(4))
+        else:
+            _segment_ids(segments, tokens)
+            self.q, self.o = (SegmentLinear(dim, dim, segments, query_segments, bias) for _ in range(2))
+            self.k, self.v = (SegmentLinear(dim, dim, segments, key_segments, bias) for _ in range(2))
+        if mask is not None:
+            mask = torch.as_tensor(mask, dtype=torch.get_default_dtype())
+            if mask.shape != (tokens, tokens) or not torch.all((mask == 0) | (mask == 1)):
+                raise ValueError("mask must be a (tokens, tokens) tensor of zeros and ones")
+            if not mask.any():
+                raise ValueError("mask allows no (query, key) pair")
+        self.register_buffer("mask", mask)
         self.register_buffer("score", score)
         self.softmax = None
         if softmax:
@@ -223,6 +352,8 @@ class Attention(nn.Module):
                 o.update(softmax)
             if not o["lo"] < o["hi"]:
                 raise ValueError("softmax: need lo < hi")
+            if o["subtract_max"] and mask is not None:
+                raise ValueError("softmax: subtract_max does not support masks")
             if (o["sum_lo"] or o["sum_hi"]) and not 0 < o["sum_lo"] < o["sum_hi"]:
                 raise ValueError("softmax: need 0 < sum_lo < sum_hi")
             self.softmax = o
@@ -253,9 +384,12 @@ class Attention(nn.Module):
         b, n, d = x.shape
         q, k, v = (f(x).reshape(b, n, self.heads, d // self.heads).transpose(1, 2) for f in (self.q, self.k, self.v))
         s = q @ k.transpose(-1, -2)  # (b, heads, n, n)
+        m = self.mask
         if self.softmax is None:
             c = self.score.view(1, self.heads, 1, 1, 3)
             a = c[..., 0] + c[..., 1] * s + c[..., 2] * s * s
+            if m is not None:
+                a = a * m
         else:
             if self.softmax["subtract_max"]:
                 s = s - s.max(-1, keepdim=True).values
@@ -266,18 +400,26 @@ class Attention(nn.Module):
                 excess = _excess(s, self.exp_lo, self.exp_hi)
                 s = s.clamp(self.exp_lo, self.exp_hi)
             e = _chebyshev_eval(self.exp_c, self.exp_lo, self.exp_hi, s)
+            if m is not None:
+                e = e * m
             total = e.sum(-1, keepdim=True)
+            # Rows that attend to nothing (masked) sum to 0 and output 0;
+            # under encryption their sum is padded into the 1/x interval.
+            live = torch.ones(()) if m is None else (m.sum(-1, keepdim=True) > 0).to(total.dtype)
+            pad = (1 - live) * 0.5 * (self.sum_lo + self.sum_hi)
             if self.training:
-                self._excess = excess + _excess(total, self.sum_lo, self.sum_hi)
-            t = total.clamp(self.sum_lo, self.sum_hi) if self.training else total
+                self._excess = excess + _excess(total + pad, self.sum_lo, self.sum_hi)
+            t = (total + pad).clamp(self.sum_lo, self.sum_hi) if self.training else total + pad
             y = _chebyshev_eval(self.inv_c, self.sum_lo, self.sum_hi, t)
             for _ in range(self.softmax["newton"]):
-                y = y * (2 - total * y)
-            a = e * y
+                y = y * (2 - (total + pad) * y)
+            a = e * y * live
         return self.o((a @ v).transpose(1, 2).reshape(b, n, d))
 
     def extra_repr(self):
         r = f"tokens={self.tokens}, heads={self.heads}"
+        if self.mask is not None:
+            r += ", masked"
         if self.softmax:
             r += ", softmax " + ", ".join(f"{k}={v}" for k, v in self.softmax.items())
         return r

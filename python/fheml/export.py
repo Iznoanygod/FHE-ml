@@ -8,7 +8,9 @@
   ``fheml.nn.MaxPool2d`` (exact, scheme switching); ``nn.Flatten`` then
   ``nn.Linear`` for the head.
 * ``(n, d)`` token sequence: ``nn.Linear`` acts per token, plus Attention
-  (quadratic or softmax scores), LayerNorm, Residual, PosEmbedding, TokenMean.
+  (quadratic or softmax scores, optional mask), LayerNorm, Residual,
+  PosEmbedding, TokenMean, and SegmentLinear (one weight set per token
+  segment: the source and target of an encoder-decoder).
 * ``(k,)`` vector: Linear, BatchNorm1d.
 
 Activations must be ``fheml.nn`` polynomials (Poly, Square, Chebyshev).
@@ -134,12 +136,22 @@ class _Exporter:
                 n, d = state[1:]
                 self.need_width(d, m.in_features, name)
                 self.max_token_width = max(self.max_token_width, m.in_features, m.out_features)
-                out.append(("tokendense", n, m.in_features, m.out_features, _np(m.weight), _np(m.bias)))
+                out.append(("tokendense", n, m.in_features, m.out_features, _np(m.weight), _np(m.bias), None))
                 return ("tokens", n, m.out_features)
             self.need_width(state[1], m.in_features, name)
             out.append(("dense", m.in_features, m.out_features, _np(m.weight), _np(m.bias)))
             return ("vector", m.out_features)
 
+        if isinstance(m, hnn.SegmentLinear):
+            self.need(kind, "tokens", name)
+            n, d = state[1:]
+            self.need_width(d, m.in_features, name)
+            if len(m.seg) != n:
+                raise ValueError(f"SegmentLinear: segments cover {len(m.seg)} tokens, the sequence has {n}")
+            self.max_token_width = max(self.max_token_width, m.in_features, m.out_features)
+            out.append(("tokendense", n, m.in_features, m.out_features, _np(m.weights()), _np(m.token_bias()),
+                        m.seg.tolist()))
+            return ("tokens", n, m.out_features)
         if isinstance(m, hnn.Square):
             out.append(("square",))
             return state
@@ -157,15 +169,26 @@ class _Exporter:
             self.need(kind, "tokens", name)
             n, d = state[1:]
             self.need_width(d, m.q.in_features, name)
-            ws = [_np(l.weight) for l in (m.q, m.k, m.v, m.o)]
-            bs = [_np(l.bias) for l in (m.q, m.k, m.v, m.o)]
-            out.append(("attention", n, d, ws, bs, _np(m.score), m.heads, m.softmax))
+            projs = (m.q, m.k, m.v, m.o)
+            seg = None
+            if isinstance(m.q, hnn.SegmentLinear):
+                ws = [_np(l.weights()) for l in projs]
+                bs = [_np(l.token_bias()) for l in projs]
+                seg = m.q.seg.tolist()
+                if any(b is None for b in bs):
+                    bs = [None] * 4 if all(b is None for b in bs) else [np.zeros((n, d)) if b is None else b for b in bs]
+            else:
+                ws = [_np(l.weight) for l in projs]
+                bs = [_np(l.bias) for l in projs]
+            out.append(("attention", n, d, ws, bs, _np(m.score), m.heads, m.softmax, seg, _np(m.mask)))
             return state
         if isinstance(m, hnn.LayerNorm):
             self.need(kind, "tokens", name)
             n, d = state[1:]
             self.need_width(d, m.dim, name)
-            out.append(("layernorm", n, d, _np(m.gamma), _np(m.beta), m.eps, m.var_min, m.var_max, m.degree, m.newton))
+            seg = None if m.seg is None else m.seg.tolist()
+            out.append(("layernorm", n, d, _np(m.gamma), _np(m.beta), m.eps, m.var_min, m.var_max, m.degree, m.newton,
+                        seg))
             return state
         if isinstance(m, hnn.Residual):
             body, after = self.run(m.body, state)
@@ -244,11 +267,11 @@ def _fold(specs):
             continue
         if s[0] == "posembed":
             if out and out[-1][0] == "tokendense":
-                _, n, i, o, w, b = out[-1]
-                out[-1] = ("tokendense", n, i, o, w, (0 if b is None else b) + s[1])
+                _, n, i, o, w, b, seg = out[-1]
+                out[-1] = ("tokendense", n, i, o, w, (0 if b is None else b) + s[1], seg)
                 continue
             n, d = s[1].shape  # no Linear to fold into: identity map with the embedding as bias
-            s = ("tokendense", n, d, d, np.eye(d), s[1])
+            s = ("tokendense", n, d, d, np.eye(d), s[1], None)
         out.append(s)
     return out
 
@@ -266,7 +289,10 @@ def _build(s):
     if k == "dense":
         return _fheml.Dense(s[1], s[2], _flat(s[3]), _flat(s[4]))
     if k == "tokendense":
-        return _fheml.TokenDense(s[1], s[2], s[3], _flat(s[4]), _flat(s[5]))
+        b = s[5]
+        if b is not None and s[6] is not None and np.ndim(b) == 1:
+            b = np.tile(b, (s[1], 1))
+        return _fheml.TokenDense(s[1], s[2], s[3], _flat(s[4]), _flat(b), segments=s[6] or [])
     if k == "tokenmean":
         return _fheml.TokenMean(s[1], s[2])
     if k == "square":
@@ -280,8 +306,9 @@ def _build(s):
     if k == "bootstrap":
         return _fheml.Bootstrap()
     if k == "attention":
-        _, n, d, ws, bs, score, heads, softmax = s
-        att = _fheml.Attention(n, d, *map(_flat, ws), *map(_flat, bs), score=_flat(score), heads=heads)
+        _, n, d, ws, bs, score, heads, softmax, seg, mask = s
+        att = _fheml.Attention(n, d, *map(_flat, ws), *map(_flat, bs), score=_flat(score), heads=heads,
+                               segments=seg or [], mask=_flat(mask))
         if softmax:
             o = _fheml.SoftmaxOptions()
             for key, v in softmax.items():
@@ -289,8 +316,8 @@ def _build(s):
             att.set_softmax(o)
         return att
     if k == "layernorm":
-        _, n, d, gamma, beta, eps, var_min, var_max, degree, newton = s
-        return _fheml.LayerNorm(n, d, _flat(gamma), _flat(beta), eps, var_min, var_max, degree, newton)
+        _, n, d, gamma, beta, eps, var_min, var_max, degree, newton, seg = s
+        return _fheml.LayerNorm(n, d, _flat(gamma), _flat(beta), eps, var_min, var_max, degree, newton, seg or [])
     if k == "residual":
         return _fheml.Residual([_build(b) for b in s[1]])
     raise AssertionError(k)
@@ -333,10 +360,10 @@ def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range
         n, d = shape
         width = ex.max_token_width if token_width == "auto" else int(token_width)
         if width > d and specs and specs[0][0] == "tokendense":
-            _, n, i, o, w, b = specs[0]
-            wp = np.zeros((o, width))
-            wp[:, :i] = w
-            specs[0] = ("tokendense", n, width, o, wp, b)
+            _, n, i, o, w, b, seg = specs[0]
+            wp = np.zeros(w.shape[:-1] + (width,))
+            wp[..., :i] = w
+            specs[0] = ("tokendense", n, width, o, wp, b, seg)
             net_shape = _fheml.Shape(n, 1, width)
 
     net = _fheml.Network(net_shape)

@@ -115,8 +115,10 @@ PYBIND11_MODULE(_fheml, m) {
       .def(py::init<Vec, Vec>(), py::arg("scale"), py::arg("shift"));
   py::class_<Scale, LinearLayer, std::shared_ptr<Scale>>(m, "Scale").def(py::init<Vec>(), py::arg("factors"));
   py::class_<TokenDense, LinearLayer, std::shared_ptr<TokenDense>>(m, "TokenDense")
-      .def(py::init<int, int, int, Vec, Vec>(), py::arg("tokens"), py::arg("inputs"), py::arg("outputs"),
-           py::arg("weights"), py::arg("bias") = Vec{});
+      .def(py::init<int, int, int, Vec, Vec, std::vector<int>>(), py::arg("tokens"), py::arg("inputs"),
+           py::arg("outputs"), py::arg("weights"), py::arg("bias") = Vec{}, py::arg("segments") = std::vector<int>{},
+           "Per-token dense map; with segments (a segment id per token) weights hold one [out][in] set per segment.")
+      .def_property_readonly("segments", &TokenDense::segments);
   py::class_<TokenMean, LinearLayer, std::shared_ptr<TokenMean>>(m, "TokenMean")
       .def(py::init<int, int>(), py::arg("tokens"), py::arg("dim"));
   py::class_<Square, Layer, std::shared_ptr<Square>>(m, "Square").def(py::init<>());
@@ -139,11 +141,13 @@ PYBIND11_MODULE(_fheml, m) {
   py::class_<Residual, Layer, std::shared_ptr<Residual>>(m, "Residual")
       .def(py::init<std::vector<LayerPtr>>(), py::arg("body"));
   py::class_<LayerNorm, Layer, std::shared_ptr<LayerNorm>>(m, "LayerNorm")
-      .def(py::init<int, int, Vec, Vec, double, double, double, uint32_t, uint32_t>(), py::arg("tokens"),
-           py::arg("dim"), py::arg("gamma"), py::arg("beta"), py::arg("eps") = 1e-5, py::arg("var_min") = 0.1,
-           py::arg("var_max") = 1.0, py::arg("degree") = 15, py::arg("newton") = 1,
+      .def(py::init<int, int, Vec, Vec, double, double, double, uint32_t, uint32_t, std::vector<int>>(),
+           py::arg("tokens"), py::arg("dim"), py::arg("gamma"), py::arg("beta"), py::arg("eps") = 1e-5,
+           py::arg("var_min") = 0.1, py::arg("var_max") = 1.0, py::arg("degree") = 15, py::arg("newton") = 1,
+           py::arg("segments") = std::vector<int>{},
            "Per-token layer norm; 1/sqrt(var + eps) is a degree-`degree` Chebyshev series on "
-           "[var_min, var_max] refined by `newton` Newton steps.")
+           "[var_min, var_max] refined by `newton` Newton steps. With segments, gamma and beta hold one "
+           "set of dim values per segment.")
       .def("inv_sqrt", &LayerNorm::inv_sqrt, py::arg("var"));
   py::class_<SoftmaxOptions>(m, "SoftmaxOptions")
       .def(py::init<>())
@@ -156,12 +160,19 @@ PYBIND11_MODULE(_fheml, m) {
       .def_readwrite("sum_lo", &SoftmaxOptions::sum_lo)
       .def_readwrite("sum_hi", &SoftmaxOptions::sum_hi);
   py::class_<Attention, Layer, std::shared_ptr<Attention>>(m, "Attention")
-      .def(py::init<int, int, Vec, Vec, Vec, Vec, Vec, Vec, Vec, Vec, Vec, int>(), py::arg("tokens"), py::arg("dim"),
-           py::arg("wq"), py::arg("wk"), py::arg("wv"), py::arg("wo"), py::arg("bq") = Vec{}, py::arg("bk") = Vec{},
-           py::arg("bv") = Vec{}, py::arg("bo") = Vec{}, py::arg("score") = Vec{0.0, 0.0, 1.0}, py::arg("heads") = 1,
-           "Self-attention with `heads` heads of width dim/heads; score is (c0, c1, c2) shared by all heads "
-           "or 3*heads values, one polynomial per head.")
+      .def(py::init<int, int, Vec, Vec, Vec, Vec, Vec, Vec, Vec, Vec, Vec, int, std::vector<int>, Vec>(),
+           py::arg("tokens"), py::arg("dim"), py::arg("wq"), py::arg("wk"), py::arg("wv"), py::arg("wo"),
+           py::arg("bq") = Vec{}, py::arg("bk") = Vec{}, py::arg("bv") = Vec{}, py::arg("bo") = Vec{},
+           py::arg("score") = Vec{0.0, 0.0, 1.0}, py::arg("heads") = 1, py::arg("segments") = std::vector<int>{},
+           py::arg("mask") = Vec{},
+           "Attention with `heads` heads of width dim/heads; score is (c0, c1, c2) shared by all heads "
+           "or 3*heads values, one polynomial per head. segments: a segment id per token, the projections then "
+           "hold one weight set per segment; mask: n*n values, 1 where query i may attend to key j (causal "
+           "self-attention, cross-attention between segments).")
       .def_property_readonly("heads", &Attention::heads)
+      .def_property_readonly("segments", &Attention::segments)
+      .def_property_readonly("mask", &Attention::mask)
+      .def_property_readonly("offsets", &Attention::offsets)
       .def("set_softmax", &Attention::set_softmax, py::arg("options"),
            "Softmax scores (polynomial exp and 1/x, optionally with the row maximum subtracted through "
            "scheme switching) instead of the quadratic score function; compile the network again afterwards.")

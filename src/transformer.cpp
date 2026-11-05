@@ -23,20 +23,42 @@ void write_vec(std::ostream& os, const std::vector<double>& v) {
 
 bool is_pow2(int x) { return x > 0 && !(x & (x - 1)); }
 
+// " segments s_0 .. s_{n-1}" (nothing without segments).
+void write_segments(std::ostream& os, const std::vector<int>& seg) {
+  if (seg.empty()) return;
+  os << " segments";
+  for (int s : seg) os << " " << s;
+}
+
 }  // namespace
 
 // ------------------------------------------------------------------ TokenDense
 
-TokenDense::TokenDense(int n, int in, int out, std::vector<double> weights, std::vector<double> bias)
-    : n_(n), in_dim_(in), out_dim_(out), w_(std::move(weights)), b_(std::move(bias)) {
-  if (w_.size() != static_cast<size_t>(in) * out) throw std::invalid_argument("tokendense: bad weight count");
+int segment_count(const std::vector<int>& segments, int n) {
+  if (segments.empty()) return 1;
+  if (segments.size() != static_cast<size_t>(n)) throw std::invalid_argument("segments: need one id per token");
+  int g = 0;
+  for (int s : segments) {
+    if (s < 0) throw std::invalid_argument("segments: ids must be >= 0");
+    g = std::max(g, s + 1);
+  }
+  return g;
+}
+
+TokenDense::TokenDense(int n, int in, int out, std::vector<double> weights, std::vector<double> bias,
+                       std::vector<int> segments)
+    : n_(n), in_dim_(in), out_dim_(out), w_(std::move(weights)), b_(std::move(bias)), seg_(std::move(segments)) {
+  if (w_.size() != static_cast<size_t>(segment_count(seg_, n)) * in * out)
+    throw std::invalid_argument("tokendense: bad weight count (need segments x out x in)");
   if (!b_.empty() && b_.size() != static_cast<size_t>(out) && b_.size() != static_cast<size_t>(n) * out)
     throw std::invalid_argument("tokendense: bias must have OUT or N*OUT values");
 }
 
 std::string TokenDense::describe() const {
   std::ostringstream os;
-  os << "tokendense " << n_ << "x(" << in_dim_ << "->" << out_dim_ << ")" << LinearLayer::describe();
+  os << "tokendense " << n_ << "x(" << in_dim_ << "->" << out_dim_ << ")";
+  if (!seg_.empty()) os << " " << segment_count(seg_, n_) << " segments";
+  os << LinearLayer::describe();
   return os.str();
 }
 
@@ -64,7 +86,7 @@ SparseMatrix TokenDense::matrix() const {
     for (int o = 0; o < out_dim_; ++o)
       for (int i = 0; i < in_dim_; ++i)
         m.add(static_cast<size_t>(t) * out_dim_ + o, static_cast<size_t>(t) * in_dim_ + i,
-              w_[static_cast<size_t>(o) * in_dim_ + i]);
+              w_[weight_base(t) + static_cast<size_t>(o) * in_dim_ + i]);
   return m;
 }
 
@@ -80,7 +102,8 @@ std::vector<LinearLayer::ParamRef> TokenDense::weight_refs() const {
   for (int t = 0; t < n_; ++t)
     for (int o = 0; o < out_dim_; ++o)
       for (int i = 0; i < in_dim_; ++i)
-        refs.push_back({static_cast<size_t>(t) * out_dim_ + o, static_cast<size_t>(t) * in_dim_ + i, o * in_dim_ + i});
+        refs.push_back({static_cast<size_t>(t) * out_dim_ + o, static_cast<size_t>(t) * in_dim_ + i,
+                        static_cast<int>(weight_base(t)) + o * in_dim_ + i});
   return refs;
 }
 
@@ -107,7 +130,9 @@ void TokenDense::set_params(const std::vector<double>& p) {
 }
 
 void TokenDense::save(std::ostream& os) const {
-  os << "tokendense " << n_ << " " << in_dim_ << " " << out_dim_ << " " << b_.size() << "\n";
+  os << "tokendense " << n_ << " " << in_dim_ << " " << out_dim_ << " " << b_.size();
+  write_segments(os, seg_);
+  os << "\n";
   write_vec(os, w_);
   write_vec(os, b_);
 }
@@ -135,12 +160,13 @@ void TokenMean::save(std::ostream& os) const { os << "tokenmean " << n_ << " " <
 // -------------------------------------------------------------------- LayerNorm
 
 LayerNorm::LayerNorm(int n, int d, std::vector<double> gamma, std::vector<double> beta, double eps, double var_min,
-                     double var_max, uint32_t degree, uint32_t newton)
-    : n_(n), d_(d), gamma_(std::move(gamma)), beta_(std::move(beta)), eps_(eps), var_min_(var_min),
-      var_max_(var_max), degree_(degree), newton_(newton) {
+                     double var_max, uint32_t degree, uint32_t newton, std::vector<int> segments)
+    : n_(n), d_(d), gamma_(std::move(gamma)), beta_(std::move(beta)), seg_(std::move(segments)), eps_(eps),
+      var_min_(var_min), var_max_(var_max), degree_(degree), newton_(newton) {
   if (n < 1 || d < 2 || (d & (d - 1))) throw std::invalid_argument("layernorm: d must be a power of two, at least 2");
-  if (gamma_.size() != static_cast<size_t>(d) || beta_.size() != static_cast<size_t>(d))
-    throw std::invalid_argument("layernorm: gamma and beta must have d entries");
+  const size_t gd = static_cast<size_t>(segment_count(seg_, n)) * d;
+  if (gamma_.size() != gd || beta_.size() != gd)
+    throw std::invalid_argument("layernorm: gamma and beta must have d entries per segment");
   if (!(eps >= 0.0) || !(var_min >= 0.0) || !(var_min < var_max))
     throw std::invalid_argument("layernorm: need 0 <= var_min < var_max and eps >= 0");
   if (degree < 1) throw std::invalid_argument("layernorm: degree must be at least 1");
@@ -151,7 +177,9 @@ LayerNorm::LayerNorm(int n, int d, std::vector<double> gamma, std::vector<double
 std::string LayerNorm::describe() const {
   std::ostringstream os;
   os << type() << " " << n_ << "x" << d_ << " eps " << eps_ << " var [" << var_min_ << ", " << var_max_
-     << "] degree " << degree_ << " newton " << newton_ << (self_ ? " (self-bootstrapping)" : "");
+     << "] degree " << degree_ << " newton " << newton_;
+  if (!seg_.empty()) os << " " << segment_count(seg_, n_) << " segments";
+  os << (self_ ? " (self-bootstrapping)" : "");
   return os.str();
 }
 
@@ -184,8 +212,8 @@ void LayerNorm::compile(uint32_t slots) {
     for (int j = 0; j < d_; ++j) pad_var_[t * stride_ + j] = 0.0;
     for (int j = 0; j < d_; ++j) token_mask_[t * stride_ + j] = 1.0;
     for (int j = 0; j < d_; ++j) {
-      gamma_slots_[t * stride_ + j] = gamma_[static_cast<size_t>(j)];
-      beta_slots_[t * stride_ + j] = beta_[static_cast<size_t>(j)];
+      gamma_slots_[t * stride_ + j] = gamma_[affine_index(t, j)];
+      beta_slots_[t * stride_ + j] = beta_[affine_index(t, j)];
     }
   }
 }
@@ -203,7 +231,7 @@ std::vector<double> LayerNorm::forward_plain(const std::vector<double>& x) const
   for (int t = 0; t < n_; ++t)
     for (int j = 0; j < d_; ++j) {
       const size_t i = static_cast<size_t>(t) * d_ + j;
-      y[i] = gamma_[static_cast<size_t>(j)] * centred[i] * r[static_cast<size_t>(t)] + beta_[static_cast<size_t>(j)];
+      y[i] = gamma_[affine_index(t, j)] * centred[i] * r[static_cast<size_t>(t)] + beta_[affine_index(t, j)];
     }
   return y;
 }
@@ -408,9 +436,10 @@ std::vector<double> LayerNorm::params() const {
 }
 
 void LayerNorm::set_params(const std::vector<double>& p) {
-  if (p.size() != 2u * d_) throw std::invalid_argument("layernorm: wrong parameter count");
-  std::copy(p.begin(), p.begin() + d_, gamma_.begin());
-  std::copy(p.begin() + d_, p.end(), beta_.begin());
+  if (p.size() != 2 * gamma_.size()) throw std::invalid_argument("layernorm: wrong parameter count");
+  const auto g = static_cast<std::ptrdiff_t>(gamma_.size());
+  std::copy(p.begin(), p.begin() + g, gamma_.begin());
+  std::copy(p.begin() + g, p.end(), beta_.begin());
   if (!mask_.empty()) compile(static_cast<uint32_t>(mask_.size()));
 }
 
@@ -443,6 +472,7 @@ void LayerNorm::scale_output(double f) {
 void LayerNorm::save(std::ostream& os) const {
   os << std::setprecision(std::numeric_limits<double>::max_digits10) << "layernorm " << n_ << " " << d_ << " " << eps_
      << " " << var_min_ << " " << var_max_ << " " << degree_ << " " << newton_;
+  write_segments(os, seg_);
   if (self_) os << " selfboot " << x_bound_;
   os << "\n";
   write_vec(os, gamma_);
@@ -583,8 +613,9 @@ void Residual::save(std::ostream& os) const {
 
 Attention::Attention(int n, int d, std::vector<double> wq, std::vector<double> wk, std::vector<double> wv,
                      std::vector<double> wo, std::vector<double> bq, std::vector<double> bk, std::vector<double> bv,
-                     std::vector<double> bo, std::vector<double> score, int heads)
-    : n_(n), d_(d), heads_(heads), dh_(heads > 0 ? d / heads : 0), score_(std::move(score)) {
+                     std::vector<double> bo, std::vector<double> score, int heads, std::vector<int> segments,
+                     std::vector<double> mask)
+    : n_(n), d_(d), heads_(heads), dh_(heads > 0 ? d / heads : 0), score_(std::move(score)), seg_(std::move(segments)) {
   if (heads < 1 || d % heads != 0) throw std::invalid_argument("attention: heads must divide d");
   if (!is_pow2(dh_)) throw std::invalid_argument("attention: the head width d/heads must be a power of two");
   if (score_.size() == 3 && heads > 1) {
@@ -599,15 +630,62 @@ Attention::Attention(int n, int d, std::vector<double> wq, std::vector<double> w
   for (int i = 0; i < 4; ++i) {
     w_[i] = std::move(*ws[i]);
     b_[i] = std::move(*bs[i]);
-    proj_[i] = std::make_shared<TokenDense>(n, d, d, w_[i], b_[i]);
+    proj_[i] = std::make_shared<TokenDense>(n, d, d, w_[i], b_[i], seg_);
     proj_[i]->set_allow_fold(false);  // K and V must be zero past n*d (see top)
   }
+  set_mask(std::move(mask));
+}
+
+void Attention::set_mask(std::vector<double> mask) {
+  if (!mask.empty() && mask.size() != static_cast<size_t>(n_) * n_)
+    throw std::invalid_argument("attention: the mask needs n x n entries");
+  mask_.assign(mask.size(), 0);
+  for (size_t i = 0; i < mask.size(); ++i) {
+    if (mask[i] != 0.0 && mask[i] != 1.0) throw std::invalid_argument("attention: mask entries must be 0 or 1");
+    mask_[i] = mask[i] != 0.0;
+  }
+  if (!mask_.empty() && softmax_ && sm_.subtract_max)
+    throw std::invalid_argument("attention: subtract_max does not support masks");
+  // Offset s pairs query i with key (i + s) mod n; keep the offsets that
+  // pair something.
+  offs_.clear();
+  for (int s = 0; s < n_; ++s) {
+    bool any = false;
+    for (int i = 0; i < n_ && !any; ++i) any = allowed(i, (i + s) % n_) != 0.0;
+    if (any) offs_.push_back(s);
+  }
+  if (offs_.empty()) throw std::invalid_argument("attention: the mask allows no (query, key) pair");
+  slots_ = 0;  // compile() again
+}
+
+std::vector<double> Attention::mask() const {
+  std::vector<double> m(mask_.size());
+  for (size_t i = 0; i < m.size(); ++i) m[i] = mask_[i];
+  return m;
+}
+
+bool Attention::empty_row(int i) const {
+  for (int j = 0; j < n_; ++j)
+    if (allowed(i, j) != 0.0) return false;
+  return true;
+}
+
+std::vector<double> Attention::masked(const std::vector<double>& base, int k) const {
+  std::vector<double> v(base);
+  if (mask_.empty()) return v;
+  const int s = offs_[static_cast<size_t>(k)];
+  for (int t = 0; t < n_; ++t)
+    if (allowed(t, (t + s) % n_) == 0.0)
+      for (int h = 0; h < heads_; ++h) v[static_cast<size_t>(t * stride_ + h * dh_)] = 0.0;
+  return v;
 }
 
 std::string Attention::describe() const {
   std::ostringstream os;
   os << "attention n=" << n_ << " d=" << d_;
   if (heads_ > 1) os << " heads=" << heads_;
+  if (!seg_.empty()) os << " " << segment_count(seg_, n_) << " segments";
+  if (!mask_.empty()) os << " masked (" << offs_.size() << "/" << n_ << " offsets)";
   if (softmax_) {
     os << " softmax exp[" << exp_lo() << ", " << exp_hi() << "] deg " << sm_.exp_degree << " 1/x[" << sum_lo() << ", "
        << sum_hi() << "] deg " << sm_.inv_degree << " newton " << sm_.newton
@@ -661,8 +739,12 @@ void Attention::compile(uint32_t slots) {
       mask_c2_[t * stride_ + h * dh_] = score_[3 * h + 2];
     }
   token_mask_.assign(slots, 0.0);
+  row_pad_.assign(slots, 0.0);
   for (int t = 0; t < n_; ++t)
-    for (int c = 0; c < d_; ++c) token_mask_[t * stride_ + c] = 1.0;
+    for (int c = 0; c < d_; ++c) {
+      token_mask_[t * stride_ + c] = 1.0;
+      row_pad_[t * stride_ + c] = empty_row(t) ? 1.0 : 0.0;
+    }
   if (softmax_) {
     mask_head_.assign(slots, 0.0);
     // Slots outside the head sub-blocks hold a row sum of 0, where the 1/x
@@ -671,8 +753,11 @@ void Attention::compile(uint32_t slots) {
     for (int t = 0; t < n_; ++t)
       for (int h = 0; h < heads_; ++h) {
         mask_head_[t * stride_ + h * dh_] = 1.0;
-        for (int c = 0; c < dh_; ++c) pad_sum_[t * stride_ + h * dh_ + c] = 0.0;
+        for (int c = 0; c < dh_; ++c) pad_sum_[t * stride_ + h * dh_ + c] = empty_row(t) ? 0.5 * (sum_lo() + sum_hi()) : 0.0;
       }
+    head_masks_.clear();
+    if (!mask_.empty())
+      for (size_t k = 0; k < offs_.size(); ++k) head_masks_.push_back(masked(mask_head_, static_cast<int>(k)));
     exp_coeffs_ = lbcrypto::EvalChebyshevCoefficients([](double x) { return std::exp(x); }, exp_lo(), exp_hi(),
                                                       sm_.exp_degree);
     inv_coeffs_ = lbcrypto::EvalChebyshevCoefficients([](double x) { return 1.0 / x; }, sum_lo(), sum_hi(),
@@ -816,6 +901,7 @@ void Attention::calibrate(const std::vector<std::vector<double>>& inputs, double
         }
         std::vector<double> a = lbcrypto::EvalChebyshevFunctionPtxt([](double t) { return std::exp(t); }, sc, exp_lo(),
                                                                    exp_hi(), sm_.exp_degree);
+        for (int j = 0; j < n_; ++j) a[j] *= allowed(i, j);
         for (int c = h * dh_; c < (h + 1) * dh_; ++c) {
           double o = 0.0;
           for (int j = 0; j < n_; ++j) o += a[j] * v[j * d_ + c];
@@ -832,6 +918,7 @@ void Attention::set_softmax(const SoftmaxOptions& o) {
   if (o.exp_degree < 1 || o.inv_degree < 1) throw std::invalid_argument("attention softmax: degrees must be >= 1");
   if ((o.sum_lo != 0.0 || o.sum_hi != 0.0) && !(0.0 < o.sum_lo && o.sum_lo < o.sum_hi))
     throw std::invalid_argument("attention softmax: need 0 < sum_lo < sum_hi");
+  if (o.subtract_max && !mask_.empty()) throw std::invalid_argument("attention: subtract_max does not support masks");
   softmax_ = true;
   sm_ = o;
 }
@@ -891,11 +978,12 @@ std::vector<double> Attention::forward_plain(const std::vector<double>& x) const
         a = lbcrypto::EvalChebyshevFunctionPtxt([](double x) { return std::exp(x); }, sc, exp_lo(), exp_hi(),
                                                 sm_.exp_degree);
         double sum = 0.0;
-        for (double e : a) sum += e;
-        inv = inv_plain(sum);
+        for (int j = 0; j < n_; ++j) sum += (a[j] *= allowed(i, j));
+        // A row that attends to nothing outputs 0 (its sum is padded).
+        inv = sum == 0.0 && empty_row(i) ? 0.0 : inv_plain(sum);
       } else {
         for (int j = 0; j < n_; ++j)
-          a[j] = score_[3 * h] + score_[3 * h + 1] * sc[j] + score_[3 * h + 2] * sc[j] * sc[j];
+          a[j] = allowed(i, j) * (score_[3 * h] + score_[3 * h + 1] * sc[j] + score_[3 * h + 2] * sc[j] * sc[j]);
       }
       for (int j = 0; j < n_; ++j)
         for (int c = h * dh_; c < (h + 1) * dh_; ++c) out[i * d_ + c] += a[j] * v[j * d_ + c] * inv;
@@ -925,23 +1013,25 @@ Ctxt Attention::forward_self(const FHEContext& ctx, const Ctxt& x, const Plan& p
   Ctxt v = proj_[2]->forward(ctx, xi);
   cc->EvalAddInPlace(k, rot(k, -nd));
   cc->EvalAddInPlace(v, rot(v, -nd));
-  std::vector<int32_t> offs(n_);
-  for (int s = 0; s < n_; ++s) offs[s] = s * stride_;
+  const int m = static_cast<int>(offs_.size());
+  std::vector<int32_t> offs(m);
+  for (int i = 0; i < m; ++i) offs[i] = offs_[i] * stride_;
   const std::vector<Ctxt> kr = backend::rotate_hoisted(cc, k, offs, ctx.parallel());
   const std::vector<Ctxt> vr = backend::rotate_hoisted(cc, v, offs, ctx.parallel());
 
   // Scores, mapped onto t in [-1, 1] at the head slots (0 elsewhere).
   const double alpha = 2.0 / (exp_hi() - exp_lo()), beta = -(exp_hi() + exp_lo()) / (exp_hi() - exp_lo());
-  const std::vector<double> mask_t = scaled(mask_head_, alpha), add_t = scaled(mask_head_, beta);
-  std::vector<Ctxt> t(n_);
+  // (A masked-out score is mapped as if it were 0, so it stays in range.)
+  const std::vector<double> add_t = scaled(mask_head_, beta);
+  std::vector<Ctxt> t(m);
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
-  for (int s = 0; s < n_; ++s) {
-    Ctxt p = cc->EvalMult(q, kr[s]);
+  for (int i = 0; i < m; ++i) {
+    Ctxt p = cc->EvalMult(q, kr[i]);
     for (int w = 1; w < dh_; w *= 2) cc->EvalAddInPlace(p, rot(p, w));
-    Ptxt m = ctx.encode(mask_t, FHEContext::level(p));
-    t[s] = cc->EvalMult(p, m);
-    Ptxt a = encode_at(add_t, t[s]);
-    cc->EvalAddInPlace(t[s], a);
+    Ptxt mt = ctx.encode(scaled(head_mask(i), alpha), FHEContext::level(p));
+    t[i] = cc->EvalMult(p, mt);
+    Ptxt a = encode_at(add_t, t[i]);
+    cc->EvalAddInPlace(t[i], a);
   }
   // Pack, bootstrap, exp (scaled for the row sums), optionally refresh.
   const int groups = packed_groups();
@@ -949,7 +1039,7 @@ Ctxt Attention::forward_self(const FHEContext& ctx, const Ctxt& x, const Plan& p
   std::vector<double> ce = scaled(exp_coeffs_, sum_alpha() / exp_div());
   for (int g = 0; g < groups; ++g) {
     Ctxt packed;
-    for (int s = g * 2 * dh_; s < std::min(n_, (g + 1) * 2 * dh_); ++s) {
+    for (int s = g * 2 * dh_; s < std::min(m, (g + 1) * 2 * dh_); ++s) {
       Ctxt r = rot(t[s], -pack_shift(s));
       packed = packed ? cc->EvalAdd(packed, r) : r;
     }
@@ -962,14 +1052,14 @@ Ctxt Attention::forward_self(const FHEContext& ctx, const Ctxt& x, const Plan& p
   // the output, so that y ~ 1 / (kappa D) stays within [0, 1]); broadcast;
   // weight v_s.
   const double kappa = 1.1 / sum_lo();
-  const std::vector<double> mask_a = scaled(mask_head_, exp_div()), mask_k = scaled(mask_head_, exp_div() * kappa / sum_alpha());
-  std::vector<Ctxt> partial(n_), weights(n_), weights_k(n_);
+  std::vector<Ctxt> partial(m), weights(m), weights_k(m);
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
-  for (int s = 0; s < n_; ++s) {
+  for (int s = 0; s < m; ++s) {
     Ctxt u = rot(e[s / (2 * dh_)], pack_shift(s));
-    Ptxt m = ctx.encode(mask_a, FHEContext::level(u));
-    Ptxt mk = ctx.encode(mask_k, FHEContext::level(u));
-    Ctxt a = cc->EvalMult(u, m), ak = cc->EvalMult(u, mk);
+    const std::vector<double>& hm = head_mask(s);
+    Ptxt ma = ctx.encode(scaled(hm, exp_div()), FHEContext::level(u));
+    Ptxt mk = ctx.encode(scaled(hm, exp_div() * kappa / sum_alpha()), FHEContext::level(u));
+    Ctxt a = cc->EvalMult(u, ma), ak = cc->EvalMult(u, mk);
     for (int w = 1; w < dh_; w *= 2) {
       cc->EvalAddInPlace(a, rot(a, -w));
       cc->EvalAddInPlace(ak, rot(ak, -w));
@@ -979,19 +1069,24 @@ Ctxt Attention::forward_self(const FHEContext& ctx, const Ctxt& x, const Plan& p
     weights_k[s] = ak;
   }
   Ctxt o = partial[0], sum = weights[0], sum_k = weights_k[0];
-  for (int s = 1; s < n_; ++s) {
+  for (int s = 1; s < m; ++s) {
     cc->EvalAddInPlace(o, partial[s]);
     cc->EvalAddInPlace(sum, weights[s]);
     cc->EvalAddInPlace(sum_k, weights_k[s]);
   }
   // t_D = alpha D + beta on the features, 0 elsewhere; kappa D gets the
-  // midpoint off the features so Newton converges there too.
-  const std::vector<double> add_d = scaled(token_mask_, sum_beta());
+  // midpoint off the features so Newton converges there too. Rows that
+  // attend to nothing (all masked) have D = 0 and o = 0: they get the
+  // midpoint like the slots off the features.
+  std::vector<double> add_d = scaled(token_mask_, sum_beta());
+  for (size_t i = 0; i < add_d.size(); ++i)
+    if (row_pad_[i] != 0.0) add_d[i] = 0.0;
   Ptxt pb = encode_at(add_d, sum);
   Ctxt td = cc->EvalAdd(sum, pb);
   if (pl.refresh_sum) td = ctx.bootstrap(td);
   std::vector<double> pad_k(token_mask_.size());
-  for (size_t i = 0; i < pad_k.size(); ++i) pad_k[i] = token_mask_[i] ? 0.0 : kappa * 0.5 * (sum_lo() + sum_hi());
+  for (size_t i = 0; i < pad_k.size(); ++i)
+    pad_k[i] = token_mask_[i] && row_pad_[i] == 0.0 ? 0.0 : kappa * 0.5 * (sum_lo() + sum_hi());
   Ptxt pk = encode_at(pad_k, sum_k);
   const Ctxt dk = cc->EvalAdd(sum_k, pk);
   std::vector<double> ci = scaled(inv_coeffs_, 1.0 / kappa);
@@ -1025,17 +1120,19 @@ Ctxt Attention::forward(const FHEContext& ctx, const Ctxt& x) const {
   // token i to token (i + s) mod n for every i < n.
   cc->EvalAddInPlace(k, rot(k, -nd));
   cc->EvalAddInPlace(v, rot(v, -nd));
-  std::vector<int32_t> offs(n_);
-  for (int s = 0; s < n_; ++s) offs[s] = s * stride_;
+  // Offsets s with no unmasked (query, key) pair are skipped.
+  const int m = static_cast<int>(offs_.size());
+  std::vector<int32_t> offs(m);
+  for (int i = 0; i < m; ++i) offs[i] = offs_[i] * stride_;
   const std::vector<Ctxt> kr = ctx.rotate_many(k, offs);
   const std::vector<Ctxt> vr = ctx.rotate_many(v, offs);
 
   // score[i][h] = q_i . k_{i+s} over head h, accumulated into slot
   // i*B + h*dh by summing a dh-wide window (slots i*B+d .. i*B+B-1 are
   // zero, so the last head's window never reads the next token).
-  std::vector<Ctxt> p(n_);
+  std::vector<Ctxt> p(m);
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
-  for (int s = 0; s < n_; ++s) {
+  for (int s = 0; s < m; ++s) {
     p[s] = cc->EvalMult(q, kr[s]);
     for (int t = 1; t < dh_; t *= 2) cc->EvalAddInPlace(p[s], rot(p[s], t));
   }
@@ -1054,29 +1151,29 @@ Ctxt Attention::forward(const FHEContext& ctx, const Ctxt& x) const {
       if (vals.size() % 2) next.back() = vals.back();
       vals.swap(next);
     }
-    for (int s = 0; s < n_; ++s) p[s] = cc->EvalSub(p[s], vals[0]);
+    for (int s = 0; s < m; ++s) p[s] = cc->EvalSub(p[s], vals[0]);
   }
 
-  std::vector<Ctxt> partial(n_), weights(n_);
+  std::vector<Ctxt> partial(m), weights(m);
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
-  for (int s = 0; s < n_; ++s) {
+  for (int s = 0; s < m; ++s) {
     Ctxt a;
     if (softmax_) {
       // a = mask * exp(p): the series everywhere, then the head slots kept.
       std::vector<double> c = exp_coeffs_;
       Ctxt e = cc->EvalChebyshevSeries(p[s], c, exp_lo(), exp_hi());
       const uint32_t lvl = e->GetLevel() + (e->GetNoiseScaleDeg() > 1 ? 1 : 0);
-      Ptxt mask = ctx.encode(mask_head_, lvl);
+      Ptxt mask = ctx.encode(head_mask(s), lvl);
       a = cc->EvalMult(e, mask);
     } else {
       // a = mask * (c2 p^2 + c1 p + c0): 2 levels, zero outside slots i*B+h*dh.
       const uint32_t lvl = p[s]->GetLevel() + (p[s]->GetNoiseScaleDeg() > 1 ? 1 : 0);
-      Ptxt c2 = ctx.encode(mask_c2_, lvl);
+      Ptxt c2 = ctx.encode(masked(mask_c2_, s), lvl);
       a = cc->EvalMult(p[s], c2);
-      Ptxt c1 = ctx.encode(mask_c1_, a->GetLevel(), a->GetNoiseScaleDeg());
+      Ptxt c1 = ctx.encode(masked(mask_c1_, s), a->GetLevel(), a->GetNoiseScaleDeg());
       cc->EvalAddInPlace(a, c1);
       a = cc->EvalMult(p[s], a);
-      Ptxt c0 = ctx.encode(mask_c0_, a->GetLevel(), a->GetNoiseScaleDeg());
+      Ptxt c0 = ctx.encode(masked(mask_c0_, s), a->GetLevel(), a->GetNoiseScaleDeg());
       cc->EvalAddInPlace(a, c0);
     }
     // Broadcast a[i*B+h*dh] over head h's sub-block (the dh-wide window
@@ -1086,11 +1183,11 @@ Ctxt Attention::forward(const FHEContext& ctx, const Ctxt& x) const {
     weights[s] = a;
   }
   Ctxt o = partial[0];
-  for (int s = 1; s < n_; ++s) cc->EvalAddInPlace(o, partial[s]);
+  for (int s = 1; s < m; ++s) cc->EvalAddInPlace(o, partial[s]);
   if (softmax_) {
     // Divide by the row sums: 1/x series plus Newton steps y <- y (2 - D y).
     Ctxt sum = weights[0];
-    for (int s = 1; s < n_; ++s) cc->EvalAddInPlace(sum, weights[s]);
+    for (int s = 1; s < m; ++s) cc->EvalAddInPlace(sum, weights[s]);
     Ptxt pad = ctx.encode(pad_sum_, sum->GetLevel(), sum->GetNoiseScaleDeg());
     cc->EvalAddInPlace(sum, pad);
     std::vector<double> c = inv_coeffs_;
@@ -1132,13 +1229,13 @@ std::vector<int32_t> Attention::rotation_indices() const {
   for (const auto& p : proj_)
     for (int32_t i : p->rotation_indices()) r.insert(i);
   r.insert(-n_ * stride_);
-  for (int s = 1; s < n_; ++s) r.insert(s * stride_);
+  for (int s : offs_) r.insert(s * stride_);
   for (int t = 1; t < dh_; t *= 2) {
     r.insert(t);
     r.insert(-t);
   }
   if (self_)
-    for (int s = 1; s < n_; ++s) {
+    for (int s = 1; s < static_cast<int>(offs_.size()); ++s) {
       r.insert(pack_shift(s));
       r.insert(-pack_shift(s));
     }
@@ -1151,9 +1248,16 @@ void Attention::encrypt_weights(const FHEContext& ctx, bool drop_plaintext) {
 }
 
 void Attention::save(std::ostream& os) const {
-  bool has_bias = !b_[0].empty();
-  os << "attention " << n_ << " " << d_ << " " << (has_bias ? 1 : 0);
+  // has_bias: 0 none, 1 [d] per projection, 2 [n][d] (per token).
+  const bool per_token = b_[0].size() == static_cast<size_t>(n_) * d_ && n_ > 1;
+  const int has_bias = b_[0].empty() ? 0 : per_token ? 2 : 1;
+  os << "attention " << n_ << " " << d_ << " " << has_bias;
   if (heads_ > 1) os << " heads " << heads_;
+  write_segments(os, seg_);
+  if (!mask_.empty()) {
+    os << " mask";
+    for (char c : mask_) os << " " << (c ? 1 : 0);
+  }
   if (softmax_)
     os << std::setprecision(std::numeric_limits<double>::max_digits10) << " softmax " << sm_.lo << " " << sm_.hi << " "
        << sm_.exp_degree << " " << sm_.inv_degree << " " << sm_.newton << " " << (sm_.subtract_max ? 1 : 0) << " "
@@ -1162,7 +1266,8 @@ void Attention::save(std::ostream& os) const {
   os << "\n";
   for (int i = 0; i < 4; ++i) write_vec(os, w_[i]);
   if (has_bias)
-    for (int i = 0; i < 4; ++i) write_vec(os, b_[i].empty() ? std::vector<double>(d_, 0.0) : b_[i]);
+    for (int i = 0; i < 4; ++i)
+      write_vec(os, b_[i].empty() ? std::vector<double>(static_cast<size_t>(per_token ? n_ : 1) * d_, 0.0) : b_[i]);
   write_vec(os, score_);
 }
 
