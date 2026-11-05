@@ -489,7 +489,9 @@ Two more things make deep transformers fit:
 
 * **Range loss.** `fheml.nn.range_loss(model)` penalises LayerNorm
   variances, attention scores and softmax row sums that leave their
-  intervals. Add it to the training loss so the calibrated intervals stay
+  intervals, and Chebyshev activation and max-pool inputs that leave
+  theirs (summed per image, since a single stray activation is enough to
+  break a bootstrap). Add it to the training loss so the calibrated intervals stay
   narrow. A narrow interval matters because bootstrap error is absolute
   (see below), and a wide `1/x` interval magnifies it.
 * **Iterative bootstrapping.** With `bootstrap_iterations=2`, OpenFHE
@@ -544,7 +546,7 @@ python3 tools/datasets.py cifar10 pets coco cmudict   # fetch and cache once
 
 `tools/fhe_eval.py` is what every example script shares: the encryption
 flags (`add_args`: `--insecure`, `--bootstrap`, `--window`, `--digits`,
-`--level-budget`, `--ring`, `--boot-iterations`, `--packing`, `--n`,
+`--level-budget`, `--ring`, `--boot-iterations`, `--scale-bits`, `--packing`, `--n`,
 `--profile`, `--json`), torch training with the range loss (`train`), the
 plaintext score of the exported network (`plain_score`), range checks,
 bootstrap placement (`prepare`), the context (`context`), the encrypted
@@ -610,6 +612,57 @@ error past what CKKS can decode. Running lnvit securely needs ring 2^17
 column at ring 4096 works because one bootstrap there is accurate to
 1.2e-3, ten times better. So the remaining gap at 128 bits is bootstrap
 precision, not depth or the planner.
+
+### CIFAR-10
+
+`examples/python/train_torch_cifar10.py` classifies encrypted 32x32 colour
+images. The client normalises the image, encrypts all 3072 values (4096
+slots) and decrypts the ten logits. Every layer in between runs encrypted,
+with bootstraps where the depth requires them. All three models use two
+stride-2 stages with multiplexed packing, so the 16x16 and 8x8 maps stay
+in the 4096 input slots. They are trained with random crops and flips.
+
+| Model | Layers | What it exercises |
+| --- | --- | --- |
+| `cnn` | conv 3→16 s2, conv 16→32 s2, conv 32→32 (BatchNorm folded), `x/2 + x²/4` activations, 2x2 average pool, dense 512→10 | the CryptoNets-style quadratic baseline: 11 levels, no bootstrapping |
+| `deepcnn` | six conv blocks (16, 16, 32, 32, 64, 64 channels, three stride-2) with degree-7 Chebyshev ReLU on [-8, 8], global average pool, dense 64→10 | ReLU networks: 38 levels, folded to 32 with 6 bootstraps |
+| `poolcnn` | four of those conv/ReLU blocks, exact 2x2 MaxPool2d, dense 512→10 | conv, ReLU, exact max pooling by scheme switching and bootstrapping in one network |
+
+```sh
+PYTHONPATH=build/python python3 examples/python/train_torch_cifar10.py --arch cnn --window 1 --n 5
+PYTHONPATH=build/python python3 examples/python/train_torch_cifar10.py --arch deepcnn --bootstrap --level-budget 3 --digits 4 --insecure --ring 8192 --scale-bits 59 --n 10
+PYTHONPATH=build/python python3 examples/python/train_torch_cifar10.py --arch poolcnn --bootstrap --level-budget 3 --digits 4 --insecure --ring 8192 --scale-bits 59 --n 5
+```
+
+Measured on 4 cores. The plaintext and encrypted columns use a fixed
+shuffle of the test set, since the cached copy is sorted by class:
+
+| | cnn, 128-bit | cnn, toy | deepcnn, toy | poolcnn, toy |
+| --- | --- | --- | --- | --- |
+| Accuracy (torch, 10k test images) | 74.3% | 74.3% | 75.1% | 74.0% |
+| fheml plaintext (2000 images; torch identical) | 72.5% | 72.5% | 74.4% | 73.4% |
+| Ring, slots, scale | 2^15, 4096, 40 bits | 8192, 4096, 40 bits | 8192, 4096, 59 bits | 8192, 4096, 59 bits |
+| Depth | 11 | 11 | 32: 6 bootstraps | 24: 4 bootstraps, MaxPool 15 |
+| Setup, rotation keys | 2 s, 23 (ladder, 552 MB) | 1 s, 71 | 10 s, 169 (2.9 GB) | 25 s, 249 (4.2 GB) |
+| Time per image | 13.0 s | 2.3 s | 25.6 s (bootstraps 18 s) | 105 s (MaxPool 99 s) |
+| Peak memory | 2.6 GB | 2.2 GB | 5.5 GB | 10.1 GB |
+| Encrypted vs torch logits | 3e-7, 5/5 same class | 1e-7, 10/10 | 2.6e-3, 10/10 | 1.5e-3, 5/5 |
+
+The deep ReLU network beats the quadratic one by less than a point. With
+16 to 64 channels and a degree-7 ReLU, both models are about the size
+CKKS handles comfortably, not that of state-of-the-art CIFAR models. The
+max pool is exact, but at one FHEW bootstrap per compared slot (1024, then
+512) it takes 95% of poolcnn's time.
+
+**Bootstrap precision and slot count.** At 4096 slots and 50-bit
+scaling, a bootstrap keeps only about 3 bits (1 bit with
+`key_switch_digits=4`, against 6 bits at 256 slots), and six of them leave
+deepcnn's logits off by 2 to 5. A larger ring alone does not help. A larger
+scale does: 55 bits keep 8 bits and 59 bits keep 12, hence `--scale-bits
+59` on the toy runs. At 128-bit security, ring 2^16 fits only 50-bit
+scaling. The 4096-slot bootstrapping keys also take 100 rotation keys even
+with the ladder (about 12 GB with `--digits 4`), more than the container's
+14 GB, so the bootstrapped CIFAR models run on toy parameters here.
 
 ## Encrypted training
 
@@ -877,7 +930,7 @@ still need their own key).
 | `examples/` | `mnist_cnn` (encrypted MNIST), `conv_demo` (network built in code), `packing_bench` (gapped vs compact vs multiplexed packing) and `rotation_bench` (hoisted rotation trees vs. plain composed rotations) |
 | `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py` |
 | `python/` | pybind11 bindings and the `fheml` Python package (`fheml.nn` + `fheml.from_torch`: PyTorch export) |
-| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `train_encrypted_mnist.py` trains on encrypted data |
+| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` and `train_torch_cifar10.py` train in torch and run encrypted; `train_encrypted_mnist.py` trains on encrypted data |
 | `tools/train_mnist.py`, `tools/train_transformer.py` | HE-friendly CNN / transformer training and export (numpy) |
 | `models/` | trained example models and 200 test images |
 | `legacy/` | the original PALISADE capstone code |
