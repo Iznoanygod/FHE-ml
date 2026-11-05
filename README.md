@@ -937,19 +937,21 @@ Measured on 4 cores. The transformer columns use toy parameters (ring
 2^14, 59-bit scaling), with d = 32, MLP 64 and one block. CIFAR is top-1
 accuracy and Pets is mean IoU over the three classes:
 
-| | CIFAR, 4 heads | Pets, 1 head | Pets, 4 heads |
-| --- | --- | --- | --- |
-| torch (all test images) | 58.9% | 0.484 | 0.499 |
-| fheml plaintext (2000 / 500 test images) | 59.8% (torch on them: 59.8%) | 0.483 (torch: 0.483) | 0.503 (torch: 0.503) |
-| Depth | 71: 3 bootstraps between layers, 23 inside LayerNorm, softmax and argmax | 68: 3 + 16 | 68: 3 + 22 |
-| Setup, rotation keys | 50 s, 153 keys (5.2 GB) | 30 s, 232 keys (7.9 GB) | 21 s, 177 keys (6.0 GB) |
-| Time per image | 167-238 s | 408-409 s | 376-397 s (argmax 225 s) |
-| Peak memory | 9.3 GB | 12.3 GB | 9.8 GB |
-| Encrypted vs torch | one-hots within 7e-6, 3/3 same class | 1.5e-5, every pixel the same (2 images) | 1.5e-5, every pixel the same (2 images) |
+| | CIFAR, 1 head | CIFAR, 4 heads | Pets, 1 head | Pets, 4 heads |
+| --- | --- | --- | --- | --- |
+| torch (all test images) | 57.7% | 58.9% | 0.484 | 0.499 |
+| fheml plaintext (2000 / 500 test images) | 57.1% (torch on them: 57.1%) | 59.8% (torch: 59.8%) | 0.483 (torch: 0.483) | 0.503 (torch: 0.503) |
+| Depth | 71: 3 bootstraps between layers, 17 inside LayerNorm, softmax and argmax | 71: 3 + 23 | 68: 3 + 16 | 68: 3 + 22 |
+| Setup, rotation keys | 27 s, 229 keys (7.8 GB) | 19 s, 153 keys (5.2 GB) | 30 s, 232 keys (7.9 GB) | 21 s, 177 keys (6.0 GB) |
+| Time per image | 133-136 s | 163-169 s | 408-409 s | 376-397 s (argmax 225 s) |
+| Peak memory | 11.9 GB | 9.0 GB | 12.3 GB | 9.8 GB |
+| Encrypted vs torch | one-hots within 4e-6, 3/3 same class | 1e-5, 3/3 | 1.5e-5, every pixel the same (2 images) | 1.5e-5, every pixel the same (2 images) |
 
-More heads cost nothing extra under encryption. The heads are sub-blocks of
-each token's slots, so they need no split or concat rotations, and the
-4-head models need fewer rotation keys than the single-head ones. d = 64
+The heads are sub-blocks of each token's slots, so they need no split or
+concat rotations, and the 4-head models need fewer rotation keys than the
+single-head ones. Time follows the refreshes instead: the 4-head CIFAR
+model's attention plans 23 bootstraps inside its layers against 17, so it is
+about 25% slower, while the 4-head Pets model is a little faster. d = 64
 does not fit: the keys for 16384-slot ciphertexts exceed 14 GB even at toy
 parameters.
 
