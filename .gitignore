@@ -1,4 +1,4 @@
 build/
 *.csv
-data/
+data
 __pycache__/

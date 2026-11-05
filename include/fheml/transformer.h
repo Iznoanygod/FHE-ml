@@ -40,12 +40,25 @@
 
 namespace fheml {
 
-// Same dense map applied to every token: {n, 1, in} -> {n, 1, out}.
+// Token segments. A sequence may consist of several segments, e.g. the
+// source and the target sentence of an encoder-decoder (see Attention):
+// `segments` gives each of the n tokens a segment id 0 .. G-1, and the
+// per-token layers (TokenDense, LayerNorm, the attention projections) then
+// hold one weight set per segment. Different weights on different tokens
+// cost nothing under encryption: the slot matrix kron(I_n, W) becomes
+// block-diagonal with other blocks, but its diagonals stay at the same
+// offsets. Empty = one segment.
+int segment_count(const std::vector<int>& segments, int n);
+
+// Same dense map applied to every token: {n, 1, in} -> {n, 1, out}; with
+// segments, token t uses weight set segments[t].
 class TokenDense : public LinearLayer {
  public:
-  // weights: [out][in]; bias: empty, [out] (shared by all tokens) or
-  // [n][out] (per token, e.g. a positional embedding folded in).
-  TokenDense(int n, int in, int out, std::vector<double> weights, std::vector<double> bias);
+  // weights: [G][out][in] (G = 1 without segments); bias: empty, [out]
+  // (shared by all tokens) or [n][out] (per token, e.g. a positional
+  // embedding folded in).
+  TokenDense(int n, int in, int out, std::vector<double> weights, std::vector<double> bias,
+             std::vector<int> segments = {});
   std::string type() const override { return "tokendense"; }
   std::string describe() const override;
   Shape configure(const Shape& in) override;
@@ -57,10 +70,15 @@ class TokenDense : public LinearLayer {
   std::vector<double> params() const override;
   void set_params(const std::vector<double>& p) override;
   void save(std::ostream& os) const override;
+  const std::vector<int>& segments() const { return seg_; }
 
  private:
   int n_, in_dim_, out_dim_;
   std::vector<double> w_, b_;
+  std::vector<int> seg_;  // empty: one segment
+  size_t weight_base(int t) const {
+    return seg_.empty() ? 0 : static_cast<size_t>(seg_[static_cast<size_t>(t)]) * in_dim_ * out_dim_;
+  }
 };
 
 // Mean over tokens: {n, 1, d} -> {d, 1, 1}.
@@ -100,8 +118,9 @@ class TokenMean : public LinearLayer {
 // product. 1-3 bootstraps; the input bound comes from calibrate().
 class LayerNorm : public Layer {
  public:
+  // gamma, beta: [G][d], one set per token segment (G = 1 without segments).
   LayerNorm(int n, int d, std::vector<double> gamma, std::vector<double> beta, double eps, double var_min,
-            double var_max, uint32_t degree = 15, uint32_t newton = 1);
+            double var_max, uint32_t degree = 15, uint32_t newton = 1, std::vector<int> segments = {});
   std::string type() const override { return "layernorm"; }
   std::string describe() const override;
   Shape configure(const Shape& in) override;
@@ -153,10 +172,16 @@ class LayerNorm : public Layer {
   uint32_t newton() const { return newton_; }
   const std::vector<double>& gamma() const { return gamma_; }
   const std::vector<double>& beta() const { return beta_; }
+  const std::vector<int>& segments() const { return seg_; }
+  // Index of feature j of token t in gamma and beta.
+  size_t affine_index(int t, int j) const {
+    return (seg_.empty() ? 0 : static_cast<size_t>(seg_[static_cast<size_t>(t)]) * d_) + static_cast<size_t>(j);
+  }
 
  private:
   int n_, d_;
   std::vector<double> gamma_, beta_;
+  std::vector<int> seg_;
   double eps_, var_min_, var_max_;
   uint32_t degree_, newton_;
   std::vector<double> coeffs_;  // Chebyshev series on [var_min, var_max]
@@ -251,13 +276,16 @@ struct SoftmaxOptions {
 // calibrate()). Typically 3-5 bootstraps per block.
 class Attention : public Layer {
  public:
-  // w*: [d][d] as [out][in] (head h reads/writes rows [h*dh, (h+1)*dh) of
-  // Wq, Wk, Wv and columns of Wo, like torch's MultiheadAttention); b*: empty
-  // or [d]; score = {c0, c1, c2} shared by all heads, or 3*heads values with
-  // one polynomial per head.
+  // w*: [G][d][d] as [out][in] (head h reads/writes rows [h*dh, (h+1)*dh)
+  // of Wq, Wk, Wv and columns of Wo, like torch's MultiheadAttention; G
+  // token segments, 1 without); b*: empty, [d] or [n][d] (per token); score
+  // = {c0, c1, c2} shared by all heads, or 3*heads values with one
+  // polynomial per head; mask: empty or [n][n], 1 where query i may attend
+  // to key j (see the top of the class).
   Attention(int n, int d, std::vector<double> wq, std::vector<double> wk, std::vector<double> wv,
             std::vector<double> wo, std::vector<double> bq, std::vector<double> bk, std::vector<double> bv,
-            std::vector<double> bo, std::vector<double> score, int heads = 1);
+            std::vector<double> bo, std::vector<double> score, int heads = 1, std::vector<int> segments = {},
+            std::vector<double> mask = {});
   std::string type() const override { return "attention"; }
   std::string describe() const override;
   Shape configure(const Shape& in) override;
@@ -273,6 +301,18 @@ class Attention : public Layer {
   // The cyclic copy of K and V needs 2*n*d slots.
   size_t min_slots() const override;
   int heads() const { return heads_; }
+  const std::vector<int>& segments() const { return seg_; }
+  // The attention mask ([n][n], empty = every pair) and whether query i may
+  // attend to key j.
+  void set_mask(std::vector<double> mask);
+  std::vector<double> mask() const;
+  double allowed(int i, int j) const {
+    return mask_.empty() ? 1.0 : mask_[static_cast<size_t>(i) * n_ + static_cast<size_t>(j)];
+  }
+  bool empty_row(int i) const;
+  // Token offsets s (key = query + s mod n) evaluated: those that pair
+  // some query with a key it may attend to.
+  const std::vector<int>& offsets() const { return offs_; }
   // Projection i (0 q, 1 k, 2 v, 3 o): weights [d][d] and bias (may be empty).
   const std::vector<double>& weights(int i) const { return w_[i]; }
   const std::vector<double>& bias(int i) const { return b_[i]; }
@@ -300,6 +340,13 @@ class Attention : public Layer {
   // padding, the exp and 1/x series (softmax).
   const std::vector<double>& score_mask(int k) const { return k == 0 ? mask_c0_ : k == 1 ? mask_c1_ : mask_c2_; }
   const std::vector<double>& head_mask() const { return mask_head_; }
+  // The head mask with the masked-out queries of offset offsets()[k] zeroed.
+  const std::vector<double>& head_mask(int k) const {
+    return mask_.empty() ? mask_head_ : head_masks_[static_cast<size_t>(k)];
+  }
+  // A per-slot vector that is nonzero only at the head slots (t*B + h*dh),
+  // zeroed where offsets()[k] pairs query t with a masked-out key.
+  std::vector<double> masked(const std::vector<double>& base, int k) const;
   const std::vector<double>& pad_sum() const { return pad_sum_; }
   const std::vector<double>& exp_coeffs() const { return exp_coeffs_; }
   const std::vector<double>& inv_coeffs() const { return inv_coeffs_; }
@@ -328,6 +375,11 @@ class Attention : public Layer {
   int stride_ = 0;                   // token stride B of the input layout
   std::vector<double> w_[4], b_[4];  // q, k, v, o
   std::vector<double> score_;  // [heads][3]
+  std::vector<int> seg_;       // token segments (empty: one)
+  std::vector<char> mask_;     // [n][n] attention mask (empty: all pairs)
+  std::vector<int> offs_;      // evaluated token offsets
+  std::vector<std::vector<double>> head_masks_;  // head mask per evaluated offset (masked)
+  std::vector<double> row_pad_;  // 1 on the features of tokens that attend to nothing
   std::shared_ptr<TokenDense> proj_[4];
   uint32_t slots_ = 0;
   std::vector<double> mask_c2_, mask_c1_, mask_c0_;
@@ -347,7 +399,7 @@ class Attention : public Layer {
   };
   Plan plan(uint32_t d, uint32_t budget) const;
   Plan plan_with(uint32_t d, uint32_t budget, bool refresh_e, bool refresh_sum) const;
-  int packed_groups() const { return (n_ + 2 * dh_ - 1) / (2 * dh_); }
+  int packed_groups() const { return (static_cast<int>(offs_.size()) + 2 * dh_ - 1) / (2 * dh_); }
   // Slot shift of offset s inside its packed ciphertext.
   int32_t pack_shift(int s) const;
   // Scaling of the self-bootstrapping softmax: the row sums times alpha

@@ -129,6 +129,37 @@ for bad, msg in ((nn.Sequential(nn.Linear(4, 4), nn.ReLU()), "Chebyshev"),
     except ValueError as e:
         assert msg in str(e), e
 
+# Encoder-decoder over one sequence of 3 source and 2 target tokens:
+# segment-wise embedding and head, encoder self-attention, causal decoder
+# self-attention with softmax, cross-attention, segment-wise layer norm.
+S, T, d = 3, 2, 8
+seg = (S, T)
+masks = hnn.encoder_decoder_masks(S, T)
+sm = dict(lo=-3.0, hi=3.0, exp_degree=15, inv_degree=15, newton=2, sum_lo=0.05, sum_hi=45.0)
+encdec = nn.Sequential(
+    hnn.SegmentLinear(6, d, seg), hnn.PosEmbedding(S + T, d),
+    hnn.Residual(hnn.Attention(d, S + T, heads=2, mask=masks["encoder"], segments=seg, query_segments=[0],
+                               key_segments=[0])),
+    hnn.Residual(hnn.SegmentLinear(d, 16, seg, active=[0]), hnn.Poly([0, 0.5, 0.25]),
+                 hnn.SegmentLinear(16, d, seg, active=[0])),
+    hnn.Residual(hnn.LayerNorm(d, eps=0.1, var_max=4.0, degree=31, segments=seg),
+                 hnn.Attention(d, S + T, heads=2, softmax=sm, mask=masks["causal"], segments=seg,
+                               query_segments=[1], key_segments=[1])),
+    hnn.Residual(hnn.Attention(d, S + T, mask=masks["cross"], segments=seg, query_segments=[1], key_segments=[0])),
+    hnn.SegmentLinear(d, 4, seg, active=[1]))
+with torch.no_grad():
+    for p in encdec.parameters():
+        p.mul_(0.5)
+net = run("encoder-decoder", encdec, (S + T, 6))
+xs = torch.rand(1, S + T, 6, dtype=torch.float64)
+with torch.no_grad():
+    y0 = encdec(xs)
+    xs2 = xs.clone()
+    xs2[0, -1] += 1
+    y1 = encdec(xs2)
+assert torch.allclose(y0[0, :-1], y1[0, :-1]) and not torch.allclose(y0[0, -1], y1[0, -1]), "causality"
+assert torch.all(y0[0, :S] == 0), "head acts on the target segment only"
+
 # A short training run: the exported model reproduces the trained one.
 x = torch.rand(256, 1, 8, 8, dtype=torch.float64)
 y = (x[:, 0, :4].mean((1, 2)) > x[:, 0, 4:].mean((1, 2))).long()

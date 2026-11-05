@@ -360,6 +360,8 @@ std::unique_ptr<Node> build(Layer* l, bool train, uint32_t slots) {
     return n;
   }
   if (auto* at = dynamic_cast<Attention*>(l)) {
+    if (!at->mask().empty() || !at->segments().empty())
+      throw std::invalid_argument("trainer: masked or segmented attention (encoder-decoder) is inference only");
     n->kind = Node::kAttn;
     n->att = at;
     n->trainable = train;
@@ -367,6 +369,7 @@ std::unique_ptr<Node> build(Layer* l, bool train, uint32_t slots) {
     return n;
   }
   if (auto* ln = dynamic_cast<LayerNorm*>(l)) {
+    if (!ln->segments().empty()) throw std::invalid_argument("trainer: segmented layer norm is inference only");
     n->kind = Node::kNorm;
     n->norm = ln;
     n->trainable = train;
@@ -1460,8 +1463,11 @@ std::vector<double> plain_backward(const std::vector<std::shared_ptr<Layer>>& la
     } else if (auto* lin = dynamic_cast<LinearLayer*>(l)) {
       g = plain_linear_backward(lin, train[k], x, g, grads);
     } else if (auto* ln = dynamic_cast<LayerNorm*>(l)) {
+      if (!ln->segments().empty()) throw std::invalid_argument("train_plain: segmented layer norm is inference only");
       g = plain_layernorm_backward(ln, train[k], x, g, grads);
     } else if (auto* at = dynamic_cast<Attention*>(l)) {
+      if (!at->mask().empty() || !at->segments().empty())
+        throw std::invalid_argument("train_plain: masked or segmented attention is inference only");
       g = plain_attention_backward(at, train[k], x, g, grads);
     } else if (auto* mp = dynamic_cast<MaxPool2d*>(l)) {
       g = plain_maxpool_backward(mp, x, g);

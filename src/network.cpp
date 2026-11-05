@@ -30,6 +30,20 @@ uint32_t next_pow2(size_t n) {
 
 }  // namespace
 
+// Optional "segments s_0 .. s_{n-1}" (token segments, see TokenDense).
+std::vector<int> read_segments(std::istream& is, int n) {
+  std::string next;
+  auto pos = is.tellg();
+  if (is >> next && next == "segments") {
+    std::vector<int> seg(static_cast<size_t>(n));
+    for (int& v : seg) is >> v;
+    return seg;
+  }
+  is.clear();
+  is.seekg(pos);
+  return {};
+}
+
 std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
   std::shared_ptr<Layer> layer;
   if (tok == "conv2d") {
@@ -107,9 +121,10 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
     int n, i, o;
     size_t nb;
     is >> n >> i >> o >> nb;
-    auto w = read_vec(is, static_cast<size_t>(i) * o, "tokendense weights");
+    auto seg = read_segments(is, n);
+    auto w = read_vec(is, static_cast<size_t>(segment_count(seg, n)) * i * o, "tokendense weights");
     auto b = read_vec(is, nb, "tokendense bias");
-    layer = std::make_shared<TokenDense>(n, i, o, std::move(w), std::move(b));
+    layer = std::make_shared<TokenDense>(n, i, o, std::move(w), std::move(b), std::move(seg));
   } else if (tok == "tokenmean") {
     int n, d;
     is >> n >> d;
@@ -127,6 +142,16 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
       is.seekg(pos);
     }
     if (heads < 1) throw std::runtime_error("model file: bad attention head count");
+    auto seg = read_segments(is, n);
+    // Optional "mask m_00 .. m_{n-1,n-1}".
+    std::vector<double> mask;
+    pos = is.tellg();
+    if (is >> next && next == "mask") {
+      mask = read_vec(is, static_cast<size_t>(n) * n, "attention mask");
+    } else {
+      is.clear();
+      is.seekg(pos);
+    }
     // Optional "softmax LO HI EXP_DEG INV_DEG NEWTON SUBTRACT_MAX SUM_LO SUM_HI".
     bool softmax = false;
     SoftmaxOptions sm;
@@ -152,11 +177,12 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
       is.seekg(pos);
     }
     std::vector<double> w[4], b[4];
-    for (auto& wi : w) wi = read_vec(is, static_cast<size_t>(d) * d, "attention weights");
+    for (auto& wi : w) wi = read_vec(is, static_cast<size_t>(segment_count(seg, n)) * d * d, "attention weights");
     if (hb)
-      for (auto& bi : b) bi = read_vec(is, d, "attention bias");
+      for (auto& bi : b) bi = read_vec(is, static_cast<size_t>(hb == 2 ? n : 1) * d, "attention bias");
     auto score = read_vec(is, 3u * heads, "attention score polynomial");
-    auto att = std::make_shared<Attention>(n, d, w[0], w[1], w[2], w[3], b[0], b[1], b[2], b[3], score, heads);
+    auto att = std::make_shared<Attention>(n, d, w[0], w[1], w[2], w[3], b[0], b[1], b[2], b[3], score, heads,
+                                           std::move(seg), std::move(mask));
     if (softmax) att->set_softmax(sm);
     att->set_self_bootstrapping(self);
     att->set_bounds(xb, ob);
@@ -166,6 +192,8 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
     double eps, vmin, vmax;
     uint32_t degree, newton;
     is >> n >> d >> eps >> vmin >> vmax >> degree >> newton;
+    auto seg = read_segments(is, n);
+    const size_t gd = static_cast<size_t>(segment_count(seg, n)) * d;
     // Optional "selfboot BOUND" (bootstraps internally, see LayerNorm).
     double bound = 0.0;
     bool self = false;
@@ -178,9 +206,10 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
       is.clear();
       is.seekg(pos);
     }
-    auto g = read_vec(is, d, "layernorm gamma");
-    auto b = read_vec(is, d, "layernorm beta");
-    auto ln = std::make_shared<LayerNorm>(n, d, std::move(g), std::move(b), eps, vmin, vmax, degree, newton);
+    auto g = read_vec(is, gd, "layernorm gamma");
+    auto b = read_vec(is, gd, "layernorm beta");
+    auto ln = std::make_shared<LayerNorm>(n, d, std::move(g), std::move(b), eps, vmin, vmax, degree, newton,
+                                          std::move(seg));
     ln->set_self_bootstrapping(self);
     ln->set_input_bound(bound);
     layer = ln;
