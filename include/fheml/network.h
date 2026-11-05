@@ -136,6 +136,9 @@ class Network {
   // ladder, ContextOptions::rotation_window): only the rotations of layers
   // that cannot compose them (attention); linear layers compose theirs.
   std::vector<int32_t> rotation_indices(bool ladder = false) const;
+  // ContextOptions::compare_slots for this network: the widest span its
+  // comparisons touch when every comparing layer reports one, else 0 (all).
+  uint32_t compare_slots() const;
 
   // Level to encrypt inputs at: with bootstrapping the first segment only
   // needs depth_before_first_bootstrap() levels, and OpenFHE only refreshes

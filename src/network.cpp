@@ -962,10 +962,32 @@ void collect_rotations(const std::vector<std::shared_ptr<Layer>>& layers, bool l
 
 }  // namespace
 
+uint32_t Network::compare_slots() const {
+  if (!slots_) throw std::logic_error("compile() the network first");
+  size_t span = 0;
+  bool all = false;
+  std::function<void(const std::vector<std::shared_ptr<Layer>>&)> visit = [&](const auto& layers) {
+    for (const auto& l : layers) {
+      if (auto* r = dynamic_cast<const Residual*>(l.get())) visit(r->body());
+      if (!l->uses_scheme_switching()) continue;
+      if (!l->compare_span()) all = true;
+      span = std::max(span, l->compare_span());
+    }
+  };
+  visit(layers_);
+  if (all || !span) return 0;
+  uint32_t p = 1;
+  while (p < span) p *= 2;
+  return p < slots_ ? p : 0;
+}
+
 std::vector<int32_t> Network::rotation_indices(bool ladder) const {
   if (!slots_) throw std::logic_error("compile() the network first");
   std::set<int32_t> s;
   collect_rotations(layers_, ladder, s);
+  // compare() folds onto compare_slots before switching.
+  if (const uint32_t cs = compare_slots(); cs && !ladder)
+    for (uint32_t r = cs; r < slots_; r *= 2) s.insert(static_cast<int32_t>(r));
   return std::vector<int32_t>(s.begin(), s.end());
 }
 
@@ -976,6 +998,7 @@ ContextOptions Network::context_options(bool secure) const {
   o.secure = secure;
   o.bootstrapping = uses_bootstrapping();
   o.scheme_switching = uses_scheme_switching();
+  if (o.scheme_switching) o.compare_slots = compare_slots();
   // +1: EvalBootstrap needs one level left when its input arrives.
   o.mult_depth = o.bootstrapping ? depth_between_bootstraps() + 1 : depth();
   if (o.bootstrapping) {
