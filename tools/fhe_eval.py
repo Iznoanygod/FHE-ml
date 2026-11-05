@@ -56,6 +56,9 @@ def add_args(ap, n=3):
                     help="2 = iterative bootstrapping: about twice the bits of precision for twice the time")
     ap.add_argument("--boot-precision", type=int, default=0,
                     help="bits of precision of one bootstrap for --boot-iterations 2 (default: measured at keygen)")
+    ap.add_argument("--scale-bits", type=int, default=0,
+                    help="CKKS scaling bits (0 = default: 40, 50 with bootstrapping); bootstrapping thousands of "
+                    "slots keeps far more precision at 59 (first modulus min(60, bits + 7))")
     ap.add_argument("--seed", type=int, default=0)
     return ap
 
@@ -74,14 +77,30 @@ def predict(model, x, batch=512):
         return torch.cat([model(x[i]) for i in batches(len(x), batch, shuffle=False)])
 
 
+def argmax_range(model, x, quantile=0.999, headroom=1.25):
+    """Comparison range for an encrypted ArgMax after model: the largest
+    logit magnitude of all but the top 0.1% of inputs, with 25% headroom.
+    The excluded inputs are ones whose polynomial activations left their
+    intervals; their logits run to thousands and are already wrong, and a
+    range that covered them would cost the comparisons of every other input
+    their precision (FHEW compares (a - b) / range to a fixed resolution)."""
+    logits = predict(model, x).abs().reshape(len(x), -1).amax(1)
+    bound = headroom * float(torch.quantile(logits.double(), quantile))
+    print(f"argmax range {bound:.1f} (largest training logit: median {logits.median():.1f}, "
+          f"{quantile:.1%} below {bound / headroom:.1f}, max {logits.max():.1f})")
+    return bound
+
+
 def train(model, xtr, ytr, xte, yte, epochs, loss_fn=None, metric=None, lr=2e-3, batch=128,
-          range_weight=RANGE_WEIGHT, clip=1.0, weight_decay=0.0, augment=None, log=print):
+          range_weight=RANGE_WEIGHT, clip=1.0, weight_decay=0.0, augment=None, augment_pairs=None, log=print):
     """Adam with a one-cycle schedule. loss_fn(outputs, targets) defaults to
     cross-entropy; metric(outputs, targets) -> float is printed after every
     epoch on the test set. fheml.nn.range_loss keeps polynomial arguments
     (layer norm variances, softmax scores and sums) inside the intervals the
     encrypted series cover; gradient clipping tames polynomial networks
-    early on. augment(x) -> x is applied to each training batch. Returns
+    early on. augment(x) -> x is applied to each training batch;
+    augment_pairs(x, y) -> (x, y) instead transforms inputs and targets
+    together (flipping an image and its segmentation mask). Returns
     (final metric, training seconds)."""
     loss_fn = loss_fn or nn.functional.cross_entropy
     metric = metric or accuracy
@@ -93,9 +112,13 @@ def train(model, xtr, ytr, xte, yte, epochs, loss_fn=None, metric=None, lr=2e-3,
         model.train()
         t = time.time()
         for idx in batches(len(xtr), batch):
-            xb = xtr[idx] if augment is None else augment(xtr[idx])
+            xb, yb = xtr[idx], ytr[idx]
+            if augment is not None:
+                xb = augment(xb)
+            if augment_pairs is not None:
+                xb, yb = augment_pairs(xb, yb)
             opt.zero_grad()
-            loss = loss_fn(model(xb), ytr[idx])
+            loss = loss_fn(model(xb), yb)
             (loss + range_weight * hnn.range_loss(model)).backward()
             if clip:
                 nn.utils.clip_grad_norm_(model.parameters(), clip)
@@ -215,7 +238,7 @@ def check_ranges(net, xs):
     """Largest |input| of every Chebyshev / exact-relu / max-pool layer over
     xs, against its interval (the series diverge outside it; the comparison
     wraps around)."""
-    xs = [np.asarray(x, dtype=np.float64).ravel() for x in xs]
+    xs = [np.asarray(fheml._prepare(net, x)) for x in xs]  # (pads token inputs to the stride)
     for i, layer in enumerate(net.layers):
         if layer.type in ("chebyshev", "exactrelu", "maxpool2d"):
             peak = max(np.abs(x).max() for x in xs)
@@ -289,6 +312,9 @@ def context(net, args, level_budget):
     t = time.time()
     overrides = {"level_budget": level_budget, "key_switch_digits": args.digits,
                  "bootstrap_iterations": args.boot_iterations, "bootstrap_precision": args.boot_precision}
+    if args.scale_bits:
+        overrides["scale_mod_bits"] = args.scale_bits
+        overrides["first_mod_bits"] = min(60, args.scale_bits + 7)
     if args.ring or (args.insecure and net.uses_bootstrapping):
         overrides["ring_dim"] = args.ring or 4096
     ctx = fheml.make_context(net, secure=not args.insecure, rotation_window=args.window, **overrides)
