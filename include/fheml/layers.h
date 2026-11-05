@@ -123,6 +123,9 @@ class Layer {
   virtual bool is_bootstrap() const { return false; }
   // Needs ContextOptions::scheme_switching (FHEContext::compare()).
   virtual bool uses_scheme_switching() const { return false; }
+  // Slots this layer's comparisons touch, from the first (0 = all of them;
+  // see ContextOptions::compare_slots).
+  virtual size_t compare_span() const { return 0; }
 
   // Bootstrapped networks (see Network::place_bootstraps). Levels are
   // counted from the output level of a bootstrap; a stretch between
@@ -414,9 +417,13 @@ class MaxPool2d : public Layer {
 // than the comparison resolution, about 4 range / 2^(fhew_log_q - 1), are
 // resolved either way). The one-hot comes from the comparison results,
 // which are fresh at compare_depth() whatever the input level: the layer
-// costs compare_depth() + rounds levels, and past a bootstrap its output
+// costs compare_depth() + rounds + 2 levels, and past a bootstrap its output
 // sits `rounds` levels into the stretch (the comparisons come back above a
-// bootstrap's output level) while its input needs rounds + 1 levels left.
+// bootstrap's output level) while its input needs rounds + 2 levels left.
+//
+// The network sets ContextOptions::compare_slots to the span the
+// comparisons touch (blocks x block), so the scheme-switching keys stay
+// small however many slots the ciphertexts hold.
 //
 // `range` bounds the inputs, |x| <= range, as for MaxPool2d. `classes` > 0
 // splits the last dimension further: groups of `classes` consecutive
@@ -438,6 +445,7 @@ class ArgMax : public Layer {
   uint32_t level_peak(uint32_t d, uint32_t budget) const override;
   std::vector<int32_t> rotation_indices() const override;
   bool uses_scheme_switching() const override { return true; }
+  size_t compare_span() const override { return static_cast<size_t>(blocks()) * block(); }
   bool composes_rotations() const override { return true; }
   void set_bootstrapped(bool on) override { bootstrapped_ = on; }
   void compile(uint32_t slots) override;

@@ -139,8 +139,9 @@ void FHEContext::keygen(const std::vector<int32_t>& rotations) {
     sp.SetSecurityLevelCKKS(opts_.secure ? lbcrypto::HEStd_128_classic : lbcrypto::HEStd_NotSet);
     sp.SetSecurityLevelFHEW(opts_.secure ? lbcrypto::STD128 : lbcrypto::TOY);
     sp.SetCtxtModSizeFHEWLargePrec(opts_.fhew_log_q);
-    sp.SetNumSlotsCKKS(opts_.slots);
-    sp.SetNumValues(opts_.slots);
+    const uint32_t cs = compare_slots();
+    sp.SetNumSlotsCKKS(cs);
+    sp.SetNumValues(cs);
     lbcrypto::LWEPrivateKey lwe_sk = cc_->EvalSchemeSwitchingSetup(sp);
     cc_->EvalSchemeSwitchingKeyGen(keys_, lwe_sk);
     // Largest FHEW plaintext modulus the sign bootstrap decodes correctly.
@@ -470,18 +471,35 @@ Ctxt FHEContext::compare(const Ctxt& a, const Ctxt& b, double range, size_t coun
     compare_range_ = range;
   }
   // OpenFHE's slots-to-coefficients transform keeps three towers of the
-  // (rescaled) input: the inputs need two levels left.
+  // (rescaled) input: the inputs need two levels left (three when the
+  // difference is first masked to fewer compared slots).
+  const uint32_t cs = compare_slots();
+  const uint32_t need = cs < opts_.slots ? 3 : 2;
   for (const Ctxt& c : {a, b}) {
     const uint32_t used = c->GetLevel() + (c->GetNoiseScaleDeg() > 1 ? 1 : 0);
-    if (used + 2 > total_depth_)
+    if (used + need > total_depth_)
       throw std::logic_error("compare: input has " + std::to_string(total_depth_ - std::min(used, total_depth_)) +
-                             " levels left, needs 2");
+                             " levels left, needs " + std::to_string(need));
   }
   // OpenFHE's slots-to-coefficients matrix needs a power-of-two count.
   uint32_t n = 1;
-  while (n < count && n < opts_.slots) n *= 2;
-  if (!count) n = opts_.slots;
-  return cc_->EvalCompareSchemeSwitching(a, b, n, opts_.slots);
+  while (n < count && n < cs) n *= 2;
+  if (!count) n = cs;
+  if (count > cs) throw std::invalid_argument("compare: count exceeds ContextOptions::compare_slots");
+  if (cs == opts_.slots) return cc_->EvalCompareSchemeSwitching(a, b, n, opts_.slots);
+  // Fewer compared slots than the ciphertext holds: a - b, masked to the
+  // compared slots, folded onto period cs, is what a cs-slot (sparsely
+  // packed) ciphertext with those values looks like.
+  Ctxt d = cc_->EvalSub(a, b);
+  std::vector<double> mask(opts_.slots, 0.0);
+  std::fill(mask.begin(), mask.begin() + n, 1.0);
+  d = cc_->EvalMult(d, encode(mask, level(d)));
+  for (uint32_t s = cs; s < opts_.slots; s *= 2) cc_->EvalAddInPlace(d, rotate(d, static_cast<int32_t>(s)));
+  // The result is a cs-slot (sparsely packed) ciphertext: as a full one it
+  // repeats with period cs.
+  Ctxt r = cc_->EvalCompareSchemeSwitching(d, cc_->EvalSub(d, d), n, cs);
+  r->SetSlots(opts_.slots);
+  return r;
 #endif
 }
 
