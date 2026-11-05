@@ -215,20 +215,17 @@ def detect_loss(p, t, classes):
     return loss
 
 
-def shuffle_map(channels, r, grid):
-    """LinearMap of pixel shuffle: (channels * r^2, grid, grid) -> (channels, grid * r, grid * r)."""
-    n = channels * r * r * grid * grid
-    src = F.pixel_shuffle(torch.arange(n, dtype=torch.float64).reshape(1, channels * r * r, grid, grid), r)
-    return hnn.LinearMap((torch.arange(n), src.flatten().long(), torch.ones(n)), (channels, grid * r, grid * r),
-                         name="pixelshuffle", in_size=n)
-
-
-class PixelShuffle(nn.Module):
-    """F.pixel_shuffle while training; exported as its LinearMap."""
+class PixelShuffle(hnn.LinearMap):
+    """Pixel shuffle (channels * r^2, grid, grid) -> (channels, grid * r,
+    grid * r): a permutation, exported as its LinearMap; torch computes it
+    with F.pixel_shuffle (the same result, without the gather)."""
 
     def __init__(self, channels, r, grid):
-        super().__init__()
-        self.map = shuffle_map(channels, r, grid)
+        n = channels * r * r * grid * grid
+        src = F.pixel_shuffle(torch.arange(n, dtype=torch.float64).reshape(1, channels * r * r, grid, grid), r)
+        super().__init__((torch.arange(n), src.flatten().long(), torch.ones(n)), (channels, grid * r, grid * r),
+                         name="pixelshuffle", in_size=n)
+        self._non_persistent_buffers_set.update(("rows", "cols", "vals"))  # rebuilt, not saved
         self.r = r
 
     def forward(self, x):
@@ -307,20 +304,32 @@ def detection_scores(outputs, split, idx, names, ious=(0.5,), large=False):
 # ----------------------------------------------------------- segmentation
 
 def activation_ranges(model, x):
-    """Largest |input| of every Chebyshev activation over x, against its interval."""
-    peaks = {}
+    """Largest |input| of every Chebyshev activation over x, against its
+    interval, and how many images leave an interval somewhere (their
+    encrypted result is garbage: a series diverges outside its interval)."""
+    peaks, outside = {}, torch.zeros(len(x), dtype=torch.bool)
+    pos = [0]
 
     def hook(m, inp, _):
-        a = inp[0].abs()
-        peaks[m] = max(peaks.get(m, 0.0), float(a.max()) if torch.isfinite(a).all() else float("inf"))
+        a = inp[0].abs().flatten(1)
+        peak = a.max(1).values
+        peak = torch.where(torch.isfinite(peak), peak, torch.full_like(peak, float("inf")))
+        peaks[m] = max(peaks.get(m, 0.0), float(peak.max()))
+        outside[pos[0]:pos[0] + len(a)] |= peak > m.b
 
     hooks = [m.register_forward_hook(hook) for m in model.modules() if isinstance(m, hnn.Chebyshev)]
-    fhe_eval.predict(model, x)
+    model.eval()
+    with torch.no_grad():
+        for i in range(0, len(x), 512):
+            pos[0] = i
+            model(x[i:i + 512])
     for h in hooks:
         h.remove()
     for m, p in peaks.items():
         print(f"  {m.fn} on [{m.a:g}, {m.b:g}]: max |input| {p:.2f} over {len(x)} val images"
               + ("  OUTSIDE" if p > m.b else ""))
+    print(f"  {int(outside.sum())} of {len(x)} val images leave an interval")
+    return outside
 
 
 def labels(out, classes):
@@ -426,7 +435,7 @@ def main():
                                        metric=metric, lr=3e-3, batch=128, range_weight=RANGE_WEIGHT)
         if args.checkpoint:
             torch.save(net_t.state_dict(), args.checkpoint)
-    activation_ranges(net_t, xte)
+    outside = activation_ranges(net_t, xte)
     calib = xtr[:args.calibration].double().numpy()
     del xtr, ytr, tr  # the training set (GBs) is not needed past here
 
@@ -442,7 +451,7 @@ def main():
         scores = dict(map50=maps[0], map50_95=maps.mean(), map50_large=large,
                       ap50={n: a for n, a in zip(names, ap50)})
     else:
-        bound = float(out.abs().max())
+        bound = float(out[~outside].abs().max())  # the images that stay inside
         rng = float(np.ceil(1.25 * bound))
         print(f"class logits on val within +-{bound:.1f}: ArgMax range {rng}")
         full = nn.Sequential(net_t, hnn.ArgMax(rng, dim=1)) if args.tail == "encrypted" else net_t
@@ -489,6 +498,7 @@ def main():
     run = fhe_eval.encrypted_run(net, ctx, full, xte.double().numpy(), args, describe=describe)
     fhe_eval.record(args, net, ctx, setup, run, task=args.task, tail=args.tail, classes=names, width=args.width,
                     train_images=len(sel), train_seconds=train_time, plain_metric=plain, plain_images=n_plain,
+                    val_images_outside=int(outside.sum()),
                     **scores)
 
 

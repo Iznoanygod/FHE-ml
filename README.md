@@ -642,6 +642,79 @@ column at ring 4096 works because one bootstrap there is accurate to
 1.2e-3, ten times better. So the remaining gap at 128 bits is bootstrap
 precision, not depth or the planner.
 
+## Detection and segmentation on COCO
+
+`examples/python/coco_cnn.py` takes a CNN on COCO 2017 from the image to the
+finished answer under encryption. The server runs the network and all of its
+post-processing on the ciphertext. The client decrypts once and only reads the
+result: boxes and scores for detection, a one-hot label map for segmentation.
+
+```sh
+PYTHONPATH=build/python python3 examples/python/coco_cnn.py --task detect --classes person \
+    --insecure --bootstrap --window 1 --digits 4 --scale-bits 59 --n 2
+PYTHONPATH=build/python python3 examples/python/coco_cnn.py --task segment --classes person \
+    --insecure --bootstrap --window 1 --digits 4 --scale-bits 59 --n 2
+```
+
+**Backbone.** Images are squashed to 48×48. Five 3×3 convolutions with
+BatchNorm and ReLU (widths 12, 24, 24, 48, 48; three of them stride 2) give a
+6×6 grid of features, and a 1×1 convolution reads out each cell's prediction.
+ReLU is a degree-31 Chebyshev series on [-20, 20], and torch trains through
+that same series. The range penalty starts at 60% of the interval, so unseen
+images stay inside it too: the script counts the val images that do not. The
+network is 41 to 60 levels deep, and `--bootstrap` places 5 to 8 bootstraps
+between its layers.
+
+**Detection.** This is a single-shot grid detector. Every cell predicts a box
+(centre within the cell, width, height) and K per-class scores through one
+Chebyshev sigmoid. Non-maximum suppression and box decoding then stay
+encrypted:
+
+1. A `LinearMap` gathers each score's 3×3 neighbourhood into 9 channels
+   (the score itself first, zero padding).
+2. The encrypted `ArgMax` over those channels gives c = 1 where the score is
+   its neighbourhood's maximum.
+3. A residual adds c − 1 to the score.
+4. A second `LinearMap` turns cell offsets into box corners. It adds each
+   cell's own position as a bias.
+5. A Chebyshev ReLU zeroes the suppressed scores and clips the corners at 0.
+
+**Segmentation.** Each cell predicts the logits of its 4×4 block of a 24×24
+label map. A pixel-shuffle `LinearMap` (a permutation) arranges them into the
+map, so no upsampling layer is needed. A per-pixel `ArgMax` over the K + 1
+channels then makes the one-hot labels.
+
+**Evaluation.** Training uses the first 40,000 train2017 images and scoring
+uses all 5000 val2017 images. At 48×48, half of the boxes are smaller than a
+grid cell (8 px). Detection therefore scores the objects at least one cell in
+size and treats smaller ones and crowds as ignore regions
+(`average_precision(ignore=...)`), the way COCO treats crowds.
+
+Measured on 4 cores, toy parameters (ring 2^14, 8192 slots, 59-bit scale,
+`key_switch_digits` 4, ladder window 1):
+
+| | Person detector | Person segmenter | 6-class detector | 6-class segmenter |
+| --- | --- | --- | --- | --- |
+| Torch, val2017 (5000) | AP50 15.4%, AP 4.1%, large AP50 17.5% | mean IoU 0.587 (person 0.32), pixels 86.4% | mAP50 5.9% (person 16.3%), mAP 1.6% | mean IoU 0.243 (person 0.33, bus 0.22, train 0.19), pixels 84.6% |
+| fheml plaintext = torch | yes (20 images) | yes (20 images) | yes (20 images) | yes (20 images) |
+| Depth, bootstraps | 60, 7 + 1 inside ArgMax | 41, 5 | 60, 7 + 1 | 43, 5 + 1 |
+| Time per image | 146 s | 128 s | 326 s | 500 s |
+| Peak memory | 10.8 GB | 10.9 GB | 10.9 GB | 10.9 GB |
+| Encrypted vs torch | detections identical, 1.8e-4 | every label identical | detections identical, outputs within 2.8e-2 | every label identical |
+
+Two of the 5000 val images (person segmenter) and one (6-class segmenter)
+push a ReLU input outside its interval; their encrypted results would be
+garbage, and the torch scores count them as they come out. The six classes
+are person, car, bus, train, cat and dog. Accuracy is limited
+by the model's size, not by encryption. In 64×64 trials, the same backbone
+with exact ReLU in plain torch reached 4.7% mAP50 on the six classes, and the
+0.5x + 0.25x² variant (`--activation quad`) reached 3.7%.
+
+Memory sets the input size. At 64×64 the activations need 16384 slots, and
+bootstrapping keys alone at that size exceed 14 GB. The comparisons cost one
+FHEW bootstrap per compared slot, switched 256 slots at a time, which is most
+of each image's time. 128-bit parameters do not fit this machine.
+
 ## Encrypted training
 
 `Trainer` trains a network on encrypted data. The client encrypts inputs and
