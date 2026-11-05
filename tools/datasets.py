@@ -21,6 +21,7 @@ CMUdict, Google's MNIST mirror).
 """
 import concurrent.futures
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -217,7 +218,7 @@ class _RemoteZip:
                     if self.size is None:
                         self.size = int(r.headers["Content-Range"].rsplit("/", 1)[1])
                     return r.read()
-            except OSError:
+            except (OSError, http.client.HTTPException):  # resets, 502s, truncated bodies
                 if attempt == 5:
                     raise
                 time.sleep(2 ** attempt)

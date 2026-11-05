@@ -91,6 +91,25 @@ run("pixel argmax", pix, (1, 4, 4))
 # at once, so the comparisons fold (256) and chunk (512) under one context.
 run("wide pixel argmax", nn.Sequential(hnn.ArgMax(range=1.5, dim=1)), (5, 8, 8))
 
+# Fixed linear maps between shapes: pixel shuffle (a permutation) of a conv
+# output into a larger image, then a gather with per-position offsets back
+# into a vector, then the per-pixel argmax of the shuffled map.
+r, n = 2, 8 * 2 * 2
+src = nn.functional.pixel_shuffle(torch.arange(n, dtype=torch.float64).reshape(1, 8, 2, 2), r).flatten().long()
+shuffle = hnn.LinearMap((torch.arange(n), src, torch.ones(n)), (2, 4, 4), name="pixelshuffle", in_size=n)
+x = torch.randn(3, 8, 2, 2, dtype=torch.float64)
+assert torch.equal(shuffle(x), nn.functional.pixel_shuffle(x, r)), "LinearMap pixel shuffle"
+gather = hnn.LinearMap(rng.normal(size=(5, 32)) * (rng.uniform(size=(5, 32)) < 0.2), (5,), bias=rng.normal(size=5),
+                       name="gather")
+net = run("linear maps", nn.Sequential(nn.Conv2d(1, 8, 3, stride=2, padding=1), shuffle, gather), (1, 4, 4))
+assert [l.type for l in net.layers] == ["conv2d", "linearmap", "linearmap"]
+path = os.path.join(tempfile.mkdtemp(), "linearmap.fheml")
+net.save(path)
+x = rng.uniform(-1, 1, (1, 4, 4))
+assert np.allclose(fheml.plain(fheml.Network.load(path), x), fheml.plain(net, x)), "linearmap save/load"
+run("shuffle argmax", nn.Sequential(nn.Conv2d(1, 8, 3, stride=2, padding=1), shuffle, hnn.ArgMax(4.0, dim=1)),
+    (1, 4, 4))
+
 # Plain nn.ReLU exports as the exact scheme-switching ReLU: the encrypted
 # result matches torch's true ReLU, not a polynomial.
 relu_mlp = nn.Sequential(nn.Linear(6, 8), nn.ReLU(), nn.Linear(8, 3))

@@ -164,6 +164,21 @@ class _Exporter:
             out.append(("tokendense", n, m.in_features, m.out_features, _np(m.weights()), _np(m.token_bias()),
                         m.seg.tolist()))
             return ("tokens", n, m.out_features)
+        if isinstance(m, hnn.LinearMap):
+            if kind == "tokens":
+                raise ValueError(f"LinearMap {m.name}: token inputs are padded per token; use it on images or vectors")
+            if m.in_size != int(np.prod(state[1:])):
+                raise ValueError(f"LinearMap {m.name}: expects {m.in_size} inputs, gets {state[1:]}")
+            shape = m.out_shape
+            if len(shape) == 3:
+                new = ("image",) + shape
+            elif len(shape) == 1:
+                new = ("vector",) + shape
+            else:
+                raise ValueError(f"LinearMap {m.name}: output shape {shape} must be (C, H, W) or (k,)")
+            out.append(("linearmap", tuple(state[1:]), shape, m.rows.tolist(), m.cols.tolist(), _np(m.vals),
+                        _np(m.bias), m.name))
+            return new
         if isinstance(m, hnn.Square):
             out.append(("square",))
             return state
@@ -288,6 +303,11 @@ def _fold(specs):
     return out
 
 
+def _shape(t):
+    """(C, H, W) / (k,) -> fheml.Shape."""
+    return _fheml.Shape(*t) if len(t) == 3 else _fheml.Shape(t[0], 1, 1)
+
+
 def _build(s):
     k = s[0]
     if k == "conv2d":
@@ -309,6 +329,9 @@ def _build(s):
         return _fheml.TokenDense(s[1], s[2], s[3], _flat(s[4]), _flat(b), segments=s[6] or [])
     if k == "tokenmean":
         return _fheml.TokenMean(s[1], s[2])
+    if k == "linearmap":
+        _, ins, outs, rows, cols, vals, bias, name = s
+        return _fheml.LinearMap(_shape(ins), _shape(outs), rows, cols, _flat(vals), _flat(bias), name)
     if k == "square":
         return _fheml.Square()
     if k == "poly":

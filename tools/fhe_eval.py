@@ -15,7 +15,7 @@ An example script defines its model and data and calls these in order:
 
 ``add_args`` gives every example the same encryption flags (--insecure,
 --bootstrap, --window, --digits, --level-budget, --ring, --boot-iterations,
---boot-precision, --packing, --n, --profile, --json). The metrics below
+--boot-precision, --scale-bits, --packing, --n, --profile, --json). The metrics below
 cover classification, segmentation, detection and sequence tasks.
 """
 import json
@@ -56,6 +56,9 @@ def add_args(ap, n=3):
                     help="2 = iterative bootstrapping: about twice the bits of precision for twice the time")
     ap.add_argument("--boot-precision", type=int, default=0,
                     help="bits of precision of one bootstrap for --boot-iterations 2 (default: measured at keygen)")
+    ap.add_argument("--scale-bits", type=int, default=0,
+                    help="CKKS scaling modulus bits (0 = 50). Toy runs of bootstrapped networks: 59 makes a "
+                    "4096-slot bootstrap about 2^-14 accurate instead of 2^-3 (128-bit ring 2^16 fits 50)")
     ap.add_argument("--seed", type=int, default=0)
     return ap
 
@@ -148,29 +151,37 @@ def box_iou(a, b):
     return inter / np.maximum(area(a) + area(b) - inter, 1e-12)
 
 
-def average_precision(dets, gts, iou=0.5):
+def average_precision(dets, gts, iou=0.5, ignore=None):
     """VOC/COCO-style AP of one class at one IoU threshold.
 
     dets: list over images of (K, 5) arrays (x0, y0, x1, y1, score); gts:
     list over images of (M, 4) boxes. Greedy matching by score, all-point
     interpolated precision (COCO uses 101 recall points; the difference is
-    small). Returns (AP, number of ground-truth boxes)."""
+    small). ignore: optional list over images of (M', 4) boxes that are
+    neither required nor penalized (COCO's crowd regions, objects outside
+    the evaluated size range): a detection that matches no ground-truth box
+    but overlaps one of them by iou is dropped instead of counted as a false
+    positive. Returns (AP, number of ground-truth boxes)."""
     scores, tp = [], []
     total = sum(len(g) for g in gts)
-    for d, g in zip(dets, gts):
+    for i, (d, g) in enumerate(zip(dets, gts)):
         d = np.asarray(d, np.float64).reshape(-1, 5)
         g = np.asarray(g, np.float64).reshape(-1, 4)
+        ign = np.asarray(ignore[i] if ignore is not None else [], np.float64).reshape(-1, 4)
         used = np.zeros(len(g), bool)
         for k in np.argsort(-d[:, 4]):
-            scores.append(d[k, 4])
             if len(g):
                 o = box_iou(d[k, :4], g)
                 o[used] = -1
                 j = int(o.argmax())
                 if o[j] >= iou:
                     used[j] = True
+                    scores.append(d[k, 4])
                     tp.append(1)
                     continue
+            if len(ign) and box_iou(d[k, :4], ign).max() >= iou:
+                continue
+            scores.append(d[k, 4])
             tp.append(0)
     if total == 0:
         return float("nan"), 0
@@ -215,7 +226,7 @@ def check_ranges(net, xs):
     """Largest |input| of every Chebyshev / exact-relu / max-pool layer over
     xs, against its interval (the series diverge outside it; the comparison
     wraps around)."""
-    xs = [np.asarray(x, dtype=np.float64).ravel() for x in xs]
+    xs = [fheml._prepare(net, x) for x in xs]  # token inputs padded to the token stride
     for i, layer in enumerate(net.layers):
         if layer.type in ("chebyshev", "exactrelu", "maxpool2d"):
             peak = max(np.abs(x).max() for x in xs)
@@ -289,8 +300,11 @@ def context(net, args, level_budget):
     t = time.time()
     overrides = {"level_budget": level_budget, "key_switch_digits": args.digits,
                  "bootstrap_iterations": args.boot_iterations, "bootstrap_precision": args.boot_precision}
+    if args.scale_bits:
+        overrides["scale_mod_bits"] = args.scale_bits
+        overrides["first_mod_bits"] = min(60, args.scale_bits + 7)
     if args.ring or (args.insecure and net.uses_bootstrapping):
-        overrides["ring_dim"] = args.ring or 4096
+        overrides["ring_dim"] = args.ring or max(4096, 2 * net.slots)  # toy ring: the smallest that bootstraps
     ctx = fheml.make_context(net, secure=not args.insecure, rotation_window=args.window, **overrides)
     setup = time.time() - t
     print(ctx.describe(), f"(setup {setup:.1f}s)")
