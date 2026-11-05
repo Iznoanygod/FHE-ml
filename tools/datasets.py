@@ -5,7 +5,7 @@ ignored by git), converts it once to a compact ``.npz`` cache next to it and
 returns numpy arrays. Images are uint8 ``(N, C, H, W)``; the examples scale
 them. Sources are mirrors that stay reachable from restricted networks
 (fast.ai's S3 copies of CIFAR-10, Oxford-IIIT Pet and COCO 2017, GitHub for
-CMUdict, Google's MNIST mirror).
+CMUdict and SST-2, fast.ai's S3 copy of AG News, Google's MNIST mirror).
 
     mnist       handwritten digits, 28x28            classification
     cifar10     10 classes, 32x32 RGB                classification
@@ -16,6 +16,8 @@ CMUdict, Google's MNIST mirror).
                 resized to a square                  detection, segmentation
     cmudict     CMU pronouncing dictionary: spelling -> phonemes
                                                      sequence to sequence
+    agnews      AG News: 4 news topics, 120k/7.6k    text classification
+    sst2        Stanford Sentiment Treebank, binary  text classification
 
     python3 tools/datasets.py cifar10 pets coco cmudict   # fetch and cache
 """
@@ -41,9 +43,13 @@ from train_mnist import load_mnist  # noqa: E402,F401  (re-exported)
 FASTAI = "https://s3.amazonaws.com/fast-ai-imageclas/"
 COCO = "https://s3.amazonaws.com/fast-ai-coco/"
 CMUDICT = "https://raw.githubusercontent.com/cmusphinx/cmudict/master/cmudict.dict"
+AGNEWS = "https://s3.amazonaws.com/fast-ai-nlp/ag_news_csv.tgz"
+SST2 = "https://raw.githubusercontent.com/clairett/pytorch-sentiment-classification/master/data/SST2/"
 
 CIFAR10_CLASSES = ("airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truck")
 PET_MASK_CLASSES = ("pet", "background", "border")
+AGNEWS_CLASSES = ("world", "sports", "business", "sci/tech")
+SST2_CLASSES = ("negative", "positive")
 
 
 def _download(url, path):
@@ -367,7 +373,88 @@ def load_cmudict(data_dir="data", max_letters=8, max_phonemes=8):
     return _cached(os.path.join(data_dir, f"cmudict_{max_letters}_{max_phonemes}.npz"), build)
 
 
-LOADERS = dict(mnist=load_mnist, cifar10=load_cifar10, pets=load_pets, coco=load_coco, cmudict=load_cmudict)
+# ---------------------------------------------------------------------- text
+
+_WORD = None
+
+
+def tokenize(text):
+    """Lower-cased words, numbers and single punctuation marks."""
+    global _WORD
+    if _WORD is None:
+        import re
+
+        _WORD = re.compile(r"[a-z0-9]+(?:'[a-z]+)?|[^\sa-z0-9]")
+    return _WORD.findall(text.lower().replace("\\", " "))
+
+
+def _encode_text(train, test, max_tokens, vocab_size):
+    """Shared by the text loaders: train/test are lists of (words, label).
+    The vocabulary is the vocab_size - 2 most frequent training words after
+    <pad> (0) and <unk> (1); every text is cut to its first max_tokens
+    words and padded with 0. Returns the dict of arrays."""
+    from collections import Counter
+
+    counts = Counter(w for words, _ in train for w in words)
+    vocab = ["<pad>", "<unk>"] + [w for w, _ in counts.most_common(vocab_size - 2)]
+    index = {w: i for i, w in enumerate(vocab)}
+    out = dict(vocab=np.asarray(vocab))
+    for split, rows in (("train", train), ("test", test)):
+        x = np.zeros((len(rows), max_tokens), np.int64)
+        for i, (words, _) in enumerate(rows):
+            ids = [index.get(w, 1) for w in words[:max_tokens]]
+            x[i, :len(ids)] = ids
+        out[f"{split}_x"] = x
+        out[f"{split}_y"] = np.asarray([y for _, y in rows], np.int64)
+        out[f"{split}_len"] = np.asarray([min(len(w), max_tokens) for w, _ in rows], np.int64)
+    return out
+
+
+def load_agnews(data_dir="data", max_tokens=16, vocab_size=20000):
+    """AG News topic classification (Zhang et al. 2015): 120,000 training and
+    7,600 test articles, 4 balanced classes (AGNEWS_CLASSES). The text is the
+    title followed by the description, tokenized by ``tokenize`` and cut to
+    max_tokens words. Returns vocab and train/test x (N, max_tokens) int64
+    word ids (0 = pad, 1 = unknown), y (N,) and len (N,) (words kept)."""
+
+    def build():
+        import csv
+
+        _fetch_tgz(AGNEWS, data_dir, "ag_news_csv")
+        splits = []
+        for split in ("train", "test"):
+            with open(os.path.join(data_dir, "ag_news_csv", split + ".csv"), encoding="utf-8") as f:
+                rows = csv.reader(f)
+                splits.append([(tokenize(title + " . " + desc), int(label) - 1) for label, title, desc in rows])
+        return _encode_text(*splits, max_tokens, vocab_size)
+
+    return _cached(os.path.join(data_dir, f"agnews_{max_tokens}_{vocab_size}.npz"), build)
+
+
+def load_sst2(data_dir="data", max_tokens=32, vocab_size=12000):
+    """SST-2 binary sentiment (Socher et al. 2013), sentence level: 6,920
+    training, 872 dev and 1,821 test sentences (GLUE's test labels are
+    hidden; this split has them). Same arrays as load_agnews; the train
+    split here includes the dev sentences."""
+
+    def build():
+        splits = []
+        for names in (("train", "dev"), ("test",)):
+            rows = []
+            for name in names:
+                path = _download(SST2 + name + ".tsv", os.path.join(data_dir, "sst2", name + ".tsv"))
+                with open(path, encoding="utf-8") as f:
+                    for line in f:
+                        text, label = line.rstrip("\n").rsplit("\t", 1)
+                        rows.append((tokenize(text), int(label)))
+            splits.append(rows)
+        return _encode_text(*splits, max_tokens, vocab_size)
+
+    return _cached(os.path.join(data_dir, f"sst2_{max_tokens}_{vocab_size}.npz"), build)
+
+
+LOADERS = dict(mnist=load_mnist, cifar10=load_cifar10, pets=load_pets, coco=load_coco, cmudict=load_cmudict,
+               agnews=load_agnews, sst2=load_sst2)
 
 
 def main():

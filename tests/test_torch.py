@@ -218,6 +218,23 @@ with torch.no_grad():
 assert torch.allclose(y0[0, :-1], y1[0, :-1]) and not torch.allclose(y0[0, -1], y1[0, -1]), "causality"
 assert torch.all(y0[0, :S] == 0), "head acts on the target segment only"
 
+# Chebyshev activations and exact max pools report inputs outside their
+# intervals to range_loss while training (the series clamp them); in eval
+# mode the series is evaluated as is, like encrypted inference.
+cheb, pool = hnn.Chebyshev("relu", -2, 2, 7).double(), hnn.MaxPool2d(2, 2, range=2.0)
+xr = torch.tensor([[[[0.5, 3.0], [-1.0, 1.0]]]], dtype=torch.float64)
+cheb.train()(xr)
+pool.train()(xr)
+assert abs(cheb._excess.item() - 1.0) < 1e-12, cheb._excess          # (3 - 2)^2, summed per sample
+assert abs(pool._excess.item() - 1.0) < 1e-12, pool._excess
+assert abs(hnn.range_loss(nn.Sequential(cheb, pool)).item() - 2.0) < 1e-12
+inside = torch.linspace(-2, 2, 9, dtype=torch.float64)
+assert torch.allclose(cheb.train()(inside), cheb.eval()(inside)), "clamping only changes out-of-range inputs"
+out = torch.tensor([3.0], dtype=torch.float64)
+assert abs(cheb.eval()(out).item() - hnn._chebyshev_eval(cheb.c, -2.0, 2.0, out).item()) < 1e-12, "eval: no clamp"
+assert abs(cheb.train()(out).item() - cheb.eval()(torch.tensor([2.0], dtype=torch.float64)).item()) < 1e-12
+print("range loss: chebyshev and max pool inputs")
+
 # A short training run: the exported model reproduces the trained one.
 x = torch.rand(256, 1, 8, 8, dtype=torch.float64)
 y = (x[:, 0, :4].mean((1, 2)) > x[:, 0, 4:].mean((1, 2))).long()
