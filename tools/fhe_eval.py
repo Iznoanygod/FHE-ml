@@ -15,7 +15,7 @@ An example script defines its model and data and calls these in order:
 
 ``add_args`` gives every example the same encryption flags (--insecure,
 --bootstrap, --window, --digits, --level-budget, --ring, --boot-iterations,
---boot-precision, --packing, --n, --profile, --json). The metrics below
+--boot-precision, --scale-bits, --packing, --n, --profile, --json). The metrics below
 cover classification, segmentation, detection and sequence tasks.
 """
 import json
@@ -57,8 +57,8 @@ def add_args(ap, n=3):
     ap.add_argument("--boot-precision", type=int, default=0,
                     help="bits of precision of one bootstrap for --boot-iterations 2 (default: measured at keygen)")
     ap.add_argument("--scale-bits", type=int, default=0,
-                    help="CKKS scaling bits (default 50); 59 keeps ~12 bits through a bootstrap at thousands of "
-                    "slots where 50 keeps 1-3 (first modulus = min(60, scale + 7))")
+                    help="CKKS scaling modulus bits (0 = 50). Toy runs of bootstrapped networks: 59 makes a "
+                    "4096-slot bootstrap about 2^-14 accurate instead of 2^-3 (128-bit ring 2^16 fits 50)")
     ap.add_argument("--seed", type=int, default=0)
     return ap
 
@@ -292,7 +292,7 @@ def context(net, args, level_budget):
     t = time.time()
     overrides = {"level_budget": level_budget, "key_switch_digits": args.digits,
                  "bootstrap_iterations": args.boot_iterations, "bootstrap_precision": args.boot_precision}
-    if getattr(args, "scale_bits", 0):
+    if args.scale_bits:
         overrides["scale_mod_bits"] = args.scale_bits
         overrides["first_mod_bits"] = min(60, args.scale_bits + 7)
     if args.ring or (args.insecure and net.uses_bootstrapping):
