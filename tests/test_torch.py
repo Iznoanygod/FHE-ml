@@ -173,4 +173,17 @@ for _ in range(100):
 acc = (model(x).argmax(1) == y).double().mean().item()
 print(f"trained toy model: loss {loss.item():.3f}, accuracy {acc:.2f}")
 run("trained", model, (1, 8, 8))
+
+# Chebyshev activations: training clamps to [a, b] and the range loss
+# penalises inputs outside it; eval mode evaluates the bare series.
+act = hnn.Chebyshev("sigmoid", -2, 2, 7)
+xs = torch.tensor([-3.0, 0.0, 1.0, 4.0], requires_grad=True)
+model = nn.Sequential(act).train()
+y_train = model(xs)
+penalty = hnn.range_loss(model)
+assert abs(penalty.item() - (1 + 4) / 4) < 1e-6, penalty
+assert torch.allclose(y_train[0], act.eval()(torch.tensor(-2.0))), "clamped while training"
+penalty.backward()
+assert xs.grad[0] < 0 and xs.grad[3] > 0 and xs.grad[1] == 0, "penalty pulls the inputs back inside"
+assert not torch.allclose(act(torch.tensor(4.0)), act(torch.tensor(2.0))), "no clamp in eval mode"
 print("PASSED")

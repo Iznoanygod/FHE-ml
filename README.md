@@ -270,14 +270,45 @@ pushes the model to keep its variances and scores inside the intervals). For tok
 each token to the widest per-token layer, which makes those layers much cheaper
 under encryption; `fheml.infer` pads inputs to match.
 
-`examples/python/train_torch_mnist.py` trains, exports and runs both MNIST
+`examples/python/train_torch_mnist.py` trains, exports and runs the MNIST
 models encrypted. With 128-bit security:
 
 * **CNN:** 98.4% after 3 epochs, about 3 s per encrypted image.
 * **ViT:** 94.8% after 15 epochs, about 16 s per encrypted image.
 * **Agreement:** the encrypted logits match torch to about 1e-6.
 
+The fully connected baseline is the 784-200-10 sigmoid MLP of the 2022
+prototype (`--arch mlp`), now encrypted end to end: the sigmoid is a degree-15
+Chebyshev series on [-16, 16] instead of a decrypt-sigmoid-re-encrypt round
+trip through the client. `--arch mlp-poly` is the same network with the
+CNN's quadratic activation. `examples/python/mnist_mlp_cnn.py` trains the
+MLPs and the CNN on the full 28×28 images and runs them side by side
+(128-bit, no bootstrapping; 6 encrypted test images each for the shallow
+models and 3-4 for the deep ones, all agreeing with torch). `--arch mlp-deep`
+and `mlp-deep-poly` are 784-512-256-128-10 versions of the two MLPs:
+
+| Model | Parameters | Accuracy (torch, 10k) | Depth | Ring | Rotation keys | s / image | max \|enc − torch\| |
+|---|---|---|---|---|---|---|---|
+| MLP 784-200-10, Chebyshev sigmoid | 159,410 | 97.1% | 8 | 2^15 | 49 (882 MB) | 4.0 | 5e-7 |
+| MLP 784-200-10, quadratic | 159,410 | 98.2% | 4 | 2^14 | 49 (257 MB) | 0.9 | 3e-7 |
+| MLP 784-512-256-128-10, Chebyshev sigmoid | 569,226 | 98.3% | 22 | 2^16 | 93 (8.1 GB) | 78 | 2e-6 |
+| MLP 784-512-256-128-10, quadratic | 569,226 | 98.8% | 10 | 2^15 | 93 (2.1 GB) | 16 | 6e-7 |
+| CNN (conv 5×5/2, 845-64-10), quadratic | 54,934 | 98.4% | 7 | 2^15 | 55 (907 MB) | 3.0 | 1e-6 |
+
+The dense 784→200 layer packs into 455 diagonals in 1024 slots, so the
+quadratic MLP is the cheapest model here; the sigmoid series costs six levels
+where the quadratic costs two, which doubles the ring and quadruples the time.
+Three hidden layers lift the sigmoid MLP from 97.1% to 98.3% and the
+quadratic one from 98.2% to 98.8%, but the 784→512 layer needs all 1024 diagonals and every layer adds
+rotation keys, so the deep MLPs cost 16 s (quadratic) and 78 s (sigmoid,
+whose depth 22 needs ring 2^16) per image. The CNN gets 98.4% with a tenth
+of the deep MLP's parameters, and
+multiplexed packing (`--packing multiplexed`: 2048 slots, 40 keys, 660 MB)
+brings it to 2.6 s per image.
+
 ```sh
+PYTHONPATH=build/python python3 examples/python/mnist_mlp_cnn.py --n 6
+PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch mlp --n 3
 PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch cnn --n 3
 PYTHONPATH=build/python python3 examples/python/train_torch_mnist.py --arch vit --out models/vit_torch.fheml
 ```
@@ -933,7 +964,7 @@ still need their own key).
 | `examples/` | `mnist_cnn` (encrypted MNIST), `conv_demo` (network built in code), `packing_bench` (gapped vs compact vs multiplexed packing) and `rotation_bench` (hoisted rotation trees vs. plain composed rotations) |
 | `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py`, `test_eval.py`, `test_g2p.py` (the encoder-decoder example) |
 | `python/` | pybind11 bindings and the `fheml` Python package (`fheml.nn` + `fheml.from_torch`: PyTorch export) |
-| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `train_encrypted_mnist.py` trains on encrypted data; `g2p_transformer.py` is an encoder-decoder (CMUdict grapheme to phoneme) decoded greedily under encryption |
+| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `mnist_mlp_cnn.py` compares the MLP and CNN; `train_encrypted_mnist.py` trains on encrypted data; `g2p_transformer.py` is an encoder-decoder (CMUdict grapheme to phoneme) decoded greedily under encryption |
 | `tools/train_mnist.py`, `tools/train_transformer.py` | HE-friendly CNN / transformer training and export (numpy) |
 | `models/` | trained example models and 200 test images |
 | `legacy/` | the original PALISADE capstone code |
