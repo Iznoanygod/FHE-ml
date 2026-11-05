@@ -6,14 +6,16 @@ run encrypted, with one comparison table at the end.
     PYTHONPATH=build/python python3 examples/python/mnist_mlp_cnn.py --arch mlp --n 10
     PYTHONPATH=build/python python3 examples/python/mnist_mlp_cnn.py --insecure --json runs.jsonl
 
-The models are train_torch_mnist.py's: mlp (the 784-200-10 sigmoid network
-of the original 2022 prototype, fully encrypted with a Chebyshev sigmoid),
-mlp-poly (the same with a quadratic activation), mlp-deep and mlp-deep-poly
-(784-512-256-128-10 versions of both) and cnn (the CryptoNets/LoLa CNN).
+The models are train_torch_mnist.py's BASELINES: mlp (the 784-200-10 sigmoid
+network of the original 2022 prototype), mlp-relu, mlp-deep and
+mlp-deep-relu (784-512-256-128-10) and cnn (CryptoNets/LoLa shape with
+ReLUs), all with Chebyshev activations and encrypted end to end, plus the
+quadratic-activation references mlp-poly, mlp-deep-poly and cnn-poly.
 
-Every model runs on the full 28x28 image with no bootstrapping; at 128-bit
-security mlp-poly fits ring 2^14, mlp, mlp-deep-poly and cnn need 2^15 and
-mlp-deep (depth 22) needs 2^16 with about 8 GB of rotation keys. The table reports test
+Every model runs on the full 28x28 image with no bootstrapping. At 128-bit
+security the Chebyshev MLPs need ring 2^15 (2^16 for the deep ones, depth
+22, about 8 GB of rotation keys) and the ReLU CNN ring 2^16 (depth 15); use
+--packing multiplexed for the CNNs. The table reports test
 accuracy in torch, accuracy of the exported network as encrypted inference
 computes it (in the clear, on 2000 test images), the multiplicative depth,
 the context, seconds per encrypted image and the largest gap between an
@@ -30,12 +32,9 @@ import fheml
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "tools"))
 import fhe_eval  # noqa: E402
 from datasets import load_mnist  # noqa: E402
-from train_torch_mnist import DEEP_HIDDEN, MLP_LR, cnn, mlp  # noqa: E402
+from train_torch_mnist import BASELINES  # noqa: E402
 
-# builder, epochs, learning rate
-MODELS = {"mlp": (mlp, 5, MLP_LR), "mlp-poly": (lambda: mlp("poly"), 5, 2e-3),
-          "mlp-deep": (lambda: mlp("sigmoid", DEEP_HIDDEN), 5, MLP_LR),
-          "mlp-deep-poly": (lambda: mlp("poly", DEEP_HIDDEN), 5, 2e-3), "cnn": (cnn, 3, 2e-3)}
+MODELS = BASELINES
 
 
 def run(arch, args, data):
