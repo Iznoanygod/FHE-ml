@@ -778,59 +778,72 @@ in the attention: a basic transformer with one head of width d (`--heads 1`)
 and a multi-head one that splits the same d into heads (`--heads 4`, same
 parameter count). The client tokenizes its text, looks the words up in the
 embedding table that comes with the model (like the tokenizer) and encrypts
-the (tokens, d) matrix of word vectors; the server computes the rest:
+the (tokens, d) matrix of word vectors. Everything after that runs
+encrypted, including every non-polynomial step: the client decrypts only the
+class logits.
 
 ```text
 token Linear d -> d (+ learned positions)
 residual { LayerNorm, softmax self-attention, 1 or 4 heads }
-residual { LayerNorm, Linear d -> 2d, 0.5x + 0.25x², Linear 2d -> d }
+residual { LayerNorm, Linear d -> 2d, GELU, Linear 2d -> d }
 LayerNorm, mean over tokens, Linear d -> classes
 ```
 
 with d = 32. AG News (4 news topics) uses the first 16 words of title and
-description, SST-2 (sentence sentiment) 32 words. Every series runs on a
-fixed interval (scores [-4, 4], row sums [0.5, 100], block-norm variance
-[0, 8], final-norm variance [0, 16]); the range loss keeps the training
-data inside them and the script prints how the test data fits. The network
-is 56 levels deep: `--bootstrap` places one bootstrap between layers, and
-LayerNorm and softmax attention bootstrap inside (14 refreshes, 16 for 4
-heads on SST-2).
+description, SST-2 (sentence sentiment) 32 words. Every non-polynomial
+function is a series on a fixed interval: GELU degree 7 on [-8, 8], exp
+on scores [-4, 4], 1/x on row sums [0.5, 100], 1/sqrt on block-norm
+variances [0, 8] and final-norm variances [0, 16]. The range loss keeps the
+training data inside, and the script prints how the test data fits. The
+network is 58 levels deep. `--bootstrap` places two bootstraps between
+layers, and LayerNorm and softmax attention bootstrap inside (13 refreshes,
+15 for 4 heads on SST-2).
 
 ```sh
-PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 1 --bootstrap --insecure --n 10
-PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 4 --bootstrap --insecure --n 10
-PYTHONPATH=build/python python3 examples/python/text_transformer.py --task sst2 --heads 4 --bootstrap --insecure --n 10
+PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 1 --bootstrap --insecure --scale-bits 59 --n 10
+PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 4 --bootstrap --insecure --scale-bits 59 --n 10
+PYTHONPATH=build/python python3 examples/python/text_transformer.py --task sst2 --heads 4 --bootstrap --insecure --scale-bits 59 --n 10
 ```
 
-Measured on 4 cores (toy parameters: correctness and operation count, not
-128-bit timings; see lnvit above for why the softmax/LayerNorm models need
-ring 2^17 at 128 bits):
+Measured on 4 cores with toy parameters (59-bit scaling). These show
+correctness and operation count, not 128-bit timings.
 
 | | AG News, 1 head | AG News, 4 heads | SST-2, 1 head | SST-2, 4 heads |
 | --- | --- | --- | --- | --- |
-| Accuracy (torch, whole test set) | 88.9% | 88.9% | 76.6% | 78.1% |
-| fheml plaintext | 88.4% (first 2000; torch on them 88.4%) | 88.2% (torch 88.2%) | 76.6% (all 1821) | 78.1% |
+| Accuracy (torch, whole test set) | 88.9% | 88.9% | 75.8% | 77.4% |
+| fheml plaintext | 88.2% (first 2000; torch on them 88.2%) | 88.5% (torch 88.5%) | 75.8% (all 1821) | 77.4% |
 | Ring, slots | 4096, 2048 | 4096, 2048 | 8192, 4096 | 8192, 4096 |
-| Rotation keys | 115 (711 MB) | 122 (754 MB) | 131 (1.6 GB) | 110 (1.4 GB) |
-| Time per text | 29 s | 27 s | 59 s | 63 s |
-| Peak memory | 2.1 GB | 2.2 GB | 3.9 GB | 3.6 GB |
-| Encrypted vs torch logits | 4e-2 to 1.8e-1, 10/10 same class | 2e-2 to 2.4e-1, 10/10 | 2e-2 to 2.9e-1, 10/10 | 1e-2 to 1.9e-1, 10/10 |
+| Rotation keys | 115 (733 MB) | 122 (777 MB) | 131 (1.7 GB) | 110 (1.4 GB) |
+| Time per text | 22 s | 24 s | 61 s | 62 s |
+| Peak memory | 2.1 GB | 2.2 GB | 3.8 GB | 3.6 GB |
+| Encrypted vs torch logits | 6e-5 to 4e-4, 10/10 same class | 9e-5 to 5e-4, 10/10 | 4e-5 to 8e-4, 10/10 | 2e-5 to 2e-4, 10/10 |
 
-The logit error is the toy ring's bootstrap error (about 1e-3 per refresh)
-amplified through 14 refreshes; it does not change a single prediction.
-Multi-head attention costs no levels and here no time over the single
-head: the heads sit in slot sub-blocks of each token, so there are no
-split or concatenation rotations. Models whose polynomials leave their
-intervals on some input (one AG News test text drives the 4-head model's
-last LayerNorm variance to 311 against [0, 16]) are counted at their real
-encrypted output in the fheml plaintext accuracy.
+Use 59-bit scaling for these runs. At the default 50 bits, one bootstrap
+over thousands of slots keeps only a few bits. The logits then drift by
+1e-1 through 13 refreshes, and on SST-2 (4096 slots) one text differed
+from torch and another failed to decode. Multi-head attention costs no
+levels and no time over the single head: the heads sit in slot sub-blocks
+of each token, so there are no split or concatenation rotations. When a
+polynomial leaves its interval on some input, the fheml plaintext accuracy
+counts that input at its real encrypted output. One AG News test text drives
+the 4-head model's block-norm variance far past [0, 8].
 
-`--attention quadratic --no-norm` is the same model with the polynomial
-score `A = c0 + c1 S + c2 S²` and no LayerNorm, shallow enough to run at
-128-bit security without bootstrapping:
+The same model also decodes at 128-bit security when made small enough for
+this machine's 14 GB. That run used AG News cut to 8 words, d = 16, MLP
+width 16 and 256 slots (`--tokens 8 --dim 16 --mlp-ratio 1 --bootstrap
+--window 1 --level-budget 3 --digits 4 --boot-iterations 2`). Torch scores
+85.9% and the fheml plaintext 85.0%. The run took 62 s of setup, 57
+rotation keys (7.5 GB) and 11.6 GB peak, at 10 minutes per text, and 2/2
+texts gave the same class as torch (logit error 5.5e-2). At 512 slots and
+more, key generation runs out of memory here.
+
+`--attention quadratic --no-norm --activation quadratic` replaces softmax with
+the polynomial score `A = c0 + c1 S + c2 S²`, drops LayerNorm and uses
+`0.5x + 0.25x²` in the MLP. The result is shallow enough to run at 128-bit
+security without bootstrapping:
 
 ```sh
-PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 4 --attention quadratic --no-norm --window 1 --n 3
+PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 4 --attention quadratic --no-norm --activation quadratic --window 1 --n 3
 ```
 
 Measured at 128-bit security, ring 2^15, 40-bit scale, depth 12, rotation-key

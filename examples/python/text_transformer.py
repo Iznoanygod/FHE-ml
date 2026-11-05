@@ -1,10 +1,11 @@
 """Encoder-only transformers for text classification, trained in PyTorch,
 exported to fheml and run encrypted: a basic single-head model and its
 multi-head counterpart, on AG News (4 news topics) or SST-2 (sentiment).
+With PYTHONPATH=build/python:
 
-    PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 1 --bootstrap --insecure
-    PYTHONPATH=build/python python3 examples/python/text_transformer.py --task agnews --heads 4 --bootstrap --insecure
-    PYTHONPATH=build/python python3 examples/python/text_transformer.py --task sst2 --heads 4 --bootstrap --insecure
+    python3 examples/python/text_transformer.py --task agnews --heads 1 --bootstrap --insecure --scale-bits 59
+    python3 examples/python/text_transformer.py --task agnews --heads 4 --bootstrap --insecure --scale-bits 59
+    python3 examples/python/text_transformer.py --task sst2 --heads 4 --bootstrap --insecure --scale-bits 59
 
 The client tokenizes its text, looks the words up in the embedding table
 (released with the model, like the tokenizer) and encrypts the (tokens, dim)
@@ -13,17 +14,22 @@ matrix of word vectors. The server runs everything else homomorphically:
     token Linear dim -> dim (+ learned positional embedding)
     L x pre-norm encoder block:
         residual { LayerNorm, softmax self-attention with H heads }
-        residual { LayerNorm, Linear dim -> 2 dim, 0.5x + 0.25x^2, Linear 2 dim -> dim }
+        residual { LayerNorm, Linear dim -> 2 dim, GELU, Linear 2 dim -> dim }
     LayerNorm, mean over tokens, Linear dim -> classes
 
 --heads 1 is the basic transformer: one attention head of width dim. --heads
 4 splits the same dim into four heads of width dim / 4 (the parameter count
 does not change); under encryption the heads cost fewer rotations than one
-wide head. --attention quadratic swaps softmax for the polynomial score
-A = c0 + c1 S + c2 S^2 (depth 6 instead of ~23), --no-norm drops the
-LayerNorms. Softmax and LayerNorm are tens of levels deep, so --bootstrap is
-needed: fheml.auto_bootstrap places bootstraps between layers and the layers
-bootstrap internally (see Network.place_bootstraps).
+wide head. Every non-polynomial function (softmax, LayerNorm, GELU) is
+evaluated encrypted as a series; the client decrypts only the logits.
+Softmax and LayerNorm are tens of levels deep, so --bootstrap is needed:
+fheml.auto_bootstrap places bootstraps between layers and the layers
+bootstrap internally (see Network.place_bootstraps). Use --scale-bits 59 on
+toy rings: 50-bit bootstraps over thousands of slots keep too few bits.
+
+--attention quadratic (polynomial score A = c0 + c1 S + c2 S^2), --no-norm
+and --activation quadratic (0.5x + 0.25x^2) give a shallow polynomial
+stand-in that runs at 128-bit security without bootstrapping.
 """
 import argparse
 import os
@@ -66,14 +72,26 @@ class Embed(nn.Module):
         return self.table(ids)
 
 
-def encoder(tokens, dim, classes, heads, layers=1, attention="softmax", norm=True):
+# GELU as a Chebyshev series on [-GELU_RANGE, GELU_RANGE]; the range loss
+# keeps the MLP pre-activations inside.
+GELU_RANGE, GELU_DEGREE = 8.0, 7
+
+
+def activation(kind):
+    if kind == "gelu":
+        return hnn.Chebyshev("gelu", -GELU_RANGE, GELU_RANGE, GELU_DEGREE)
+    return hnn.Poly([0, 0.5, 0.25])
+
+
+def encoder(tokens, dim, classes, heads, layers=1, attention="softmax", norm=True, act="gelu", mlp_ratio=2):
     """The server side, on (batch, tokens, dim) word vectors."""
     ln = (lambda o=LN: [hnn.LayerNorm(dim, **o)]) if norm else (lambda o=None: [])  # noqa: E731
     att = dict(softmax=SOFTMAX) if attention == "softmax" else {}
     blocks = []
     for _ in range(layers):
         blocks += [hnn.Residual(*ln(), hnn.Attention(dim, tokens, heads=heads, **att)),
-                   hnn.Residual(*ln(), nn.Linear(dim, 2 * dim), hnn.Poly([0, 0.5, 0.25]), nn.Linear(2 * dim, dim))]
+                   hnn.Residual(*ln(), nn.Linear(dim, mlp_ratio * dim), activation(act),
+                                nn.Linear(mlp_ratio * dim, dim))]
     return nn.Sequential(nn.Linear(dim, dim), hnn.PosEmbedding(tokens, dim), *blocks, *ln(LN_FINAL), hnn.TokenMean(),
                          nn.Linear(dim, len(classes)))
 
@@ -82,25 +100,32 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--task", choices=sorted(TASKS), default="agnews")
     ap.add_argument("--heads", type=int, default=1, help="attention heads (1 = basic transformer)")
+    ap.add_argument("--tokens", type=int, help="words per text (default: per task)")
     ap.add_argument("--dim", type=int, default=32, help="model width (power of two)")
     ap.add_argument("--layers", type=int, default=1, help="encoder blocks")
+    ap.add_argument("--mlp-ratio", type=int, default=2, help="MLP hidden width / dim (the token stride is the "
+                    "widest layer, so 1 halves the slots)")
     ap.add_argument("--attention", choices=("softmax", "quadratic"), default="softmax")
     ap.add_argument("--no-norm", dest="norm", action="store_false", help="no LayerNorm")
+    ap.add_argument("--activation", choices=("gelu", "quadratic"), default="gelu",
+                    help="MLP activation: GELU (Chebyshev series) or the polynomial 0.5x + 0.25x^2")
     ap.add_argument("--train-size", type=int, help="use only this many training texts")
     fhe_eval.add_args(ap)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
     task = TASKS[args.task]
-    data = task["load"](args.data, task["tokens"], task["vocab"])
+    tokens = args.tokens or task["tokens"]
+    data = task["load"](args.data, tokens, task["vocab"])
     xtr, ytr = torch.tensor(data["train_x"]), torch.tensor(data["train_y"])
     xte, yte = torch.tensor(data["test_x"]), torch.tensor(data["test_y"])
     if args.train_size:
         xtr, ytr = xtr[:args.train_size], ytr[:args.train_size]
-    classes, tokens = task["classes"], task["tokens"]
+    classes = task["classes"]
 
     embed = Embed(len(data["vocab"]), args.dim)
-    model = encoder(tokens, args.dim, classes, args.heads, args.layers, args.attention, args.norm)
+    model = encoder(tokens, args.dim, classes, args.heads, args.layers, args.attention, args.norm,
+                    args.activation, args.mlp_ratio)
     full = nn.Sequential(embed, model)
     acc, train_time = fhe_eval.train(full, xtr, ytr, xte, yte, args.epochs or task["epochs"], weight_decay=1e-5)
 
@@ -133,7 +158,8 @@ def main():
 
     run = fhe_eval.encrypted_run(net, ctx, model, vte, args, describe=describe)
     fhe_eval.record(args, net, ctx, setup, run, task=args.task, heads=args.heads, dim=args.dim, layers=args.layers,
-                    attention=args.attention, norm=args.norm, tokens=tokens, torch_accuracy=acc,
+                    attention=args.attention, norm=args.norm, activation=args.activation, mlp_ratio=args.mlp_ratio,
+                    scale_bits=args.scale_bits or 50, tokens=tokens, torch_accuracy=acc,
                     plain_accuracy=plain_acc, torch_accuracy_plain_texts=torch_sub, plain_texts=n_plain,
                     train_seconds=train_time)
 
