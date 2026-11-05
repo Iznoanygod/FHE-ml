@@ -23,7 +23,7 @@ import numpy as np
 import torch
 from torch import nn
 
-__all__ = ["Poly", "Square", "Chebyshev", "Attention", "LayerNorm", "MaxPool2d", "Residual", "TokenMean",
+__all__ = ["Poly", "Square", "Chebyshev", "Attention", "LayerNorm", "MaxPool2d", "ArgMax", "Residual", "TokenMean",
            "PosEmbedding", "Bootstrap", "SegmentLinear", "chebyshev_coefficients", "range_loss", "segment_ids",
            "causal_mask", "encoder_decoder_masks"]
 
@@ -480,6 +480,50 @@ class MaxPool2d(nn.MaxPool2d):
 
     def extra_repr(self):
         return super().extra_repr() + f", range={self.range}"
+
+
+class ArgMax(nn.Module):
+    """Encrypted argmax, exported to ``fheml.ArgMax`` (CKKS <-> FHEW scheme switching).
+
+    Returns a one-hot of the input's shape: within every group of ``classes``
+    consecutive features of the last dimension (default: all of it), 1 at
+    the first maximum and 0 elsewhere. ``dim=1`` on an image (batch, C, H, W)
+    takes the argmax over the channels of every pixel instead. Put it after a trained model, as the
+    last layer to export (it has no gradient)::
+
+        net = fheml.from_torch(nn.Sequential(model, hnn.ArgMax(range=R)), shape)
+
+    ``range`` bounds the inputs, ``|x| <= range`` (the comparison wraps
+    around outside it): take it from the logits on training data. Groups of
+    K classes cost ceil(log2 K) comparison rounds, (K' - 1) M FHEW
+    bootstraps (K', M: K and the group count rounded up to powers of two)
+    and 12 + ceil(log2 K) + 2 levels.
+    """
+
+    def __init__(self, range=1.0, classes=None, dim=-1):
+        super().__init__()
+        if not range > 0:
+            raise ValueError("ArgMax: range must be positive")
+        if classes is not None and classes < 1:
+            raise ValueError("ArgMax: classes must be positive")
+        if dim not in (-1, 1) or (dim == 1 and classes):
+            raise ValueError("ArgMax: dim is -1 (last, optionally in groups of classes) or 1 (image channels)")
+        self.range, self.classes, self.dim = float(range), classes, dim
+
+    def forward(self, x):
+        if self.dim == 1:
+            if x.dim() != 4:
+                raise ValueError("ArgMax(dim=1) expects images (batch, C, H, W)")
+            return nn.functional.one_hot(x.argmax(1), x.shape[1]).to(x.dtype).permute(0, 3, 1, 2)
+        k = self.classes or x.shape[-1]
+        if x.shape[-1] % k:
+            raise ValueError("ArgMax: classes must divide the last dimension")
+        g = x.reshape(*x.shape[:-1], x.shape[-1] // k, k)
+        return nn.functional.one_hot(g.argmax(-1), k).to(x.dtype).reshape(x.shape)
+
+    def extra_repr(self):
+        return (f"range={self.range}" + (f", classes={self.classes}" if self.classes else "")
+                + (", dim=1" if self.dim == 1 else ""))
 
 
 class Bootstrap(nn.Module):

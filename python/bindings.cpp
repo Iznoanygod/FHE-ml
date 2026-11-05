@@ -111,6 +111,14 @@ PYBIND11_MODULE(_fheml, m) {
   py::class_<MaxPool2d, Layer, std::shared_ptr<MaxPool2d>>(m, "MaxPool2d")
       .def(py::init<int, int, double>(), py::arg("k"), py::arg("stride"), py::arg("range") = 1.0,
            "Exact max pooling through CKKS<->FHEW scheme switching; inputs must lie in [-range, range].");
+  py::class_<ArgMax, Layer, std::shared_ptr<ArgMax>>(m, "ArgMax")
+      .def(py::init<double, int, bool>(), py::arg("range") = 1.0, py::arg("classes") = 0,
+           py::arg("over_channels") = false,
+           "Encrypted argmax over groups of `classes` consecutive features (0 = the last dimension), or over the "
+           "channels of every pixel: a one-hot per group, in the input's layout, through CKKS<->FHEW scheme "
+           "switching; inputs must lie in [-range, range].")
+      .def_property_readonly("range", &ArgMax::range)
+      .def_property_readonly("rounds", &ArgMax::rounds);
   py::class_<ChannelAffine, LinearLayer, std::shared_ptr<ChannelAffine>>(m, "ChannelAffine")
       .def(py::init<Vec, Vec>(), py::arg("scale"), py::arg("shift"));
   py::class_<Scale, LinearLayer, std::shared_ptr<Scale>>(m, "Scale").def(py::init<Vec>(), py::arg("factors"));
