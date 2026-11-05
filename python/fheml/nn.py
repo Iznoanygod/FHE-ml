@@ -89,8 +89,8 @@ def _excess(x, lo, hi):
 
 
 def range_loss(model):
-    """Sum of how far the last training forward pushed LayerNorm variances and
-    softmax scores / row sums outside the intervals their encrypted series
+    """Sum of how far the last training forward pushed Chebyshev activation
+    inputs, LayerNorm variances and softmax scores / row sums outside the intervals their encrypted series
     cover (mean squared excess). Add ``weight * range_loss(model)`` to the
     training loss so the model learns to stay inside them: the series
     diverge outside, and encrypted inference cannot clamp."""
@@ -107,7 +107,10 @@ class Chebyshev(nn.Module):
 
     The forward pass evaluates the polynomial itself, not the exact function,
     so training sees what encrypted inference computes. Inputs outside [a, b]
-    blow up quickly, as they do under encryption: keep activations in range.
+    blow up quickly, as they do under encryption: while training, the series
+    sees its input clamped to [a, b] and records how far the input went
+    outside, which ``range_loss`` turns into a penalty that pulls the
+    pre-activations back inside. Check the ranges on data before encrypting.
     """
 
     def __init__(self, fn, a, b, degree):
@@ -119,6 +122,9 @@ class Chebyshev(nn.Module):
                                                   dtype=torch.get_default_dtype()))
 
     def forward(self, x):
+        if self.training:
+            self._excess = _excess(x, self.a, self.b)
+            x = x.clamp(self.a, self.b)
         return _chebyshev_eval(self.c, self.a, self.b, x)
 
     def extra_repr(self):
