@@ -215,7 +215,7 @@ def check_ranges(net, xs):
     """Largest |input| of every Chebyshev / exact-relu / max-pool layer over
     xs, against its interval (the series diverge outside it; the comparison
     wraps around)."""
-    xs = [np.asarray(x, dtype=np.float64).ravel() for x in xs]
+    xs = [fheml._prepare(net, x) for x in xs]  # token inputs padded to the token stride
     for i, layer in enumerate(net.layers):
         if layer.type in ("chebyshev", "exactrelu", "maxpool2d"):
             peak = max(np.abs(x).max() for x in xs)
@@ -290,7 +290,7 @@ def context(net, args, level_budget):
     overrides = {"level_budget": level_budget, "key_switch_digits": args.digits,
                  "bootstrap_iterations": args.boot_iterations, "bootstrap_precision": args.boot_precision}
     if args.ring or (args.insecure and net.uses_bootstrapping):
-        overrides["ring_dim"] = args.ring or 4096
+        overrides["ring_dim"] = args.ring or max(4096, 2 * net.slots)  # toy ring: the smallest that bootstraps
     ctx = fheml.make_context(net, secure=not args.insecure, rotation_window=args.window, **overrides)
     setup = time.time() - t
     print(ctx.describe(), f"(setup {setup:.1f}s)")
