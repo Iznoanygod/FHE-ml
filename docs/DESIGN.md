@@ -176,6 +176,50 @@ fewer than one wide head, with the same 3n products, the same depth 6 and
 fewer rotation keys. The model file writes `attention N D HAS_BIAS heads H`
 with 3H score coefficients; single-head files are unchanged.
 
+#### Masks, segments and encoder-decoders
+
+Every attention pattern of a transformer is one schedule with a mask.
+`Attention(..., mask=M)` takes an n×n 0/1 matrix, `M[i][j] = 1` where query
+i may attend to key j. Offset s pairs query i with key (i + s) mod n, so the
+mask enters the per-offset masks that the schedule multiplies by anyway: the
+score coefficients (quadratic scores) or the head mask after `exp`
+(softmax). A masked-out pair gets weight 0 at no extra level or rotation,
+and an offset that pairs nothing is skipped, with its rotations and
+products. A query that attends to nothing (all its row masked) gets the
+middle of the `1/x` interval as its row sum, like the slots outside the
+heads, and outputs 0. With internal bootstrapping, masked scores are mapped
+as if they were 0 before the packed bootstrap, so they stay in range.
+
+An encoder-decoder runs as one sequence of S source and T target tokens.
+Token segments (`segments=`, a segment id per token) give the per-token
+layers one weight set per segment: `TokenDense` (embeddings, MLPs, the
+head), `LayerNorm` (gamma, beta) and the four attention projections.
+Different weights on different tokens cost nothing: `kron(I_n, W)` becomes
+block-diagonal with other blocks, and its diagonals stay at the same
+offsets. A block that belongs to one side has zero weights on the other
+side's tokens, so its residual passes them through. Then:
+
+* encoder self-attention: Q, K, V, O on the source, mask source × source
+  (2S − 1 of the n offsets);
+* decoder self-attention: Q, K, V, O on the target, causal mask
+  `S ≤ j ≤ i`;
+* cross-attention: Q and O on the target, K and V on the source, mask
+  target × source;
+* the head: a `TokenDense` acting on the target tokens.
+
+Every layer keeps the depth it has without a mask (6 for quadratic scores),
+and the planner places bootstraps as usual. The price of one sequence is
+that every layer touches all n tokens: an encoder block computes with
+zeros on the T target tokens. Generation is the usual client loop: the
+client decrypts the next-token logits, appends its choice to the target
+prefix and sends the encrypted sequence again; the server never sees a
+token. `fheml.nn.SegmentLinear`, `segments=` on `fheml.nn.LayerNorm` and
+`fheml.nn.Attention` (with `query_segments` and `key_segments`) and
+`fheml.nn.encoder_decoder_masks(S, T)` are the torch twins. The model file
+writes `segments s_0 … s_{n-1}` after a layer's sizes and
+`mask m_00 … m_{n-1,n-1}` after the heads; an attention bias flag of 2 marks
+per-token biases.
+
 ### Softmax and normalisation
 
 - By default softmax is replaced by the fixed quadratic `A = (S+2)²/(8n)`.

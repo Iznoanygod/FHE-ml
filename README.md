@@ -498,6 +498,61 @@ Two more things make deep transformers fit:
   4e-6 (`tests/test_fheml.cpp`). The precision of one bootstrap is measured
   at key generation, or set with `bootstrap_precision`.
 
+## Encoder-decoders: segments and masks
+
+Attention takes an n×n mask (causal self-attention, cross-attention), and
+the per-token layers take token segments with one weight set each. Together
+they run an encoder-decoder as one encrypted sequence of source and target
+tokens (see `docs/DESIGN.md#masks-segments-and-encoder-decoders`):
+
+```python
+from fheml import nn as hnn
+S, T, d = 8, 8, 32
+seg, m = (S, T), hnn.encoder_decoder_masks(S, T)
+model = torch.nn.Sequential(
+    hnn.SegmentLinear(64, d, seg), hnn.PosEmbedding(S + T, d),        # source / target embeddings
+    hnn.Residual(hnn.Attention(d, S + T, heads=4, mask=m["encoder"], segments=seg,
+                               query_segments=[0], key_segments=[0])),  # encoder
+    hnn.Residual(hnn.Attention(d, S + T, heads=4, mask=m["causal"], segments=seg,
+                               query_segments=[1], key_segments=[1])),  # decoder self-attention
+    hnn.Residual(hnn.Attention(d, S + T, heads=4, mask=m["cross"], segments=seg,
+                               query_segments=[1], key_segments=[0])),  # cross-attention
+    hnn.SegmentLinear(d, 64, seg, active=[1]))                          # next-token logits
+net = fheml.from_torch(model, (S + T, 64))
+```
+
+Masks and segments cost no levels and no extra rotations; offsets that a
+mask leaves empty are skipped. They are inference-only: the encrypted
+trainer rejects them.
+
+## Datasets and the example harness
+
+`tools/datasets.py` downloads, converts and caches (in `data/`) the datasets
+of the examples, from mirrors that stay reachable from restricted networks:
+
+| Loader | Data | Tasks |
+| --- | --- | --- |
+| `load_mnist` | MNIST, 28×28 digits | classification |
+| `load_cifar10` | CIFAR-10, 32×32 RGB, 10 classes | classification |
+| `load_pets(size=64)` | Oxford-IIIT Pet: 37 breeds, cat/dog, pixel trimaps (pet, background, border), pet head boxes | segmentation, detection |
+| `load_coco(split, size, max_images, masks)` | COCO 2017 instances: boxes and masks of 80 categories, squashed to size×size; `val` whole, `train` fetched image by image from the archive | detection, segmentation |
+| `load_cmudict` | CMU pronouncing dictionary: spelling → phonemes (39), ≤ 8 letters/phonemes, 10% test by word hash | sequence to sequence |
+
+```sh
+python3 tools/datasets.py cifar10 pets coco cmudict   # fetch and cache once
+```
+
+`tools/fhe_eval.py` is what every example script shares: the encryption
+flags (`add_args`: `--insecure`, `--bootstrap`, `--window`, `--digits`,
+`--level-budget`, `--ring`, `--boot-iterations`, `--packing`, `--n`,
+`--profile`, `--json`), torch training with the range loss (`train`), the
+plaintext score of the exported network (`plain_score`), range checks,
+bootstrap placement (`prepare`), the context (`context`), the encrypted
+run against torch (`encrypted_run`) and the JSON record (`record`). Its
+metrics cover classification (`accuracy`), segmentation (`mean_iou`,
+`pixel_accuracy`), detection (`box_iou`, `average_precision`) and sequences
+(`sequence_accuracy`); `tests/test_eval.py` checks them.
+
 ## Example models
 
 `examples/python/train_torch_mnist.py` trains these models in PyTorch,
