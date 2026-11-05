@@ -95,6 +95,11 @@ def main():
         inputs = 28
     else:
         data = task["load"](args.data, tokens, task["vocab"])
+        # Pad on the left, so the last state the classifier reads follows the
+        # last word (the client's tokenizer decides where the padding goes).
+        for split in ("train", "test"):
+            data[split + "_x"] = np.stack([np.roll(x, tokens - n) for x, n in zip(data[split + "_x"],
+                                                                                  data[split + "_len"])])
         xtr, ytr = torch.tensor(data["train_x"]), torch.tensor(data["train_y"])
         xte, yte = torch.tensor(data["test_x"]), torch.tensor(data["test_y"])
         inputs = args.dim
@@ -135,8 +140,10 @@ def main():
     level_budget = fhe_eval.prepare(net, args, vcal)
     if args.bootstrap and args.insecure and not args.scale_bits:
         # At 4096 slots a 50-bit scale leaves bootstrapping only a few bits of
-        # precision; 59 bits keeps about 12 (toy rings have room for it).
-        args.scale_bits = 59
+        # precision. 55 bits with a 60-bit first modulus keeps far more and
+        # still leaves the values entering a bootstrap 5 bits of headroom
+        # (59 bits leaves 1: values near 1 then occasionally wrap around).
+        args.scale_bits = 55
     ctx, setup = fhe_eval.context(net, args, level_budget)
 
     def describe(i, enc, ref):
