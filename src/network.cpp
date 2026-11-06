@@ -1,5 +1,6 @@
 #include "fheml/network.h"
 
+#include "fheml/recurrent.h"
 #include "fheml/transformer.h"
 
 #include <algorithm>
@@ -261,6 +262,25 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
     for (size_t i = 0; i < k && is >> t; ++i) body.push_back(read_layer(t, is));
     if (body.size() != k) throw std::runtime_error("model file: truncated residual block");
     layer = std::make_shared<Residual>(std::move(body));
+  } else if (tok == "recurrent") {
+    std::string cell;
+    int n, in, h, last, self;
+    double gate_a, cell_a, out_scale;
+    uint32_t degree, cell_degree;
+    is >> cell >> n >> in >> h >> gate_a >> degree >> cell_a >> cell_degree >> last >> out_scale >> self;
+    auto bounds = read_vec(is, Recurrent::kSites, "recurrent bounds");
+    const auto c = Recurrent::parse_cell(cell);
+    const size_t g = static_cast<size_t>(Recurrent::gates(c)) * h;
+    auto wih = read_vec(is, g * in, "recurrent w_ih");
+    auto whh = read_vec(is, g * h, "recurrent w_hh");
+    auto bih = read_vec(is, g, "recurrent b_ih");
+    auto bhh = read_vec(is, g, "recurrent b_hh");
+    auto r = std::make_shared<Recurrent>(c, n, in, h, std::move(wih), std::move(whh), std::move(bih), std::move(bhh),
+                                         gate_a, degree, cell_a, cell_degree, last != 0);
+    r->scale_output(out_scale);
+    r->set_self_bootstrapping(self != 0);
+    r->set_bounds(std::move(bounds));
+    layer = r;
   } else {
     throw std::runtime_error("model file: unknown layer '" + tok + "'");
   }
@@ -384,7 +404,7 @@ Fold fold_kind(const Layer& l) {
   if (dynamic_cast<const PolyActivation*>(&l) || dynamic_cast<const ChebyshevActivation*>(&l) ||
       dynamic_cast<const ExactReLU*>(&l) || dynamic_cast<const Scale*>(&l) || dynamic_cast<const FusedLinear*>(&l) ||
       dynamic_cast<const LayerNorm*>(&l) || dynamic_cast<const MaxPool2d*>(&l) || dynamic_cast<const Attention*>(&l) ||
-      dynamic_cast<const ArgMax*>(&l))
+      dynamic_cast<const Recurrent*>(&l) || dynamic_cast<const ArgMax*>(&l))
     // MaxPool2d: max(c x) = c max(x), c > 0, taken by its gather; ArgMax:
     // argmax(c x) = argmax(x), its gather takes 1/c (the range stays put).
     return Fold::kAbsorb;
@@ -452,6 +472,7 @@ void scale_output(std::shared_ptr<Layer>& l, double f) {
     for (size_t i = o; i < p.size(); ++i) p[i] *= f;
     return at->set_params(p);
   }
+  if (auto* rec = dynamic_cast<Recurrent*>(l.get())) return rec->scale_output(f);
   if (auto* mp = dynamic_cast<MaxPool2d*>(l.get())) {
     mp->set_gain(mp->gain() * f);
     return mp->set_range(mp->range() * f);
@@ -497,6 +518,7 @@ void absorb_input(std::shared_ptr<Layer>& l, double c) {
   if (auto* fu = dynamic_cast<FusedLinear*>(l.get())) return fu->scale(1.0 / c, 1.0);
   if (auto* ln = dynamic_cast<LayerNorm*>(l.get())) return ln->absorb_input_scale(c);
   if (auto* mp = dynamic_cast<MaxPool2d*>(l.get())) return mp->set_gain(mp->gain() / c);
+  if (auto* rec = dynamic_cast<Recurrent*>(l.get())) return rec->absorb_input_scale(c);
   if (auto* am = dynamic_cast<ArgMax*>(l.get())) return am->set_gain(am->gain() / c);
   if (auto* at = dynamic_cast<Attention*>(l.get())) {
     // q, k and v are linear in the input: their weights (not biases) take 1/c.

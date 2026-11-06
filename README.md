@@ -45,11 +45,18 @@ That code is kept in [`legacy/`](legacy/) for reference.
     square root on a calibrated variance interval (10–12 levels).
   * `Residual` and `TokenMean` complete the block.
   * See [docs/DESIGN.md](docs/DESIGN.md#transformers).
+* **Recurrent networks.** `Recurrent` is an Elman RNN, GRU or LSTM over a
+  token sequence with its real activations (sigmoid gates and tanh as
+  Chebyshev series). All time steps advance together in SIMD, the gates
+  share one series evaluation, and the layer bootstraps its own state
+  inside the recurrence. See [Recurrent networks](#recurrent-networks).
 * **A Python package**, `import fheml`, wraps the same API with numpy in and
   numpy out.
 * **A PyTorch exporter.** Train with `torch.nn` layers plus the HE-friendly
   modules in `fheml.nn` (polynomial activations, polynomial attention), then
   `fheml.from_torch(model, input_shape)` gives the encrypted network.
+  `fheml.nn.RNN`, `GRU` and `LSTM` are torch's recurrent cells with the
+  series the encrypted layer evaluates.
 * **Encrypted training.** `Trainer` runs SGD with backpropagation entirely on
   ciphertexts: encrypted inputs, labels, weights, activations and gradients.
   The encrypted weights are bootstrapped after every update. Freezing the
@@ -970,6 +977,81 @@ the argmax's scheme-switching levels do not fit without bootstrapping:
 `train_torch_mnist.py --arch vit` and `--arch lnvit` use the same GELU MLP
 and end in the encrypted argmax as well (`--logits` drops it).
 
+## Recurrent networks
+
+`fheml.Recurrent` (torch twins `fheml.nn.RNN`, `GRU`, `LSTM`) runs a
+single-layer recurrent network over a token sequence, with the weights in
+torch's layout (`load_torch(layer)` copies a trained `nn.RNN` / `nn.GRU` /
+`nn.LSTM` in). It outputs every hidden state, so layers stack, or only the
+last one (`last=True`) for a classifier. The cells keep their real
+activations: the gates' sigmoid is a Chebyshev series on [-gate_a, gate_a]
+(default 16, degree 13), the tanh of the RNN, the GRU candidate and the LSTM
+cell one on [-a, a] (default 8). Wide intervals matter here: an LSTM cell
+state accumulates over the whole sequence, and with [-8, 8] / [-4, 4] most
+sequential-MNIST inputs left them. The LSTM's candidate gate uses
+tanh(x) = 2 sigmoid(2x) - 1, so all four gates share one series evaluation.
+
+```python
+from fheml import nn as hnn
+model = torch.nn.Sequential(hnn.LSTM(28, 32, last=True), torch.nn.Linear(32, 10))
+# ... train (fhe_eval.train adds range_loss, which keeps the series inside their intervals) ...
+net = fheml.from_torch(model, (28, 28))   # 28 time steps of 28 features
+fheml.auto_bootstrap(net, calibration)    # the layer bootstraps its own state
+```
+
+Under encryption all time steps advance together: the state ciphertext
+holds every token's hidden state and one step updates all of them (see
+[docs/DESIGN.md](docs/DESIGN.md#recurrent-layers)). After n steps the result
+is exactly the sequential recurrence, with the same depth: 5 levels per step
+for the RNN and 12 for GRU and LSTM at degree 13. A sequence is therefore
+always deeper than one bootstrapping stretch, and the layer refreshes its
+state whenever the next step would not fit (one bootstrap per RNN step,
+three per GRU or LSTM step at a 5-level budget). Everything it bootstraps
+lies in [-1, 1] by construction, so no scaling levels are spent.
+`Recurrent.series_ranges(xs)` (printed by `fhe_eval.check_ranges`) reports
+how far the series arguments go on real data, at every encrypted step.
+
+`examples/python/rnn_sequences.py` trains RNN, GRU and LSTM classifiers on
+sequential MNIST (the image read row by row, 28 steps of 28 pixels), SST-2
+and AG News (word vectors from the client's embedding lookup, as for the
+text transformers) and runs them encrypted:
+
+```sh
+PYTHONPATH=build/python python3 examples/python/rnn_sequences.py --task smnist --cell lstm --bootstrap --insecure --n 3
+PYTHONPATH=build/python python3 examples/python/rnn_sequences.py --task sst2 --cell gru --bootstrap --insecure --n 3
+PYTHONPATH=build/python python3 examples/python/rnn_sequences.py --task agnews --cell rnn --bootstrap --insecure --n 3
+```
+
+Measured on 4 cores at toy parameters (insecure ring, 55-bit scaling,
+10 levels per stretch for the RNN and 12 for GRU/LSTM), hidden size 32,
+3 encrypted test sequences per model:
+
+| | Accuracy (torch, whole test set) | fheml plaintext (first 1000) | Ring, slots | Bootstraps per sequence | Time per sequence | Encrypted vs torch logits |
+| --- | --- | --- | --- | --- | --- | --- |
+| Sequential MNIST, RNN | 86.8% | 83.3% (torch on them 83.3%) | 4096, 1024 | 13 | 24 s | 7e-5 to 2e-4, 3/3 same class |
+| Sequential MNIST, GRU | 96.4% | 96.0% (96.0%) | 8192, 4096 | 27 | 192 s | 1e-3 to 2e-3, 3/3 |
+| Sequential MNIST, LSTM | 97.0% | 95.9% (96.4%) | 8192, 4096 | 34 | 228 s | 2e-3 to 4e-3, 3/3 |
+| SST-2, RNN | 79.5% | 78.4% (78.4%) | 4096, 1024 | 15 | 25 s | 1e-5 to 8e-5, 3/3 |
+| SST-2, GRU | 79.8% | 79.0% (79.0%) | 8192, 4096 | 31 | 213 s | 4e-4 to 3e-3, 3/3 |
+| SST-2, LSTM | 81.4% | 81.3% (81.3%) | 8192, 4096 | 39 | 262 s | 7e-4 to 2e-3, 3/3 |
+| AG News, RNN | 87.3% | 87.2% (87.2%) | 4096, 512 | 7 | 11 s | 2e-5 to 4e-5, 3/3 |
+| AG News, GRU | 89.1% | 88.6% (88.6%) | 4096, 2048 | 15 | 45 s | 3e-4 to 1e-3, 3/3 |
+| AG News, LSTM | 88.9% | 88.3% (88.3%) | 4096, 2048 | 19 | 55 s | 6e-4 to 2e-3, 3/3 |
+
+Sequential MNIST has 28 steps, SST-2 32 and AG News 16. Peak memory stays
+at 1.7 to 4.4 GB (0.6 to 1.6 GB of rotation keys). Bootstrapping takes
+about three quarters of the time, so the cost follows the bootstrap count:
+GRU and LSTM need one per step at 12 levels plus the refreshes of their
+gates, the RNN one per two steps. Text is padded on the left, so the last
+state the classifier reads comes right after the last word. The
+"fheml plaintext" column is the encrypted computation in the clear: where
+it trails torch, a few test inputs push a gate or cell state outside its
+series interval (4 of 200 sequential-MNIST inputs for the LSTM, none for
+the text models), which training cannot rule out for unseen data. With
+50-bit scaling the bootstraps at 4096 slots lose most of their precision
+(logit errors around 5e-2); with 59 bits values near 1 occasionally wrap
+around in the bootstrap, so the script uses 55 (`--scale-bits`).
+
 ## Detection and segmentation on COCO
 
 `examples/python/coco_cnn.py` takes a CNN on COCO 2017 from the image to the
@@ -1307,9 +1389,9 @@ still need their own key).
 | --- | --- |
 | `include/fheml/`, `src/` | the library: backend selection (`backend.h`: OpenFHE or FIDESlib), context, linear transforms, layers, network, encrypted training (`train.h`) |
 | `examples/` | `mnist_cnn` (encrypted MNIST), `conv_demo` (network built in code), `packing_bench` (gapped vs compact vs multiplexed packing) and `rotation_bench` (hoisted rotation trees vs. plain composed rotations) |
-| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py`, `test_eval.py`, `test_g2p.py` (the encoder-decoder example), `test_vision_transformers.py` |
+| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py`, `test_eval.py`, `test_g2p.py` (the encoder-decoder example), `test_vision_transformers.py`, `test_recurrent.py` (RNN, GRU, LSTM) |
 | `python/` | pybind11 bindings and the `fheml` Python package (`fheml.nn` + `fheml.from_torch`: PyTorch export) |
-| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` and `train_torch_cifar10.py` train in torch and run encrypted; `mnist_mlp_cnn.py` compares the MLP and CNN; `train_encrypted_mnist.py` trains on encrypted data; `text_transformer.py` classifies text (AG News, SST-2) with encoder transformers; `g2p_transformer.py` is an encoder-decoder (CMUdict grapheme to phoneme) decoded greedily under encryption; `vision_transformers.py` is a CIFAR-10 ViT and an Oxford Pets segmentation transformer |
+| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` and `train_torch_cifar10.py` train in torch and run encrypted; `mnist_mlp_cnn.py` compares the MLP and CNN; `train_encrypted_mnist.py` trains on encrypted data; `text_transformer.py` classifies text (AG News, SST-2) with encoder transformers; `rnn_sequences.py` runs RNN, GRU and LSTM classifiers (sequential MNIST, SST-2, AG News); `g2p_transformer.py` is an encoder-decoder (CMUdict grapheme to phoneme) decoded greedily under encryption; `vision_transformers.py` is a CIFAR-10 ViT and an Oxford Pets segmentation transformer |
 | `tools/train_mnist.py`, `tools/train_transformer.py` | HE-friendly CNN / transformer training and export (numpy) |
 | `models/` | trained example models and 200 test images |
 | `legacy/` | the original PALISADE capstone code |

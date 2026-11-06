@@ -14,7 +14,7 @@ An example script defines its model and data and calls these in order:
     fhe_eval.record(args, arch=..., **run)
 
 ``add_args`` gives every example the same encryption flags (--insecure,
---bootstrap, --window, --digits, --level-budget, --ring, --boot-iterations,
+--bootstrap, --budget, --window, --digits, --level-budget, --ring, --boot-iterations,
 --boot-precision, --scale-bits, --packing, --n, --profile, --json). The metrics below
 cover classification, segmentation, detection and sequence tasks.
 """
@@ -43,6 +43,8 @@ def add_args(ap, n=3):
     ap.add_argument("--json", help="append the run's numbers to this JSON-lines file")
     ap.add_argument("--bootstrap", action="store_true",
                     help="fold activation intervals and insert bootstraps automatically (ring 2^16)")
+    ap.add_argument("--budget", type=int, help="levels between bootstraps (default: the most a 128-bit ring-2^16 "
+                    "context allows; toy runs may take more, which saves bootstraps)")
     ap.add_argument("--window", type=int, default=0, help="rotation-key ladder window (0 = one key per rotation)")
     ap.add_argument("--calibration", type=int, default=64, help="training inputs for bootstrap range scaling")
     ap.add_argument("--ring", type=int, help="ring dimension override (insecure runs; bootstrapping precision grows with it)")
@@ -243,14 +245,21 @@ def plain_score(net, x, y, metric=None, n=2000, outputs=False):
 
 
 def check_ranges(net, xs):
-    """Largest |input| of every Chebyshev / exact-relu / max-pool layer over
-    xs, against its interval (the series diverge outside it; the comparison
-    wraps around)."""
+    """Largest |input| of every Chebyshev / exact-relu / max-pool layer, and
+    the series arguments of every recurrent layer, over xs, against their
+    intervals (the series diverge outside them; the comparison wraps
+    around)."""
     xs = [fheml._prepare(net, x) for x in xs]  # token inputs padded to the token stride
     for i, layer in enumerate(net.layers):
         if layer.type in ("chebyshev", "exactrelu", "maxpool2d"):
             peak = max(np.abs(x).max() for x in xs)
             print(f"  layer {i} {layer.describe()}: max |input| {peak:.2f} over {len(xs)} inputs")
+        if layer.type == "recurrent":
+            r = np.array([layer.series_ranges([x]) for x in xs])
+            out = int((r.max(1) > 1).sum())
+            g, c = np.median(r, 0)
+            print(f"  layer {i} {layer.describe()}: |series argument| (must be <= 1, every step) median max gates "
+                  f"{g:.2f}, cell {c:.2f}; {out} of {len(xs)} inputs leave the intervals")
         xs = [np.asarray(layer.forward_plain(x)) for x in xs]
 
 
@@ -305,7 +314,7 @@ def prepare(net, args, calib, packing=None):
         net.compile()
         check_ranges(net, calib)
         depth = net.depth
-        boots, budget = fheml.auto_bootstrap(net, calib, level_budget=level_budget, max_ring=1 << 16,
+        boots, budget = fheml.auto_bootstrap(net, calib, budget=args.budget, level_budget=level_budget, max_ring=1 << 16,
                                              key_switch_digits=args.digits,
                                              bootstrap_iterations=args.boot_iterations)
         print(f"auto_bootstrap: depth {depth} -> {net.depth}, {boots} bootstraps, at most {budget} levels between them")
