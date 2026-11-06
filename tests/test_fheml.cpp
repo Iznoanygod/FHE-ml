@@ -209,6 +209,78 @@ void cleartext_tests() {
     check_err("save/load round trip", max_err(n.forward_plain(x), m.forward_plain(x), 4), 1e-12);
   }
   {
+    // Grouped, dilated and transposed convolutions and upsampling against
+    // direct loops, plus a save/load round trip of all of them.
+    ConvGeometry g;
+    g.stride = 2;
+    g.pad_h = 2;
+    g.pad_w = 1;
+    g.dil_h = 2;
+    g.groups = 2;
+    const int ic = 4, oc = 6, H = 7, W = 6;
+    auto w = rand_vec(static_cast<size_t>(oc) * (ic / 2) * 9);
+    Network n(Shape{ic, H, W});
+    n.emplace<Conv2d>(ic, oc, 3, 3, g, w, std::vector<double>{});
+    n.compile();
+    const Shape o = n.layers()[0]->out_shape();
+    auto x = rand_vec(static_cast<size_t>(ic) * H * W);
+    std::vector<double> ref(o.size(), 0.0);
+    for (int co = 0; co < oc; ++co)
+      for (int y = 0; y < o.h; ++y)
+        for (int xx = 0; xx < o.w; ++xx)
+          for (int il = 0; il < ic / 2; ++il)
+            for (int ky = 0; ky < 3; ++ky)
+              for (int kx = 0; kx < 3; ++kx) {
+                const int ci = (co / 3) * 2 + il, iy = y * 2 - 2 + 2 * ky, ix = xx * 2 - 1 + kx;
+                if (iy < 0 || iy >= H || ix < 0 || ix >= W) continue;
+                ref[(static_cast<size_t>(co) * o.h + y) * o.w + xx] +=
+                    w[((co * 2 + il) * 3 + ky) * 3 + kx] * x[(static_cast<size_t>(ci) * H + iy) * W + ix];
+              }
+    check(o.h == 4 && o.w == 3, "grouped dilated conv output shape", o.str());
+    check_err("grouped dilated conv vs direct loops", max_err(ref, n.forward_plain(x), ref.size()), 1e-12);
+
+    // Transposed convolution = the adjoint of the convolution: <conv(x), y> = <x, convT(y)>.
+    ConvGeometry gt = g;
+    gt.out_pad_w = 1;  // recovers W = 6 from 3 columns (H = 7 needs none)
+    const std::vector<double> wt = w;  // [in = oc][out/groups = ic/2][3][3]: the conv's [oc][ic/2][3][3] order
+    Network t(o);
+    t.emplace<ConvTranspose2d>(oc, ic, 3, 3, gt, wt, std::vector<double>{});
+    t.compile();
+    check(t.layers()[0]->out_shape().h == H && t.layers()[0]->out_shape().w == W, "convtranspose output shape",
+          t.layers()[0]->out_shape().str());
+    auto yv = rand_vec(o.size());
+    auto ty = t.forward_plain(yv);
+    double lhs = 0, rhs = 0;
+    for (size_t i = 0; i < ref.size(); ++i) lhs += ref[i] * yv[i];
+    for (size_t i = 0; i < x.size(); ++i) rhs += x[i] * ty[i];
+    check_err("convtranspose is the conv's adjoint", std::abs(lhs - rhs), 1e-9);
+
+    // Bilinear (align_corners false) 2x upsampling of a 1x2 row: 0.75 a + 0.25 b in the middle.
+    Network u(Shape{1, 1, 2});
+    u.emplace<Upsample>("bilinear", 1, 4);
+    u.compile();
+    auto uy = u.forward_plain({1.0, 3.0});
+    check_err("bilinear upsample", max_err(uy, {1.0, 1.5, 2.5, 3.0}, 4), 1e-12);
+    Network un(Shape{1, 2, 2});
+    un.emplace<Upsample>("nearest", 4, 4);
+    un.compile();
+    auto ny = un.forward_plain({1.0, 2.0, 3.0, 4.0});
+    check_err("nearest upsample", max_err(ny, {1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4}, 16), 1e-12);
+
+    Network s(Shape{ic, H, W});
+    s.emplace<Conv2d>(ic, oc, 3, 3, g, w, rand_vec(oc));
+    s.emplace<PolyActivation>(std::vector<double>{0.1, 0.5, 0.25});
+    s.emplace<ConvTranspose2d>(oc, ic, 3, 3, gt, wt, rand_vec(ic));
+    s.emplace<Upsample>("bilinear", 10, 9, true);
+    const char* path = "test_model_conv.fheml";
+    s.save(path);
+    Network sl = Network::load(path);
+    std::remove(path);
+    s.compile();
+    sl.compile();
+    check_err("conv variants save/load round trip", max_err(s.forward_plain(x), sl.forward_plain(x), 4 * 90), 1e-12);
+  }
+  {
     // Max pooling in the clear against a direct computation.
     Network n(Shape{2, 5, 5});
     n.emplace<MaxPool2d>(3, 2);
@@ -791,6 +863,36 @@ void encrypted_tests(bool quick) {
     Network n(Shape{40, 1, 1});
     n.emplace<Dense>(40, 10, rand_vec(400), rand_vec(10));
     check_encrypted("dense", n, 1e-4);
+  }
+  {
+    // Depthwise dilated stride-2 conv (gapped output) -> square ->
+    // transposed conv back to full size -> bilinear 2x upsampling.
+    ConvGeometry dw;
+    dw.stride = 2;
+    dw.pad_h = dw.pad_w = 2;
+    dw.dil_h = dw.dil_w = 2;
+    dw.groups = 3;
+    ConvGeometry up;
+    up.stride = 2;
+    up.pad_h = up.pad_w = 1;
+    up.out_pad_h = up.out_pad_w = 1;
+    Network n(Shape{3, 8, 8});
+    n.emplace<Conv2d>(3, 3, 3, 3, dw, rand_vec(27, -0.4, 0.4), rand_vec(3, -0.1, 0.1));
+    n.emplace<Square>();
+    n.emplace<ConvTranspose2d>(3, 2, 3, 3, up, rand_vec(54, -0.4, 0.4), rand_vec(2, -0.1, 0.1));
+    n.emplace<Upsample>("bilinear", 16, 16);
+    check_encrypted("depthwise dilated conv, convtranspose, bilinear upsample", n, 1e-4);
+  }
+  {
+    // 1-D: a (C, L) = (4, 16) signal, Conv1d k=5 dilation 2 stride 2, nearest upsample.
+    ConvGeometry g;
+    g.stride = 2;
+    g.pad_w = 4;
+    g.dil_w = 2;
+    Network n(Shape{4, 1, 16});
+    n.emplace<Conv2d>(4, 6, 1, 5, g, rand_vec(120, -0.3, 0.3), rand_vec(6, -0.1, 0.1));
+    n.emplace<Upsample>("nearest", 1, 16);
+    check_encrypted("conv1d dilated stride 2, nearest upsample", n, 1e-4);
   }
   {
     // Multiplexed packing through activations: conv s2 (m = 2, 8 channels in

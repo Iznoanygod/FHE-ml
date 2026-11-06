@@ -121,6 +121,40 @@ Network multiplexed_cnn(unsigned seed) {
   return n;
 }
 
+// Depthwise dilated conv (shared taps per channel), a transposed conv and
+// bilinear upsampling (fixed) before the head.
+Network conv_variants(unsigned seed) {
+  Rng r(seed);
+  ConvGeometry dw;
+  dw.stride = 2;
+  dw.pad_h = dw.pad_w = 2;
+  dw.dil_h = dw.dil_w = 2;
+  dw.groups = 2;
+  ConvGeometry up;
+  up.stride = 2;
+  up.pad_h = up.pad_w = 1;
+  up.out_pad_h = up.out_pad_w = 1;
+  Network n(Shape{2, 6, 6});
+  n.emplace<Conv2d>(2, 2, 3, 3, dw, r.vec(18, 0.4), r.vec(2, 0.1))
+      .emplace<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25})
+      .emplace<ConvTranspose2d>(2, 1, 3, 3, up, r.vec(18, 0.4), r.vec(1, 0.1))
+      .emplace<Upsample>("bilinear", 3, 3)
+      .emplace<Dense>(9, 2, r.vec(18, 0.3), r.vec(2, 0.1));
+  return n;
+}
+
+// Conv1d over a (C, L) = (3, 8) signal.
+Network conv1d(unsigned seed) {
+  Rng r(seed);
+  ConvGeometry g;
+  g.pad_w = 1;
+  Network n(Shape{3, 1, 8});
+  n.emplace<Conv2d>(3, 2, 1, 3, g, r.vec(18, 0.4), r.vec(2, 0.1))
+      .emplace<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25})
+      .emplace<Dense>(16, 2, r.vec(32, 0.3), r.vec(2, 0.1));
+  return n;
+}
+
 // conv -> exact max pool (scheme switching) -> poly -> dense. Small conv
 // weights keep the pooled values inside the comparison range.
 Network pool_cnn(unsigned seed) {
@@ -479,6 +513,8 @@ int main(int argc, char** argv) {
     check(n.layers()[0]->out_layout().m == 2 && n.layers()[2]->out_layout().m == 2, "multiplexed cnn layouts (m = 2)");
   }
   gradient_check("multiplexed cnn", [] { return multiplexed_cnn(13); });
+  gradient_check("depthwise dilated conv, convtranspose, upsample", [] { return conv_variants(15); });
+  gradient_check("conv1d", [] { return conv1d(16); });
   gradient_check("tokens (residual, chebyshev, per-token bias)", [] { return tokens(4); });
   gradient_check("mlp, first layer frozen", [] { return mlp(5); }, {0});
   gradient_check("layernorm (gamma, beta, backward through the normalisation)", [] { return norm_tokens(9); });
@@ -494,6 +530,8 @@ int main(int argc, char** argv) {
   encrypted_check("cnn", [] { return cnn(2); }, 1, false, 1e-4);
   encrypted_check("strided cnn", [] { return strided_cnn(3); }, 1, false, 1e-4);
   encrypted_check("multiplexed cnn", [] { return multiplexed_cnn(13); }, 1, false, 1e-4);
+  encrypted_check("depthwise dilated conv, convtranspose, upsample", [] { return conv_variants(15); }, 1, false, 1e-4);
+  encrypted_check("conv1d", [] { return conv1d(16); }, 1, false, 1e-4);
   encrypted_check("tokens", [] { return tokens(4); }, 1, false, 1e-4);
   encrypted_check("mlp, fine-tune last layer", [] { return mlp(5); }, 1, false, 1e-4, {0});
   encrypted_check("layernorm", [] { return norm_tokens(9); }, 1, false, 1e-4);

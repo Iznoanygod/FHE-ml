@@ -5,7 +5,12 @@
 //
 //   fheml 1
 //   input C H W
-//   conv2d IN_C OUT_C KH KW STRIDE PAD HAS_BIAS   followed by weights [, bias]
+//   conv2d IN_C OUT_C KH KW STRIDE PAD HAS_BIAS [groups G] [dilation DH DW] [padw PW]
+//                                                 followed by weights [OUT_C][IN_C/G][KH][KW] [, bias];
+//                                                 PAD is the vertical padding, PW the horizontal (default PAD)
+//   convtranspose2d IN_C OUT_C KH KW STRIDE PAD HAS_BIAS [groups G] [dilation DH DW] [padw PW] [outpad OH OW]
+//                                                 followed by weights [IN_C][OUT_C/G][KH][KW] [, bias]
+//   upsample MODE OUT_H OUT_W ALIGN               MODE nearest|nearest-exact|bilinear, fixed output size
 //   dense IN OUT HAS_BIAS                         followed by weights [, bias]
 //   avgpool2d K STRIDE
 //   maxpool2d K STRIDE RANGE                     exact max via scheme switching, inputs in [-RANGE, RANGE]

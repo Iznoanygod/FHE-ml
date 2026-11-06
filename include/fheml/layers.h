@@ -251,26 +251,98 @@ class LinearLayer : public Layer {
   bool allow_fold_ = true;
 };
 
+// Convolution geometry beyond kernel size: stride, zero padding and dilation
+// per axis, and channel groups (groups = in_c = out_c is a depthwise
+// convolution). A 1-D convolution over a (C, L) signal or token sequence is a
+// convolution of the (C, 1, L) shape with kh = 1 and pad_h = 0.
+struct ConvGeometry {
+  int stride = 1;
+  int pad_h = 0, pad_w = 0;
+  int dil_h = 1, dil_w = 1;
+  int groups = 1;
+  int out_pad_h = 0, out_pad_w = 0;  // ConvTranspose2d only (torch output_padding)
+  bool is_default() const {
+    return pad_h == pad_w && dil_h == 1 && dil_w == 1 && groups == 1 && out_pad_h == 0 && out_pad_w == 0;
+  }
+};
+
+// Every convolution is one sparse matrix, so grouped, depthwise and dilated
+// kernels cost what their nonzero diagonals cost: a depthwise 3x3 needs 9
+// rotations per channel block where a dense one needs 9 (Ci + Co - 1).
 class Conv2d : public LinearLayer {
  public:
   // weights: [out_c][in_c][kh][kw] flattened; bias: [out_c] (may be empty).
   Conv2d(int in_c, int out_c, int kh, int kw, int stride, int pad, std::vector<double> weights,
          std::vector<double> bias);
+  // weights: [out_c][in_c / groups][kh][kw] flattened (torch layout).
+  Conv2d(int in_c, int out_c, int kh, int kw, ConvGeometry g, std::vector<double> weights, std::vector<double> bias);
   std::string type() const override { return "conv2d"; }
   std::string describe() const override;
   Shape configure(const Shape& in) override;
   SparseMatrix matrix() const override;
   std::vector<double> bias() const override;
-  int gap_stride() const override { return stride_; }
+  int gap_stride() const override { return g_.stride; }
   std::vector<ParamRef> weight_refs() const override;
+  std::vector<int> bias_refs() const override;
+  std::vector<double> params() const override;
+  void set_params(const std::vector<double>& p) override;
+  void save(std::ostream& os) const override;
+  const ConvGeometry& geometry() const { return g_; }
+
+ private:
+  std::vector<ParamRef> taps() const;  // (row, col, weight index) of every matrix entry
+  int in_c_, out_c_, kh_, kw_;
+  ConvGeometry g_;
+  std::vector<double> w_, b_;
+};
+
+// Transposed convolution (torch ConvTranspose2d, and ConvTranspose1d on a
+// (C, 1, L) shape): output pixel (y, x) gathers input (iy, ix) through tap
+// (ky, kx) when y = iy*stride - pad_h + ky*dil_h (same for x). It is the
+// transpose of a strided convolution's matrix, so it is a linear layer like
+// any other: one level, a rotation per distinct slot offset. The output is
+// compact; a stride-s layer reads a compact or gapped input.
+class ConvTranspose2d : public LinearLayer {
+ public:
+  // weights: [in_c][out_c / groups][kh][kw] flattened (torch layout); bias: [out_c].
+  ConvTranspose2d(int in_c, int out_c, int kh, int kw, ConvGeometry g, std::vector<double> weights,
+                  std::vector<double> bias);
+  std::string type() const override { return "convtranspose2d"; }
+  std::string describe() const override;
+  Shape configure(const Shape& in) override;
+  SparseMatrix matrix() const override;
+  std::vector<double> bias() const override;
+  std::vector<ParamRef> weight_refs() const override { return taps(); }
   std::vector<int> bias_refs() const override;
   std::vector<double> params() const override;
   void set_params(const std::vector<double>& p) override;
   void save(std::ostream& os) const override;
 
  private:
-  int in_c_, out_c_, kh_, kw_, stride_, pad_;
+  std::vector<ParamRef> taps() const;
+  int in_c_, out_c_, kh_, kw_;
+  ConvGeometry g_;
   std::vector<double> w_, b_;
+};
+
+// Upsampling to a fixed output size (torch nn.Upsample / F.interpolate on
+// (C, H, W) images or (C, L) signals): "nearest", "nearest-exact", or
+// "bilinear" (bilinear on images, linear on 1-D signals). Each output is a
+// fixed combination of at most four inputs, so the layer is a sparse matrix
+// with no weights to learn: one level.
+class Upsample : public LinearLayer {
+ public:
+  Upsample(std::string mode, int out_h, int out_w, bool align_corners = false);
+  std::string type() const override { return "upsample"; }
+  std::string describe() const override;
+  Shape configure(const Shape& in) override;
+  SparseMatrix matrix() const override;
+  void save(std::ostream& os) const override;
+
+ private:
+  std::string mode_;
+  int out_h_, out_w_;
+  bool align_;
 };
 
 class Dense : public LinearLayer {

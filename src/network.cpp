@@ -47,12 +47,42 @@ std::vector<int> read_segments(std::istream& is, int n) {
 
 std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
   std::shared_ptr<Layer> layer;
-  if (tok == "conv2d") {
-    int ic, oc, kh, kw, s, p, hb;
-    is >> ic >> oc >> kh >> kw >> s >> p >> hb;
-    auto w = read_vec(is, static_cast<size_t>(oc) * ic * kh * kw, "conv2d weights");
-    auto b = hb ? read_vec(is, oc, "conv2d bias") : std::vector<double>{};
-    layer = std::make_shared<Conv2d>(ic, oc, kh, kw, s, p, std::move(w), std::move(b));
+  if (tok == "conv2d" || tok == "convtranspose2d") {
+    int ic, oc, kh, kw, hb;
+    ConvGeometry g;
+    is >> ic >> oc >> kh >> kw >> g.stride >> g.pad_h >> hb;
+    g.pad_w = g.pad_h;
+    for (;;) {  // optional "groups G", "dilation DH DW", "padw PW", "outpad OH OW"
+      std::string next;
+      auto pos = is.tellg();
+      if (is >> next && next == "groups") {
+        is >> g.groups;
+      } else if (next == "dilation") {
+        is >> g.dil_h >> g.dil_w;
+      } else if (next == "padw") {
+        is >> g.pad_w;
+      } else if (next == "outpad") {
+        is >> g.out_pad_h >> g.out_pad_w;
+      } else {
+        is.clear();
+        is.seekg(pos);
+        break;
+      }
+    }
+    if (g.groups < 1) throw std::runtime_error("model file: bad " + tok + " groups");
+    const size_t nw = tok == "conv2d" ? static_cast<size_t>(oc) * (ic / g.groups) * kh * kw
+                                      : static_cast<size_t>(ic) * (oc / g.groups) * kh * kw;
+    auto w = read_vec(is, nw, tok + " weights");
+    auto b = hb ? read_vec(is, oc, tok + " bias") : std::vector<double>{};
+    if (tok == "conv2d")
+      layer = std::make_shared<Conv2d>(ic, oc, kh, kw, g, std::move(w), std::move(b));
+    else
+      layer = std::make_shared<ConvTranspose2d>(ic, oc, kh, kw, g, std::move(w), std::move(b));
+  } else if (tok == "upsample") {
+    std::string mode;
+    int oh, ow, align;
+    is >> mode >> oh >> ow >> align;
+    layer = std::make_shared<Upsample>(mode, oh, ow, align != 0);
   } else if (tok == "dense") {
     int i, o, hb;
     is >> i >> o >> hb;
