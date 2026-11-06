@@ -56,6 +56,10 @@
 // forward_plain() runs the same algorithm on cleartext slot vectors (same
 // approximations and iterations), so it matches encrypted inference up to
 // the CKKS error.
+//
+// Training: the Trainer keeps the three slot maps (slot_maps()) as
+// encrypted linear nodes and backpropagates through time with the same
+// all-tokens Jacobi iteration on the adjoint recurrence (see train.cpp).
 #ifndef FHEML_RECURRENT_H_
 #define FHEML_RECURRENT_H_
 
@@ -114,10 +118,40 @@ class Recurrent : public Layer {
   // diverge outside their intervals).
   std::array<double, 2> series_ranges(const std::vector<std::vector<double>>& inputs) const;
 
-  // Training (torch layout): w_ih, w_hh, b_ih, b_hh. Plaintext only: the
-  // Trainer does not backpropagate through time.
+  // Training (torch layout): w_ih, w_hh, b_ih, b_hh. The Trainer
+  // backpropagates through time on the same slot layout (see train.cpp).
   std::vector<double> params() const override;
   void set_params(const std::vector<double>& p) override;
+  bool trainable() const override { return true; }
+
+  // The slot maps the layer evaluates, as entries of params() scaled into
+  // the series' units: the input projection of every gate but the GRU
+  // candidate's (0), the GRU candidate's input projection (1) and the
+  // recurrent map from the previous token's state (2). A bias slot may hold
+  // the sum of two parameters (b_ih + b_hh), both at the same scale.
+  struct MapEntry {
+    size_t row, col;
+    int param;
+    double scale;
+  };
+  struct MapBias {
+    size_t row;
+    int param, pair;  // pair: the second parameter summed into the slot, -1 = none
+    double scale;
+  };
+  struct SlotMap {
+    std::vector<MapEntry> w;
+    std::vector<MapBias> b;
+  };
+  std::array<SlotMap, 3> slot_maps() const;
+  size_t stride() const { return stride_; }
+  size_t region() const { return region_; }
+  uint32_t plain_slots() const { return plain_slots_; }
+  const std::vector<double>& state_mask() const { return mask_; }
+  const std::vector<double>& gate_mask() const { return mask_in_; }
+  double hn_scale() const { return hn_scale_; }
+  const std::vector<double>& gate_coeffs() const { return gate_c_; }
+  const std::vector<double>& cell_coeffs() const { return cell_c_; }
 
   Cell cell() const { return cell_; }
   int tokens() const { return n_; }
@@ -143,6 +177,7 @@ class Recurrent : public Layer {
   typename Ops::V run(Ops& ops, typename Ops::V x) const;
   void build();  // series coefficients, scaled weights and slot vectors
   void build_transforms(uint32_t slots, LinearTransform* x, LinearTransform* xn, LinearTransform* h);
+  double series_scale(size_t gate, bool recurrent) const;  // pre-activation -> series units
   struct LevelRun {
     bool fits = false;
     uint32_t out = 0, peak = 0, boots = 0;

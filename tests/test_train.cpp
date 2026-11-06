@@ -177,6 +177,25 @@ Network bn_cnn(unsigned seed) {
   return n;
 }
 
+// Recurrent layers over 3 tokens of 2 features (hidden 3): all states or
+// the last one, into a dense head. stacked: an RNN (hidden 2, all states)
+// in front, so the gradient goes through the layer's input.
+Network recurrent_net(unsigned seed, Recurrent::Cell cell, bool last, int tokens = 3, bool stacked = false) {
+  Rng r(seed);
+  const int I = 2, H = 3, G = Recurrent::gates(cell);
+  Network n(Shape{tokens, 1, I});
+  if (stacked)
+    n.add(std::make_shared<Recurrent>(Recurrent::Cell::kRNN, tokens, I, I, r.vec(static_cast<size_t>(I * I), 0.5),
+                                      r.vec(static_cast<size_t>(I * I), 0.4), r.vec(static_cast<size_t>(I), 0.2),
+                                      r.vec(static_cast<size_t>(I), 0.2), 6.0, 9));
+  n.add(std::make_shared<Recurrent>(cell, tokens, I, H, r.vec(static_cast<size_t>(G * H * I), 0.5),
+                                    r.vec(static_cast<size_t>(G * H * H), 0.4), r.vec(static_cast<size_t>(G * H), 0.2),
+                                    r.vec(static_cast<size_t>(G * H), 0.2), 6.0, 9, 4.0, 9, last));
+  const size_t out = last ? H : static_cast<size_t>(tokens * H);
+  n.emplace<Dense>(out, 2, r.vec(out * 2, 0.4), r.vec(2, 0.1));
+  return n;
+}
+
 // Dropout before an activation and inside a residual block.
 Network dropout_mlp(unsigned seed) {
   Rng r(seed);
@@ -646,6 +665,17 @@ int main(int argc, char** argv) {
   gradient_check("exact relu", [] { return relu_mlp(19); });
   gradient_check("batch norm (batch statistics, conv and vector)", [] { return bn_cnn(20); });
   gradient_check("dropout", [] { return dropout_mlp(21); });
+  using Cell = Recurrent::Cell;
+  gradient_check("rnn, all states", [] { return recurrent_net(22, Cell::kRNN, false); });
+  gradient_check("rnn, last state", [] { return recurrent_net(23, Cell::kRNN, true); });
+  gradient_check("gru, all states", [] { return recurrent_net(24, Cell::kGRU, false); });
+  gradient_check("gru, last state", [] { return recurrent_net(25, Cell::kGRU, true); });
+  gradient_check("lstm, all states", [] { return recurrent_net(26, Cell::kLSTM, false); });
+  gradient_check("lstm, last state", [] { return recurrent_net(27, Cell::kLSTM, true); });
+  gradient_check("gru, one token", [] { return recurrent_net(28, Cell::kGRU, true, 1); });
+  gradient_check("lstm, one token", [] { return recurrent_net(29, Cell::kLSTM, true, 1); });
+  gradient_check("stacked rnn, lstm", [] { return recurrent_net(30, Cell::kLSTM, false, 3, true); });
+  gradient_check("stacked rnn, frozen lstm", [] { return recurrent_net(31, Cell::kLSTM, true, 3, true); }, {1});
   gradient_check("max pool 3x3 stride 1, output layer", [] { return pool_output(14); });
 
   encrypted_check("mlp", [] { return mlp(1); }, 1, false, 1e-4);
@@ -669,6 +699,11 @@ int main(int argc, char** argv) {
   encrypted_check("batch norm, batched", [] { return bn_cnn(20); }, 1, false, 1e-4, {}, 0.5, 0, Loss{}, 0, 1.0, true);
   encrypted_check("mlp, batched", [] { return mlp(1); }, 1, false, 1e-4, {}, 0.5, 0, Loss{}, 0, 1.0, true);
   encrypted_check("dropout", [] { return dropout_mlp(21); }, 2, false, 1e-4);
+  encrypted_check("rnn, all states", [] { return recurrent_net(22, Cell::kRNN, false); }, 1, false, 1e-4);
+  encrypted_check("gru, last state", [] { return recurrent_net(25, Cell::kGRU, true); }, 1, false, 1e-4);
+  encrypted_check("lstm, all states", [] { return recurrent_net(26, Cell::kLSTM, false); }, 1, false, 1e-4);
+  encrypted_check("stacked rnn, lstm, level budget", [] { return recurrent_net(30, Cell::kLSTM, true, 3, true); }, 1, true,
+                  1e-3, {}, 0.5, 0, Loss{}, 10, 4.0);
   encrypted_check("batch norm, level budget", [] { return bn_cnn(20); }, 1, true, 1e-3, {}, 0.3, 0, Loss{}, 12, 8.0,
                   true);
   if (!quick) encrypted_check("max pool 3x3 stride 1, output layer", [] { return pool_output(14); }, 1, false, 1e-3);

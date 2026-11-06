@@ -325,52 +325,71 @@ void Recurrent::build() {
   if (slots_) build_transforms(slots_, &lt_x_, &lt_xn_, &lt_h_);
 }
 
-void Recurrent::build_transforms(uint32_t slots, LinearTransform* ltx, LinearTransform* ltxn, LinearTransform* lth) {
+// Per gate: the factor into its series' t units (input side, recurrent side).
+double Recurrent::series_scale(size_t g, bool recurrent) const {
+  if (cell_ == Cell::kRNN) return 1.0 / gate_a_;
+  if (cell_ == Cell::kLSTM) return (g == 2 ? 2.0 : 1.0) / gate_a_;
+  if (g < 2) return 1.0 / gate_a_;
+  return recurrent ? 1.0 / (cell_a_ * hn_scale_) : 1.0 / cell_a_;
+}
+
+std::array<Recurrent::SlotMap, 3> Recurrent::slot_maps() const {
   const size_t R = region_, B = stride_, H = static_cast<size_t>(h_), I = static_cast<size_t>(in_dim_);
   const size_t N = static_cast<size_t>(n_);
   const size_t regions = cell_ == Cell::kRNN ? 1 : cell_ == Cell::kGRU ? 3 : 4;
-  // Per gate: its region and the factor into t units (input side, recurrent side).
-  auto scale = [&](size_t g, bool recurrent) {
-    if (cell_ == Cell::kRNN) return 1.0 / gate_a_;
-    if (cell_ == Cell::kLSTM) return (g == 2 ? 2.0 : 1.0) / gate_a_;
-    if (g < 2) return 1.0 / gate_a_;
-    return recurrent ? 1.0 / (cell_a_ * hn_scale_) : 1.0 / cell_a_;
-  };
   const size_t xgates = cell_ == Cell::kGRU ? 2 : regions;
-  SparseMatrix mx(slots, slots), mxn(slots, slots), mh(slots, slots);
-  auto& bx = bias_x_;
-  auto& bxn = bias_xn_;
-  auto& bh = bias_h_;
-  bx.assign(regions * R, 0.0);
-  bxn.clear();
-  bh.clear();
+  const int A = static_cast<int>(w_ih_.size()), W = static_cast<int>(w_hh_.size()), G = static_cast<int>(b_ih_.size());
+  auto wih = [&](size_t g, size_t j, size_t i) { return static_cast<int>((g * H + j) * I + i); };
+  auto whh = [&](size_t g, size_t j, size_t k) { return A + static_cast<int>((g * H + j) * H + k); };
+  auto bih = [&](size_t g, size_t j) { return A + W + static_cast<int>(g * H + j); };
+  auto bhh = [&](size_t g, size_t j) { return A + W + G + static_cast<int>(g * H + j); };
+  std::array<SlotMap, 3> m;
   for (size_t g = 0; g < xgates; ++g) {
-    const double s = scale(g, false);
+    const double s = series_scale(g, false);
     for (size_t t = 0; t < N; ++t)
       for (size_t j = 0; j < H; ++j) {
         const size_t row = g * R + t * B + j;
-        for (size_t i = 0; i < I; ++i)
-          mx.add(row, in_layout_.slot(in_, t * I + i), w_ih_[(g * H + j) * I + i] * s);
-        bx[row] = (b_ih_[g * H + j] + b_hh_[g * H + j]) * s;
+        for (size_t i = 0; i < I; ++i) m[0].w.push_back({row, in_layout_.slot(in_, t * I + i), wih(g, j, i), s});
+        m[0].b.push_back({row, bih(g, j), bhh(g, j), s});
       }
   }
   if (cell_ == Cell::kGRU) {
-    bxn.assign(R, 0.0);
-    bh.assign(regions * R, 0.0);
-    const double s = scale(2, false), sh = scale(2, true);
+    const double s = series_scale(2, false), sh = series_scale(2, true);
     for (size_t t = 0; t < N; ++t)
       for (size_t j = 0; j < H; ++j) {
-        for (size_t i = 0; i < I; ++i)
-          mxn.add(t * B + j, in_layout_.slot(in_, t * I + i), w_ih_[(2 * H + j) * I + i] * s);
-        bxn[t * B + j] = b_ih_[2 * H + j] * s;
-        bh[2 * R + t * B + j] = b_hh_[2 * H + j] * sh;
+        for (size_t i = 0; i < I; ++i) m[1].w.push_back({t * B + j, in_layout_.slot(in_, t * I + i), wih(2, j, i), s});
+        m[1].b.push_back({t * B + j, bih(2, j), -1, s});
+        m[2].b.push_back({2 * R + t * B + j, bhh(2, j), -1, sh});
       }
   }
   for (size_t g = 0; g < regions; ++g) {
-    const double s = scale(g, true);
+    const double s = series_scale(g, true);
     for (size_t t = 1; t < N; ++t)
       for (size_t j = 0; j < H; ++j)
-        for (size_t k = 0; k < H; ++k) mh.add(g * R + t * B + j, (t - 1) * B + k, w_hh_[(g * H + j) * H + k] * s);
+        for (size_t k = 0; k < H; ++k) m[2].w.push_back({g * R + t * B + j, (t - 1) * B + k, whh(g, j, k), s});
+  }
+  return m;
+}
+
+void Recurrent::build_transforms(uint32_t slots, LinearTransform* ltx, LinearTransform* ltxn, LinearTransform* lth) {
+  const size_t R = region_;
+  const size_t regions = cell_ == Cell::kRNN ? 1 : cell_ == Cell::kGRU ? 3 : 4;
+  const std::array<SlotMap, 3> maps = slot_maps();
+  const std::vector<double> p = params();
+  auto value = [&](int q, int pair) { return p[static_cast<size_t>(q)] + (pair >= 0 ? p[static_cast<size_t>(pair)] : 0.0); };
+  SparseMatrix mx(slots, slots), mxn(slots, slots), mh(slots, slots);
+  SparseMatrix* mats[3] = {&mx, &mxn, &mh};
+  std::vector<double>* biases[3] = {&bias_x_, &bias_xn_, &bias_h_};
+  bias_x_.assign(regions * R, 0.0);
+  bias_xn_.clear();
+  bias_h_.clear();
+  if (cell_ == Cell::kGRU) {
+    bias_xn_.assign(R, 0.0);
+    bias_h_.assign(regions * R, 0.0);
+  }
+  for (size_t k = 0; k < 3; ++k) {
+    for (const MapEntry& e : maps[k].w) mats[k]->add(e.row, e.col, value(e.param, -1) * e.scale);
+    for (const MapBias& b : maps[k].b) (*biases[k])[b.row] = value(b.param, b.pair) * b.scale;
   }
   *ltx = LinearTransform(mx, slots);
   *ltxn = cell_ == Cell::kGRU ? LinearTransform(mxn, slots) : LinearTransform();
