@@ -137,7 +137,7 @@ Network conv_variants(unsigned seed) {
   Network n(Shape{2, 6, 6});
   n.emplace<Conv2d>(2, 2, 3, 3, dw, r.vec(18, 0.4), r.vec(2, 0.1))
       .emplace<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25})
-      .emplace<ConvTranspose2d>(2, 1, 3, 3, up, r.vec(9, 0.4), r.vec(1, 0.1))
+      .emplace<ConvTranspose2d>(2, 1, 3, 3, up, r.vec(18, 0.4), r.vec(1, 0.1))
       .emplace<Upsample>("bilinear", 3, 3)
       .emplace<Dense>(9, 2, r.vec(18, 0.3), r.vec(2, 0.1));
   return n;
