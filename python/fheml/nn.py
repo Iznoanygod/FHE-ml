@@ -27,7 +27,7 @@ from torch import nn
 __all__ = ["Poly", "Square", "Chebyshev", "Attention", "LayerNorm", "MaxPool2d", "ArgMax", "Residual", "TokenMean",
            "RNN", "GRU", "LSTM",
            "PosEmbedding", "Bootstrap", "SegmentLinear", "chebyshev_coefficients", "range_loss", "segment_ids",
-           "causal_mask", "encoder_decoder_masks"]
+           "causal_mask", "encoder_decoder_masks", "LinearMap"]
 
 
 class Poly(nn.Module):
@@ -541,6 +541,55 @@ class ArgMax(nn.Module):
     def extra_repr(self):
         return (f"range={self.range}" + (f", classes={self.classes}" if self.classes else "")
                 + (", dim=1" if self.dim == 1 else ""))
+
+
+class LinearMap(nn.Module):
+    """A fixed (not trained) linear map y = M x + b from one activation shape
+    to another, exported to ``fheml.LinearMap``.
+
+    ``matrix`` is (out_size, in_size) over the flattened C-order activations:
+    a dense array, a torch sparse tensor, or a (rows, cols, values) triple
+    with ``in_size`` given; ``bias`` (out_size,) or None; ``out_shape``
+    excludes the batch. It carries the fixed rearrangements of encrypted
+    post-processing: pixel shuffle, neighbour gathers, decoders that add each
+    position's own offset. One level, like any linear layer; only the
+    nonzero entries are kept.
+    """
+
+    def __init__(self, matrix, out_shape, bias=None, name="linearmap", in_size=None):
+        super().__init__()
+        if isinstance(matrix, tuple):
+            rows, cols, vals = (torch.as_tensor(np.asarray(v)) for v in matrix)
+            if in_size is None:
+                raise ValueError("LinearMap: give in_size with a (rows, cols, values) matrix")
+        else:
+            m = torch.as_tensor(matrix, dtype=torch.float64)
+            m = m.to_dense() if m.is_sparse else m
+            in_size = m.shape[1]
+            rows, cols = torch.nonzero(m, as_tuple=True)
+            vals = m[rows, cols]
+        self.out_shape = tuple(int(v) for v in out_shape)
+        self.in_size, self.out_size = int(in_size), int(np.prod(self.out_shape))
+        self.register_buffer("rows", rows.long())
+        self.register_buffer("cols", cols.long())
+        self.register_buffer("vals", vals.to(torch.get_default_dtype()))
+        self.register_buffer("bias", None if bias is None else torch.as_tensor(bias, dtype=torch.get_default_dtype()))
+        self.name = name
+        if len(self.rows) and (int(self.rows.max()) >= self.out_size or int(self.cols.max()) >= self.in_size):
+            raise ValueError(f"LinearMap {name}: entry outside the {self.out_size} x {self.in_size} matrix")
+        if self.bias is not None and self.bias.numel() != self.out_size:
+            raise ValueError(f"LinearMap {name}: bias has {self.bias.numel()} entries, out_shape {self.out_size}")
+
+    def forward(self, x):
+        x = x.flatten(1)
+        y = x.new_zeros(x.shape[0], self.out_size)
+        y.index_add_(1, self.rows, x[:, self.cols] * self.vals.to(x.dtype))
+        if self.bias is not None:
+            y = y + self.bias.to(x.dtype)
+        return y.reshape((-1,) + self.out_shape)
+
+    def extra_repr(self):
+        return f"{self.name}: {self.in_size} -> {self.out_shape}, {len(self.vals)} entries"
 
 
 class Bootstrap(nn.Module):

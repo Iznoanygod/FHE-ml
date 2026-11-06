@@ -173,29 +173,37 @@ def box_iou(a, b):
     return inter / np.maximum(area(a) + area(b) - inter, 1e-12)
 
 
-def average_precision(dets, gts, iou=0.5):
+def average_precision(dets, gts, iou=0.5, ignore=None):
     """VOC/COCO-style AP of one class at one IoU threshold.
 
     dets: list over images of (K, 5) arrays (x0, y0, x1, y1, score); gts:
     list over images of (M, 4) boxes. Greedy matching by score, all-point
     interpolated precision (COCO uses 101 recall points; the difference is
-    small). Returns (AP, number of ground-truth boxes)."""
+    small). ignore: optional list over images of (M', 4) boxes that are
+    neither required nor penalized (COCO's crowd regions, objects outside
+    the evaluated size range): a detection that matches no ground-truth box
+    but overlaps one of them by iou is dropped instead of counted as a false
+    positive. Returns (AP, number of ground-truth boxes)."""
     scores, tp = [], []
     total = sum(len(g) for g in gts)
-    for d, g in zip(dets, gts):
+    for i, (d, g) in enumerate(zip(dets, gts)):
         d = np.asarray(d, np.float64).reshape(-1, 5)
         g = np.asarray(g, np.float64).reshape(-1, 4)
+        ign = np.asarray(ignore[i] if ignore is not None else [], np.float64).reshape(-1, 4)
         used = np.zeros(len(g), bool)
         for k in np.argsort(-d[:, 4]):
-            scores.append(d[k, 4])
             if len(g):
                 o = box_iou(d[k, :4], g)
                 o[used] = -1
                 j = int(o.argmax())
                 if o[j] >= iou:
                     used[j] = True
+                    scores.append(d[k, 4])
                     tp.append(1)
                     continue
+            if len(ign) and box_iou(d[k, :4], ign).max() >= iou:
+                continue
+            scores.append(d[k, 4])
             tp.append(0)
     if total == 0:
         return float("nan"), 0

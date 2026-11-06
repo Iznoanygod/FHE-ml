@@ -94,6 +94,16 @@ Each linear layer costs one level. `Network::fuse_linear()` multiplies runs of
 adjacent linear layers (conv → pool → affine) into one matrix. That saves a
 level per merged layer, at the cost of more diagonals.
 
+Because a layer is nothing more than its logical matrix and bias,
+`LinearMap` takes them directly: a fixed sparse matrix between any two
+shapes, plus a bias per output element. It covers the rearrangements that no
+convolution expresses, so that post-processing stays encrypted. Examples are
+pixel shuffle (a permutation from `(C r², H, W)` to `(C, rH, rW)`), gathering
+each pixel's neighbourhood into channels, and decoders that add each grid
+cell's own position. It is lowered like any other linear layer: one level,
+plus a rotation per distinct slot offset. Its torch twin is
+`fheml.nn.LinearMap`, which stores (row, col, value) triples.
+
 `LinearTransform::eval_slots` runs the same schedule on cleartext vectors. The
 tests use it to check every plan against the exact product without any
 cryptography.
