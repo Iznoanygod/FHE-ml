@@ -788,9 +788,9 @@ scaling, `--insecure`), after 30 epochs of training (about 12 minutes):
 | Greedy decoding in torch, 8,095 test words (phonemes / words) | 86.6% / 60.0% | 87.9% / 62.9% |
 | fheml plaintext, first 500 test words (shuffled) | 85.1% / 54.6%, identical to torch | 86.7% / 59.6%, identical to torch |
 | Decoding network in the clear, first 100 words | 99/100 decoded exactly like torch | 100/100 |
-| Depth | 812 levels: 6 bootstraps between steps, 35 placed, 203 inside LayerNorm, softmax and ArgMax | same |
-| Setup | 5 s, 129 rotation keys (0.8 GB) | 5 s, 135 rotation keys (0.9 GB) |
-| Time per word (7 decoding steps, all encrypted) | 454 s | 453 s |
+| Depth | 819 levels: 6 bootstraps between steps, 35 placed by the planner, 217 inside LayerNorm, softmax and ArgMax | same |
+| Setup | 5-8 s, 129 rotation keys (0.8 GB) | 5 s, 135 rotation keys (0.9 GB) |
+| Time per word (7 decoding steps, all encrypted) | 501 s on average (427-702 s) | 430 s (427-431 s) |
 | Peak memory | 2.7 GB | 2.7 GB |
 | Encrypted vs torch | 5/5 words decoded exactly like torch | 5/5 words decoded exactly like torch |
 
