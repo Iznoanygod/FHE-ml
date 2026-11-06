@@ -94,6 +94,19 @@ Each linear layer costs one level. `Network::fuse_linear()` multiplies runs of
 adjacent linear layers (conv → pool → affine) into one matrix. That saves a
 level per merged layer, at the cost of more diagonals.
 
+The convolution family is written this way too. `Conv2d` covers channel
+groups (a depthwise convolution is `groups = channels`), dilation and
+separate vertical and horizontal padding; a 1-D convolution over a `(C, L)`
+signal is the same layer on the `(C, 1, L)` shape with `kh = 1`.
+`ConvTranspose2d` is the transpose of a strided convolution's matrix, and
+`Upsample` (nearest, nearest-exact, bilinear, or linear on signals) is a
+fixed matrix with at most four entries per row. None of them needs special
+evaluation code: their cost is set by their distinct slot offsets, so a
+depthwise 3×3 has 9 diagonals per channel block where a dense one has
+`9 (Ci + Co - 1)`. Shared taps train like any other conv weight (a masked
+rotate-and-sum of the gradient), which gives U-Net- and MobileNet-style
+encoders and decoders the same encrypted training as plain CNNs.
+
 Because a layer is nothing more than its logical matrix and bias,
 `LinearMap` takes them directly: a fixed sparse matrix between any two
 shapes, plus a bias per output element. It covers the rearrangements that no

@@ -108,10 +108,45 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("trainable", &Layer::trainable);
 
   py::class_<LinearLayer, Layer, std::shared_ptr<LinearLayer>>(m, "LinearLayer");
+  auto geometry = [](int stride, int pad, int pad_w, int groups, int dil_h, int dil_w, int op_h, int op_w) {
+    ConvGeometry g;
+    g.stride = stride;
+    g.pad_h = pad;
+    g.pad_w = pad_w < 0 ? pad : pad_w;
+    g.groups = groups;
+    g.dil_h = dil_h;
+    g.dil_w = dil_w;
+    g.out_pad_h = op_h;
+    g.out_pad_w = op_w;
+    return g;
+  };
   py::class_<Conv2d, LinearLayer, std::shared_ptr<Conv2d>>(m, "Conv2d")
-      .def(py::init<int, int, int, int, int, int, Vec, Vec>(), py::arg("in_channels"), py::arg("out_channels"),
-           py::arg("kh"), py::arg("kw"), py::arg("stride"), py::arg("pad"), py::arg("weights"),
-           py::arg("bias") = Vec{});
+      .def(py::init([geometry](int ic, int oc, int kh, int kw, int stride, int pad, Vec w, Vec b, int groups,
+                               int dil_h, int dil_w, int pad_w) {
+             return std::make_shared<Conv2d>(ic, oc, kh, kw, geometry(stride, pad, pad_w, groups, dil_h, dil_w, 0, 0),
+                                             std::move(w), std::move(b));
+           }),
+           py::arg("in_channels"), py::arg("out_channels"), py::arg("kh"), py::arg("kw"), py::arg("stride"),
+           py::arg("pad"), py::arg("weights"), py::arg("bias") = Vec{}, py::arg("groups") = 1,
+           py::arg("dilation_h") = 1, py::arg("dilation_w") = 1, py::arg("pad_w") = -1,
+           "Convolution; weights [out][in/groups][kh][kw]. pad is the vertical padding, pad_w the horizontal one "
+           "(-1 = pad). A 1-D convolution over (C, L) is kh = 1, pad = 0 on the (C, 1, L) shape.");
+  py::class_<ConvTranspose2d, LinearLayer, std::shared_ptr<ConvTranspose2d>>(m, "ConvTranspose2d")
+      .def(py::init([geometry](int ic, int oc, int kh, int kw, int stride, int pad, Vec w, Vec b, int groups,
+                               int dil_h, int dil_w, int pad_w, int op_h, int op_w) {
+             return std::make_shared<ConvTranspose2d>(ic, oc, kh, kw,
+                                                      geometry(stride, pad, pad_w, groups, dil_h, dil_w, op_h, op_w),
+                                                      std::move(w), std::move(b));
+           }),
+           py::arg("in_channels"), py::arg("out_channels"), py::arg("kh"), py::arg("kw"), py::arg("stride"),
+           py::arg("pad"), py::arg("weights"), py::arg("bias") = Vec{}, py::arg("groups") = 1,
+           py::arg("dilation_h") = 1, py::arg("dilation_w") = 1, py::arg("pad_w") = -1,
+           py::arg("output_padding_h") = 0, py::arg("output_padding_w") = 0,
+           "Transposed convolution (torch ConvTranspose2d); weights [in][out/groups][kh][kw].");
+  py::class_<Upsample, LinearLayer, std::shared_ptr<Upsample>>(m, "Upsample")
+      .def(py::init<std::string, int, int, bool>(), py::arg("mode"), py::arg("out_h"), py::arg("out_w"),
+           py::arg("align_corners") = false,
+           "Upsampling to (out_h, out_w): nearest, nearest-exact or bilinear (linear on (C, 1, L) signals).");
   py::class_<Dense, LinearLayer, std::shared_ptr<Dense>>(m, "Dense")
       .def(py::init<int, int, Vec, Vec>(), py::arg("inputs"), py::arg("outputs"), py::arg("weights"),
            py::arg("bias") = Vec{});

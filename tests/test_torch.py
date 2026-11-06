@@ -47,6 +47,36 @@ cnn = nn.Sequential(
     nn.Linear(6, 3))
 run("cnn", cnn, (2, 8, 8))
 
+# Conv variants: depthwise + dilated, grouped with rectangular padding,
+# 'same' padding, a transposed conv decoder and upsampling (U-Net/FCN style).
+unet = nn.Sequential(
+    nn.Conv2d(2, 4, 3, padding=1), hnn.Poly([0, 0.5, 0.25]),
+    nn.Conv2d(4, 4, 3, stride=2, padding=2, dilation=2, groups=4), nn.BatchNorm2d(4),
+    nn.Conv2d(4, 6, (3, 1), padding=(1, 0), groups=2, bias=False), hnn.Chebyshev("gelu", -3, 3, 13),
+    nn.ConvTranspose2d(6, 3, 3, stride=2, padding=1, output_padding=1), nn.BatchNorm2d(3), hnn.Square(),
+    nn.Upsample(scale_factor=2, mode="bilinear"), nn.Conv2d(3, 2, 3, padding="same"),
+    nn.Upsample(size=(12, 20), mode="nearest"))
+for m in unet.modules():
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+        with torch.no_grad():
+            m.weight.mul_(0.6)
+run("conv variants (depthwise, dilated, grouped, transposed, upsample)", unet, (2, 8, 8))
+run("bilinear upsample, align_corners", nn.Sequential(nn.Upsample(scale_factor=3, mode="bilinear", align_corners=True)),
+    (1, 3, 4))
+run("nearest-exact upsample", nn.Sequential(nn.Upsample(size=(5, 7), mode="nearest-exact")), (2, 3, 4))
+run("grouped transposed conv, dilation",
+    nn.Sequential(nn.ConvTranspose2d(4, 6, 3, stride=2, padding=2, dilation=2, groups=2, output_padding=1)), (4, 4, 4))
+
+# 1-D: a (C, L) signal through Conv1d (strided, dilated, depthwise),
+# BatchNorm1d, ConvTranspose1d and linear upsampling, then a vector head.
+sig = nn.Sequential(
+    nn.Conv1d(3, 4, 5, stride=2, padding=2), nn.BatchNorm1d(4), hnn.Chebyshev("relu", -3, 3, 15),
+    nn.Conv1d(4, 4, 3, padding=2, dilation=2, groups=4), hnn.Square(),
+    nn.ConvTranspose1d(4, 2, 4, stride=2, padding=1), nn.Upsample(scale_factor=2, mode="linear"),
+    nn.Flatten(), nn.Linear(64, 3))
+run("conv1d signal", sig, (3, 16))
+
+
 # Exact max pooling (scheme switching): small conv weights keep the pooled
 # values inside range.
 pooled = nn.Sequential(nn.Conv2d(1, 2, 3, padding=1), hnn.MaxPool2d(2, range=2.0), hnn.Square(), nn.Flatten(),

@@ -254,11 +254,14 @@ logits = fheml.infer(net, ctx, image)        # image: (1, 28, 28) numpy array
 
 | torch | fheml |
 | --- | --- |
-| `nn.Conv2d` (square kernel, zero padding, groups=1) | `conv2d` |
+| `nn.Conv2d` (any kernel, groups/depthwise, dilation, zero or `'same'` padding) | `conv2d` |
+| `nn.Conv1d` on a `(C, L)` input | `conv2d` with `kh = 1` on the `(C, 1, L)` shape |
+| `nn.ConvTranspose2d`, `nn.ConvTranspose1d` | `convtranspose2d` |
+| `nn.Upsample` (nearest, nearest-exact, bilinear, linear; integer factors or `size=`) | `upsample` |
 | `nn.Linear` | `dense` on vectors; `tokendense` on `(tokens, dim)` inputs |
 | `nn.AvgPool2d`, `nn.AdaptiveAvgPool2d(1)` | `avgpool2d` |
 | `hnn.MaxPool2d(k, stride, range=R)` (square window, no padding) | `maxpool2d` (exact, scheme switching) |
-| `nn.BatchNorm2d` / `nn.BatchNorm1d` | folded into the preceding conv/linear, else `affine` |
+| `nn.BatchNorm2d` / `nn.BatchNorm1d` (vectors and `(C, L)` signals) | folded into the preceding conv/linear, else `affine` |
 | `nn.Flatten`, `nn.Dropout`, `nn.Identity` | nothing |
 | `hnn.Poly`, `hnn.Square`, `hnn.Chebyshev` | `poly`, `square`, `chebyshev` |
 | `hnn.Attention(dim, tokens, heads=H)`, `hnn.Residual`, `hnn.TokenMean`, `hnn.PosEmbedding` | `attention` (single or multi-head), `residual`, `tokenmean`, per-token bias |
@@ -1172,10 +1175,11 @@ for xs, ts in batches:
 trainer.decrypt_weights(ctx)                             # key holder: trained weights back into net
 ```
 
-* **What trains:** conv2d, dense, tokendense and affine weights and biases,
+* **What trains:** conv2d (grouped, depthwise, dilated, 1-D), convtranspose2d,
+  dense, tokendense and affine weights and biases,
   layernorm's gamma and beta, and the four projections of attention
   (quadratic or softmax scores, any number of heads), with shared weights
-  handled exactly. Gradients flow through square, poly, chebyshev, average
+  handled exactly. Gradients flow through square, poly, chebyshev, upsampling, average
   and max pooling, token mean, layernorm, attention, residual and bootstrap
   layers. Max pooling routes each window's gradient to the tap that won,
   multiplying by the comparison bits its forward pass already computed, so
