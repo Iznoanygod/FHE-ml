@@ -107,6 +107,25 @@ print(f"level budget {trainer.level_budget}: {trainer.sample_bootstraps} bootstr
       f"max weight error {err:.1e}")
 assert err < 1e-3
 
+# Optimizers: Nesterov momentum with weight decay, then AdamW, over two
+# updates each (the encrypted state carries over).
+for opt, lr in ((fheml.sgd(momentum=0.9, weight_decay=0.05, nesterov=True), 0.3),
+                (fheml.adamw(weight_decay=0.1, betas=(0.9, 0.99), eps=0.04, v_max=4.0), 0.05)):
+    enc, ref = build(), build()
+    trainer, ctx = fheml.make_trainer(enc, [], secure=False, bootstrapping=False, updates=2, optimizer=opt)
+    print(trainer.summary())
+    trainer.encrypt_weights(ctx)
+    state = fheml.OptimizerState()
+    for step in range(2):
+        xs, ts = rng.uniform(-1, 1, (2, 10)), rng.uniform(-1, 1, (2, 3))
+        fheml.train_step(trainer, ctx, xs, ts, lr=lr)
+        fheml.train_plain(ref, xs, ts, lr=lr, optimizer=opt, state=state)
+    assert trainer.steps == state.steps == 2
+    trainer.decrypt_weights(ctx)
+    err = np.abs(params(enc) - params(ref)).max()
+    print(f"{opt}: max weight error {err:.1e} after 2 updates")
+    assert err < 1e-4
+    assert np.abs(params(ref) - params(build())).max() > 1e-2
 # A torch CNN with BatchNorm2d/BatchNorm1d (kept as trainable batch norms)
 # and Dropout: the encrypted batched step matches train_plain, running
 # statistics included.

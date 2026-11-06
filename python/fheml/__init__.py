@@ -25,6 +25,8 @@ from ._fheml import (  # noqa: F401
     LinearLayer,
     Loss,
     Network,
+    Optimizer,
+    OptimizerState,
     Residual,
     Scale,
     Shape,
@@ -89,6 +91,27 @@ def cross_entropy(**softmax):
     for k, v in softmax.items():
         setattr(o, k, v)
     return Loss.cross_entropy(o)
+
+
+def sgd(momentum=0.0, weight_decay=0.0, nesterov=False, decoupled=False):
+    """SGD for ``make_trainer(optimizer=...)``: momentum (heavy ball or
+    ``nesterov``) and weight decay (L2 inside the gradient, or ``decoupled``
+    SGDW), as torch.optim.SGD. The momentum buffer is encrypted."""
+    return Optimizer.sgd(momentum, weight_decay, nesterov, decoupled)
+
+
+def adam(betas=(0.9, 0.999), eps=1e-2, v_max=1.0, weight_decay=0.0, decoupled=False, degree=31, newton=2):
+    """Adam with encrypted moments. 1/sqrt(v_hat + eps) is a Chebyshev
+    series of ``degree`` on [0, v_max] plus ``newton`` Newton steps (eps
+    inside the root; keep v_max / eps around 100 at degree 31). v_max bounds
+    the squared gradient."""
+    b1, b2 = betas
+    return Optimizer.adam(b1, b2, eps, v_max, weight_decay, decoupled, degree, newton)
+
+
+def adamw(weight_decay=1e-2, betas=(0.9, 0.999), eps=1e-2, v_max=1.0, degree=31, newton=2):
+    """AdamW: Adam with decoupled weight decay."""
+    return Optimizer.adamw(weight_decay, betas[0], betas[1], eps, v_max, degree, newton)
 
 
 def softmax(loss, y):
@@ -171,7 +194,7 @@ def make_training_context(trainer, secure=True, bootstrapping=True, updates=1, r
 
 
 def make_trainer(net, frozen=(), secure=True, bootstrapping=True, updates=1, full_slots=True, slots=None,
-                 rotation_window=None, loss=None, level_budget=None, bootstrap_range=1.0, **overrides):
+                 rotation_window=None, loss=None, level_budget=None, bootstrap_range=1.0, optimizer=None, **overrides):
     """Encrypted-training setup: returns ``(trainer, ctx)``.
 
     full_slots recompiles ``net`` to use every slot of the ring (free per
@@ -179,7 +202,8 @@ def make_trainer(net, frozen=(), secure=True, bootstrapping=True, updates=1, ful
     ``slots`` caps that (bootstrapping keys grow with the slot count: at ring
     2^16 about 45 keys for 256 slots, 96 for 4096). See
     make_training_context for rotation_window. ``loss``: a ``Loss``
-    (default mean squared error; see ``cross_entropy``).
+    (default mean squared error; see ``cross_entropy``). ``optimizer``: an
+    ``Optimizer`` (default plain SGD; see ``sgd``, ``adam``, ``adamw``).
 
     level_budget bootstraps activations and gradients inside each step so
     that no ciphertext goes deeper than that many levels (deep networks:
@@ -188,11 +212,12 @@ def make_trainer(net, frozen=(), secure=True, bootstrapping=True, updates=1, ful
     values at those bootstraps (see Trainer.set_level_budget).
     """
     loss = loss or Loss.mse()
+    optimizer = optimizer or Optimizer.sgd()
     if rotation_window is None:
         rotation_window = 1 if secure else 0
 
     def new_trainer():
-        t = Trainer(net, list(frozen), loss)
+        t = Trainer(net, list(frozen), loss, optimizer)
         if level_budget and bootstrapping:
             t.set_level_budget(t.min_level_budget if level_budget == "min" else level_budget, bootstrap_range)
         return t
@@ -217,7 +242,7 @@ def make_trainer(net, frozen=(), secure=True, bootstrapping=True, updates=1, ful
 
 
 def train_step(trainer, ctx, xs, targets, lr, batched=None):
-    """One encrypted SGD update on a batch of (numpy) samples.
+    """One encrypted optimizer update on a batch of (numpy) samples.
 
     batched: process the batch layer by layer (Trainer.accumulate_batch),
     which batch norms need for their batch statistics; it keeps every
@@ -249,10 +274,12 @@ def forward_plain_batch(net, xs):
     return np.asarray(_fheml.forward_plain_batch(net, [_flat(x) for x in xs]))
 
 
-def train_plain(net, xs, targets, lr, frozen=(), loss=None):
-    """Plaintext reference of ``Trainer``: one SGD update on a batch."""
+def train_plain(net, xs, targets, lr, frozen=(), loss=None, optimizer=None, state=None):
+    """Plaintext reference of ``Trainer``: one optimizer update on a batch.
+    Optimizers with state (momentum, Adam) keep it in ``state``, an
+    ``OptimizerState`` reused across calls."""
     _fheml.train_plain(net, [_flat(x) for x in xs], [_flat(t) for t in targets], lr, list(frozen),
-                       loss or Loss.mse())
+                       loss or Loss.mse(), optimizer or Optimizer.sgd(), state)
 
 
 def auto_bootstrap(net, calibration, budget=None, level_budget=(2, 2), max_ring=1 << 16, headroom=1.5,

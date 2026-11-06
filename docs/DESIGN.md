@@ -437,8 +437,8 @@ weights.
 
 ## Encrypted training
 
-`Trainer` (`include/fheml/train.h`) runs SGD with backpropagation on
-ciphertexts only.
+`Trainer` (`include/fheml/train.h`) runs backpropagation and an optimizer
+(SGD with momentum and weight decay, or Adam / AdamW) on ciphertexts only.
 
 **Weights as diagonals.** Each linear layer is kept as its generalized
 diagonals `D_d`, one ciphertext each, without the BSGS pre-rotation, so they
@@ -452,8 +452,8 @@ can be updated in place:
 
 **Shared weights.** Layers say which parameter owns each matrix entry
 (`LinearLayer::weight_refs`).
-- A weight owning one slot (dense) gets that slot's gradient: the update is
-  `D_d -= lr/n · mask ⊙ G_d`.
+- A weight owning one slot (dense) gets that slot's gradient: the plain SGD
+  update is `D_d -= lr/n · mask ⊙ G_d`.
 - A weight owning many slots (a conv tap, a per-channel bias, a weight shared
   by every token) needs the sum over its slots. A masked rotate-and-sum over
   all slots computes it and leaves it in every slot, and a second mask puts it
@@ -539,6 +539,43 @@ broadcast back over the window and subtracted. Slots outside the window get
 same polynomials (`softmax_plain`); `tests/test_train.cpp` checks the gradient
 against finite differences of the exact cross-entropy and the encrypted
 update against `train_plain`.
+
+**Optimizers.** The optimizer sees, per weight ciphertext, the masked mean
+gradient `P` above: every slot holds its parameter's gradient (a shared
+weight's broadcast sum), zero elsewhere. Every public constant of the update
+(learning rate, batch size, momentum, Adam's bias corrections) rides on the
+plaintext masks that produce `P`, so several scaled copies of `P` come out of
+the same masked sum at no extra level. The optimizer state is one ciphertext
+per weight ciphertext with the same zero pattern, so it is bootstrapped in
+the same packed bootstraps as the weights.
+
+| Optimizer | Encrypted update | Levels after `P` |
+| --- | --- | --- |
+| SGD | `D += P[-lr/n]` | 0 |
+| weight decay `wd` (L2) | `+ D ⊙ (-lr wd)`; decoupled (SGDW/AdamW) the same product outside `g'` | 1 (on `D`) |
+| momentum `mu` | `b = P[1/n] + wd D + mu b`, `D += P[-lr/n] - lr wd D - lr mu b_old` | 1 (on `D`, `b`) |
+| Nesterov | `D += P[-lr(1+mu)/n] - lr(1+mu) wd D - lr mu² b_old` | 1 |
+| Adam | `m̂ = P[(1-b1)/(c1 n)] + b1 (c1'/c1) m̂`, `v̂ = P[√((1-b2)/c2)/n]² + b2 (c2'/c2) v̂`, `D += (m̂ · -lr) ⊙ rsqrt(v̂)` | 1 + pd(deg) + 1 + 2 newton + 1 |
+
+`c1 = 1 - b1^t`, `c2 = 1 - b2^t` and their values `c1'`, `c2'` at `t - 1`
+are public. Adam stores the bias-corrected moments `m̂ = m/c1` and `v̂ =
+v/c2`, which follow the same recurrences with these constants: the raw `v`
+is `c2` times smaller (1e-3 at the first step for `b2 = 0.999`), so its
+bootstraps, whose error is absolute, would lose most of its digits.
+`rsqrt(u) ≈ 1/sqrt(u + eps)` is the layer norm's inverse square root: a
+Chebyshev series on `[0, v_max]` and Newton steps `r <- 1.5 r - 0.5 (u +
+eps) r³`, which take `v̂ + eps` from a scalar product on `v̂` (it has levels
+to spare). As in the layer norm, the series is scaled by
+`1.5^newton` so that the Newton steps need no scalar product on the root.
+`eps` sits inside the root (torch adds it outside) and sets how steep the
+series is: `v_max / eps = 100` with degree 31 and two Newton steps is
+accurate to 3e-12, `1000` needs degree 63. Under a level budget the series,
+the Newton steps and the final product are bootstrapped like any other
+operation; `min_level_budget()` includes the series. `train_plain` runs the
+same update with an `OptimizerState`, and `tests/test_train.cpp` checks it
+against the textbook definitions (exact square root) and the encrypted
+update against it over several steps, with bootstrapped weights and state
+and under a level budget.
 
 **Levels.** `Trainer::step_depth()` simulates the levels of a whole step
 (forward, backward, update) and `context_options()` sizes the context from
@@ -769,9 +806,10 @@ All of the following are tested under encryption:
 - The same CNN with encrypted weights: about 3.6 s per image.
 - A one-block MNIST vision transformer (95.6%): about 15 s per image.
 - Python bindings for all of the above.
-- Encrypted training (`Trainer`): SGD updates on encrypted data and weights
-  match plaintext SGD, with and without bootstrapping; this includes
-  layer norm (gamma, beta), batch norm (batch statistics and running
+- Encrypted training (`Trainer`): SGD (momentum, Nesterov, weight decay)
+  and Adam / AdamW updates on encrypted data, weights and optimizer state
+  match the plaintext optimizers, with and without bootstrapping; this
+  includes layer norm (gamma, beta), batch norm (batch statistics and running
   statistics), dropout, recurrent layers (RNN, GRU, LSTM, backpropagation
   through time), attention (quadratic or softmax scores, masked and
   segmented), whose backward passes reuse the forward's rotations and masks,
