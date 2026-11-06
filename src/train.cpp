@@ -1,6 +1,7 @@
 #include "fheml/train.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <functional>
 #include <map>
@@ -8,6 +9,7 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "fheml/recurrent.h"
 #include "fheml/transformer.h"
 #include "math/chebyshev.h"
 
@@ -172,7 +174,7 @@ size_t first_trainable(const Network& net, const std::vector<size_t>& frozen) {
 // ----------------------------------------------------------------------- Node
 
 struct Trainer::Node {
-  enum Kind { kLinear, kSquare, kPoly, kCheb, kBoot, kResidual, kNorm, kAttn, kMax, kRelu, kBatchNorm, kDropout } kind = kLinear;
+  enum Kind { kLinear, kSquare, kPoly, kCheb, kBoot, kResidual, kNorm, kAttn, kMax, kRelu, kBatchNorm, kDropout, kRecur } kind = kLinear;
   Layer* layer = nullptr;
   bool trainable = false;
 
@@ -192,7 +194,15 @@ struct Trainer::Node {
   std::vector<double> bias_unshared;
   struct Group {
     std::vector<std::pair<int, std::vector<double>>> masks;  // (diagonal, -1 = bias), 0/1 mask
+    double factor = 1.0;  // the step's factor (a parameter held scaled, see pscale)
   };
+  // Slot maps of a recurrent layer (kRecur's body): per parameter of the
+  // layer, the scale its slots hold it at (the unshared masks and the
+  // groups carry scale^2 as their step factor, so the update is SGD on the
+  // parameter itself) and the parameter summed with it in a bias slot (-1:
+  // none; both move by the same step).
+  std::vector<double> pscale;
+  std::vector<int> ppair;
   std::vector<Group> groups;
   // Every weight ciphertext is zero outside slots [0, window): bootstrapping
   // packs slots / window of them into one ciphertext.
@@ -252,15 +262,22 @@ struct Trainer::Node {
   Dropout* drop = nullptr;
   std::vector<double> dmask;
 
+  // kRecur: body holds the layer's slot maps (Recurrent::slot_maps) as
+  // linear nodes, rx / rxn / rh their indices (-1: none); rs the current
+  // sample's forward values (see RecPass).
+  Recurrent* rec = nullptr;
+  int rx = -1, rxn = -1, rh = -1;
+  std::vector<Ctxt> rs;
+
   struct Sample {
     std::vector<double> dmask;
     Ctxt in, centred, r, q, o, y, step;
-    std::vector<Ctxt> kr, vr, p, aw, A, pick_b, pick_a;
+    std::vector<Ctxt> kr, vr, p, aw, A, pick_b, pick_a, rs;
     std::vector<Sample> body;
   };
   std::vector<Sample> saved;
 
-  std::vector<std::unique_ptr<Node>> body;  // kResidual, kAttn
+  std::vector<std::unique_ptr<Node>> body;  // kResidual, kAttn, kRecur
 };
 
 // Softmax cross-entropy (see Loss): the exp and 1/x series, and for the
@@ -354,6 +371,92 @@ namespace {
 using Node = Trainer::Node;
 using CrossEntropy = Trainer::CrossEntropy;
 
+// A recurrent layer's slot map (Recurrent::slot_maps) as a linear node: the
+// weights at their slots, scaled; owners, update masks and groups as for a
+// LinearLayer, with the step scaled by scale^2 (twice that for a bias slot
+// holding b_ih + b_hh, whose two parameters both take the step).
+std::unique_ptr<Node> build_slot_map(Recurrent* rc, const Recurrent::SlotMap& m, bool train, uint32_t slots) {
+  auto n = std::make_unique<Node>();
+  n->kind = Node::kLinear;
+  n->layer = rc;
+  n->trainable = train;
+  const std::vector<double> p = rc->params();
+  size_t top = 1;
+  for (const auto& e : m.w) top = std::max(top, e.row + 1);
+  for (const auto& b : m.b) top = std::max(top, b.row + 1);
+  n->window = 1;
+  while (n->window < top) n->window *= 2;
+  std::map<int32_t, size_t> index;
+  auto diag_of = [&](size_t rs, size_t cs) {
+    int32_t d = normalize_rotation(static_cast<int64_t>(cs) - static_cast<int64_t>(rs), slots);
+    auto it = index.find(d);
+    if (it != index.end()) return it->second;
+    index[d] = n->offs.size();
+    n->offs.push_back(d);
+    n->diag.emplace_back(slots, 0.0);
+    if (n->trainable) n->owner.emplace_back(slots, -1);
+    return n->offs.size() - 1;
+  };
+  std::vector<int> count(p.size(), 0);
+  if (train) {
+    n->pscale.assign(p.size(), 0.0);
+    n->ppair.assign(p.size(), -1);
+  }
+  for (const auto& e : m.w) {
+    const size_t i = diag_of(e.row, e.col);
+    n->diag[i][e.row] = p[static_cast<size_t>(e.param)] * e.scale;
+    if (train) {
+      if (n->owner[i][e.row] != -1) throw std::logic_error("train: two weights share one slot");
+      n->owner[i][e.row] = e.param;
+      n->pscale[static_cast<size_t>(e.param)] = e.scale;
+      ++count[static_cast<size_t>(e.param)];
+    }
+  }
+  if (!m.b.empty()) {
+    n->bias.assign(slots, 0.0);
+    if (train) n->bias_owner.assign(slots, -1);
+    for (const auto& b : m.b) {
+      n->bias[b.row] = (p[static_cast<size_t>(b.param)] + (b.pair >= 0 ? p[static_cast<size_t>(b.pair)] : 0.0)) * b.scale;
+      if (train) {
+        n->bias_owner[b.row] = b.param;
+        n->pscale[static_cast<size_t>(b.param)] = b.scale;
+        n->ppair[static_cast<size_t>(b.param)] = b.pair;
+        ++count[static_cast<size_t>(b.param)];
+      }
+    }
+  }
+  if (!train) return n;
+  auto factor = [&](int q) {
+    const double sc = n->pscale[static_cast<size_t>(q)];
+    return sc * sc * (n->ppair[static_cast<size_t>(q)] >= 0 ? 2.0 : 1.0);
+  };
+  std::map<int, std::map<int, std::vector<double>>> shared;
+  n->unshared.assign(n->offs.size(), {});
+  auto place = [&](int q, int d, uint32_t sl) {
+    if (count[static_cast<size_t>(q)] == 1) {
+      auto& u = d < 0 ? n->bias_unshared : n->unshared[static_cast<size_t>(d)];
+      if (u.empty()) u.assign(slots, 0.0);
+      u[sl] = factor(q);
+    } else {
+      auto& mk = shared[q][d];
+      if (mk.empty()) mk.assign(slots, 0.0);
+      mk[sl] = 1.0;
+    }
+  };
+  for (size_t i = 0; i < n->offs.size(); ++i)
+    for (uint32_t sl = 0; sl < slots; ++sl)
+      if (n->owner[i][sl] >= 0) place(n->owner[i][sl], static_cast<int>(i), sl);
+  for (uint32_t sl = 0; sl < n->bias_owner.size(); ++sl)
+    if (n->bias_owner[sl] >= 0) place(n->bias_owner[sl], -1, sl);
+  for (auto& kv : shared) {
+    Node::Group g;
+    g.factor = factor(kv.first);
+    for (auto& dm : kv.second) g.masks.emplace_back(dm.first, std::move(dm.second));
+    n->groups.push_back(std::move(g));
+  }
+  return n;
+}
+
 std::unique_ptr<Node> build(Layer* l, bool train, uint32_t slots) {
   auto n = std::make_unique<Node>();
   n->layer = l;
@@ -381,6 +484,23 @@ std::unique_ptr<Node> build(Layer* l, bool train, uint32_t slots) {
   }
   if (dynamic_cast<Bootstrap*>(l)) {
     n->kind = Node::kBoot;
+    return n;
+  }
+  if (auto* rc = dynamic_cast<Recurrent*>(l)) {
+    if (rc->out_scale() != 1.0)
+      throw std::invalid_argument("train: cannot train a recurrent layer with a folded output scale");
+    n->kind = Node::kRecur;
+    n->rec = rc;
+    n->trainable = train;
+    const auto maps = rc->slot_maps();
+    auto add = [&](size_t k) {
+      if (maps[k].w.empty() && maps[k].b.empty()) return -1;
+      n->body.push_back(build_slot_map(rc, maps[k], train, slots));
+      return static_cast<int>(n->body.size()) - 1;
+    };
+    n->rx = add(0);
+    n->rxn = add(1);
+    n->rh = add(2);
     return n;
   }
   if (auto* dr = dynamic_cast<Dropout*>(l)) {
@@ -624,6 +744,166 @@ std::unique_ptr<Node> build(Layer* l, bool train, uint32_t slots) {
   return n;
 }
 
+// ------------------------------------------------- recurrent layers (BPTT)
+
+// Backpropagation through time for a Recurrent layer, on the layer's own
+// slot layout: every token's state in one ciphertext, the gates in regions
+// of R slots (see recurrent.h). The forward pass is the layer's Jacobi
+// iteration with the slot maps as (encrypted) linear nodes; after its n
+// steps the last step's values are exact for every token, and the backward
+// pass needs only those. The adjoint recurrence
+//
+//   dh_t = g_t + W_hh^T dpre_{t+1} (+ z_{t+1} dh_{t+1}, GRU)
+//   dc_t = dh_t o_t tanh'(c_t) + f_{t+1} dc_{t+1}            (LSTM)
+//
+// is triangular the other way round, so the same Jacobi iteration solves
+// it on all tokens at once: n - 1 sweeps (n for the LSTM cell), each one
+// product with per-token coefficients K computed once from the forward
+// values (the series' derivatives at the pre-activations, gates, states),
+// region rotations and the transposed recurrent map. Every
+// coefficient is masked to the state slots, so nothing else reaches the
+// gradient. dpre then gives the gradients of all three maps (one product
+// with their input each) and dL/dx through the input maps' transposes.
+//
+// Ops: the encrypted pass (RecCtxtOps), level planning (RecLevelOps) and
+// the cleartext reference (RecSlotOps), as Recurrent::run.
+template <class Ops>
+struct RecPass {
+  using V = typename Ops::V;
+  Ops& o;
+  const Recurrent& rc;
+  int rx, rxn, rh;  // slot maps 0, 1, 2 (-1: none)
+  // The last step's input, recurrent-map input, pre-activations, gates,
+  // LSTM cell state / previous cell state / its tanh, GRU candidate
+  // argument / candidate / previous state.
+  V x{}, hin{}, pre{}, s{}, c{}, cprev{}, tc{}, tn{}, nn{}, hprev{};
+
+  bool prev() const { return rc.tokens() > 1; }
+  std::vector<V> save() const { return {x, hin, pre, s, c, cprev, tc, tn, nn, hprev}; }
+  void load(const std::vector<V>& v) {
+    x = v[0], hin = v[1], pre = v[2], s = v[3], c = v[4], cprev = v[5], tc = v[6], tn = v[7], nn = v[8], hprev = v[9];
+  }
+  // 1 (or v) on the state slots of tokens [from, to).
+  std::vector<double> mask(int from, int to, double v = 1.0) const {
+    std::vector<double> m(rc.region(), 0.0);
+    for (int t = from; t < to; ++t)
+      for (int j = 0; j < rc.hidden(); ++j) m[static_cast<size_t>(t) * rc.stride() + static_cast<size_t>(j)] = v;
+    return m;
+  }
+
+  V forward(V xin) {
+    using C = Recurrent::Cell;
+    const int64_t R = static_cast<int64_t>(rc.region()), B = static_cast<int64_t>(rc.stride());
+    const int n = rc.tokens();
+    const std::vector<double> m1 = mask(0, n);
+    x = xin;
+    V u = o.lin(rx, x), un{}, h{};
+    if (rc.cell() == C::kGRU) un = o.lin(rxn, x);
+    for (int k = 0; k < n; ++k) {
+      const bool first = k == 0;
+      if (first) {
+        pre = rh >= 0 ? o.bias(rh, u) : u;
+      } else {
+        hin = h;
+        V w = o.lin(rh, hin);
+        pre = o.add(u, w);
+      }
+      if (rc.cell() == C::kRNN) {
+        h = o.series(pre, rc.gate_coeffs());
+        continue;
+      }
+      s = o.series(pre, rc.gate_coeffs());
+      if (rc.cell() == C::kLSTM) {
+        V ig = o.mul(o.mulp(s, rc.gate_mask()), o.twice_minus_one(o.rot(s, 2 * R)));
+        if (first) {
+          c = ig;
+        } else {
+          cprev = o.rot(c, -B);
+          c = o.add(o.mul(o.mulp(o.rot(s, R), m1), cprev), ig);
+        }
+        tc = o.series(c, rc.cell_coeffs());
+        h = o.mul(o.rot(s, 3 * R), tc);
+      } else {
+        tn = o.add(un, o.mul(o.mulp(s, rc.gate_mask()), o.rot(pre, 2 * R)));
+        nn = o.series(tn, rc.cell_coeffs());
+        V d{};
+        if (first) {
+          d = o.neg(nn);
+        } else {
+          hprev = o.rot(h, -B);
+          d = o.sub(hprev, nn);
+        }
+        h = o.add(nn, o.mul(o.mulp(o.rot(s, R), m1), d));
+      }
+    }
+    if (rc.last() && n > 1) h = o.rot(h, static_cast<int64_t>(n - 1) * B);
+    return h;
+  }
+
+  // g = dL/dy; returns dL/dx (when need) and adds the maps' gradients.
+  V backward(V g, bool need) {
+    using C = Recurrent::Cell;
+    const int64_t R = static_cast<int64_t>(rc.region()), B = static_cast<int64_t>(rc.stride());
+    const int n = rc.tokens();
+    const std::vector<double> m1 = mask(0, n), tail = mask(1, n);
+    if (rc.last() && n > 1) g = o.mulp(o.rot(g, -static_cast<int64_t>(n - 1) * B), mask(n - 1, n));
+    const std::vector<double> dgate = chebyshev_derivative(rc.gate_coeffs(), -1.0, 1.0);
+    const V sp = o.series(pre, dgate);  // the gate series' derivative at every pre-activation
+    V dpre{}, dun{};
+    if (rc.cell() == C::kRNN) {
+      const V K = o.mulp(sp, m1);
+      V d = g;
+      for (int it = 1; it < n; ++it) d = o.add(g, o.lin_t(rh, o.mul(K, d)));
+      dpre = o.mul(K, d);
+    } else if (rc.cell() == C::kGRU) {
+      const std::vector<double> mh = mask(0, n, rc.hn_scale());
+      const std::vector<double> dcell = chebyshev_derivative(rc.cell_coeffs(), -1.0, 1.0);
+      const V z = o.mulp(o.rot(s, R), m1);
+      const V Kn = o.mul(o.mulp(o.series(tn, dcell), m1), o.addp(o.neg(z), m1));  // (1 - z) tanh'
+      const V Kr = o.mul(o.mul(Kn, o.mulp(o.rot(pre, 2 * R), mh)), sp);
+      const V Kz = o.mul(o.mulp(o.rot(sp, R), m1), prev() ? o.sub(hprev, nn) : o.neg(nn));
+      const V Kh = o.mul(Kn, o.mulp(s, mh));
+      const V Z = o.mulp(o.rot(s, R), tail);
+      auto P = [&](const V& d) {
+        return o.add(o.add(o.mul(Kr, d), o.rot(o.mul(Kz, d), -R)), o.rot(o.mul(Kh, d), -2 * R));
+      };
+      V d = g;
+      for (int it = 1; it < n; ++it) d = o.add(o.add(g, o.rot(o.mul(Z, d), B)), o.lin_t(rh, P(d)));
+      dpre = P(d);
+      dun = o.mul(Kn, d);
+    } else {
+      const std::vector<double> dcell = chebyshev_derivative(rc.cell_coeffs(), -1.0, 1.0);
+      const V M = o.mul(o.mulp(o.rot(s, 3 * R), m1), o.series(c, dcell));  // o tanh'(c)
+      const V F = o.mulp(o.rot(s, R), tail);
+      const V Ki = o.mul(o.mulp(o.twice_minus_one(o.rot(s, 2 * R)), rc.gate_mask()), sp);
+      V Kf{};
+      if (prev()) Kf = o.mul(cprev, o.mulp(o.rot(sp, R), m1));
+      std::vector<double> mg = rc.gate_mask();
+      for (double& v : mg) v *= 2.0;
+      const V Kg = o.mul(o.mulp(s, mg), o.rot(sp, 2 * R));
+      const V Ko = o.mul(tc, o.mulp(o.rot(sp, 3 * R), m1));
+      auto P = [&](const V& dc, const V& dh) {
+        V a = o.add(o.mul(Ki, dc), o.rot(o.mul(Kg, dc), -2 * R));
+        if (prev()) a = o.add(a, o.rot(o.mul(Kf, dc), -R));
+        return o.add(a, o.rot(o.mul(Ko, dh), -3 * R));
+      };
+      V dh = g, dc{};
+      for (int k = 1; k <= n; ++k) {
+        dc = k == 1 ? o.mul(M, dh) : o.add(o.mul(M, dh), o.rot(o.mul(F, dc), B));
+        if (k < n) dh = o.add(g, o.lin_t(rh, P(dc, dh)));
+      }
+      dpre = P(dc, dh);
+    }
+    o.grad(rx, dpre, x);
+    if (rxn >= 0) o.grad(rxn, dun, x);
+    if (rh >= 0) o.grad(rh, dpre, hin);
+    if (!need) return V{};
+    V dx = o.lin_t(rx, dpre);
+    if (rxn >= 0) dx = o.add(dx, o.lin_t(rxn, dun));
+    return dx;
+  }
+};
+
 // ----------------------------------------------------------- level planning
 
 // Mirrors the encrypted step with integer levels. w = level of the weights.
@@ -725,6 +1005,33 @@ uint32_t sim_batchnorm_forward(Sim& s, const Node& n, uint32_t x, std::pair<uint
   return s.see(std::max(xh, aff) + 1);
 }
 
+// RecPass on levels: the encrypted pass's levels from the input level (no
+// level budget; gradients move s.new_w as linear layers do).
+struct RecLevelOps {
+  using V = uint32_t;
+  Sim& s;
+  const Node& n;
+  const Node& map(int w) const { return *n.body[static_cast<size_t>(w)]; }
+  V lin(int w, V x) { return s.see(std::max(x, map(w).trainable ? s.w : x) + 1); }
+  V lin_t(int w, V g) { return lin(w, g); }
+  void grad(int w, V g, V x) {
+    const Node& m = map(w);
+    if (!m.trainable) return;
+    const uint32_t upd = s.see(s.see(std::max(g, x) + 1) + (m.groups.empty() ? 1 : 2));
+    s.new_w = std::max(s.new_w, std::max(s.w, upd));
+  }
+  V bias(int w, V u) { return map(w).trainable && !map(w).bias.empty() ? std::max(u, s.w) : u; }
+  V add(V a, V b) { return std::max(a, b); }
+  V sub(V a, V b) { return std::max(a, b); }
+  V neg(V a) { return a; }
+  V mul(V a, V b) { return s.see(std::max(a, b) + 1); }
+  V mulp(V a, const std::vector<double>&) { return s.see(a + 1); }
+  V addp(V a, const std::vector<double>&) { return a; }
+  V rot(V a, int64_t) { return a; }
+  V series(V a, const std::vector<double>& c) { return s.see(a + poly_depth(static_cast<uint32_t>(c.size() - 1))); }
+  V twice_minus_one(V a) { return a; }
+};
+
 uint32_t sim_forward(Sim& s, const std::vector<std::unique_ptr<Node>>& nodes, uint32_t x, SimTrace& tr) {
   tr.in.assign(nodes.size(), 0);
   tr.body.assign(nodes.size(), {});
@@ -753,6 +1060,12 @@ uint32_t sim_forward(Sim& s, const std::vector<std::unique_ptr<Node>>& nodes, ui
       case Node::kCheb: x = s.see(x + n.layer->depth()); break;
       case Node::kBoot: x = std::min(x, 0u); break;  // levels are relative to a fresh bootstrap
       case Node::kResidual: x = std::max(sim_forward(s, n.body, x, tr.body[i]), x); break;
+      case Node::kRecur: {
+        RecLevelOps o{s, n};
+        RecPass<RecLevelOps> p{o, *n.rec, n.rx, n.rxn, n.rh};
+        x = p.forward(x);
+        break;
+      }
     }
   }
   return x;
@@ -836,6 +1149,13 @@ uint32_t sim_backward(Sim& s, const std::vector<std::unique_ptr<Node>>& nodes, c
         break;
       case Node::kBoot: g = std::min(g, 0u); break;
       case Node::kResidual: g = std::max(sim_backward(s, n.body, tr.body[k], g), g); break;
+      case Node::kRecur: {
+        RecLevelOps o{s, n};
+        RecPass<RecLevelOps> p{o, *n.rec, n.rx, n.rxn, n.rh};
+        p.forward(z);
+        g = p.backward(g, true);
+        break;
+      }
     }
   }
   return g;
@@ -869,7 +1189,20 @@ void collect_rotations(const std::vector<std::unique_ptr<Node>>& nodes, uint32_t
     if (m) r.insert(m);
   };
   for (const auto& n : nodes) {
-    if (n->kind == Node::kResidual || n->kind == Node::kAttn) collect_rotations(n->body, slots, r, allsum);
+    if (n->kind == Node::kResidual || n->kind == Node::kAttn || n->kind == Node::kRecur)
+      collect_rotations(n->body, slots, r, allsum);
+    if (n->kind == Node::kRecur) {
+      // Gate regions, the token shift and its adjoint, the last state.
+      const int64_t R = static_cast<int64_t>(n->rec->region()), B = static_cast<int64_t>(n->rec->stride());
+      for (int64_t g = 1; g < 4; ++g) {
+        add(g * R);
+        add(-g * R);
+      }
+      add(B);
+      add(-B);
+      add(static_cast<int64_t>(n->rec->tokens() - 1) * B);
+      add(-static_cast<int64_t>(n->rec->tokens() - 1) * B);
+    }
     if (n->kind == Node::kNorm)
       for (int32_t k : n->norm->rotation_indices()) add(k);
     if (n->kind == Node::kBatchNorm)
@@ -916,7 +1249,7 @@ void collect_rotations(const std::vector<std::unique_ptr<Node>>& nodes, uint32_t
 template <typename F>
 void for_each_weighted(std::vector<std::unique_ptr<Node>>& nodes, F f) {
   for (auto& n : nodes) {
-    if (n->kind == Node::kResidual || n->kind == Node::kAttn) for_each_weighted(n->body, f);
+    if (n->kind == Node::kResidual || n->kind == Node::kAttn || n->kind == Node::kRecur) for_each_weighted(n->body, f);
     if (n->kind == Node::kLinear || n->kind == Node::kNorm || n->kind == Node::kBatchNorm) f(*n);
   }
 }
@@ -924,7 +1257,7 @@ void for_each_weighted(std::vector<std::unique_ptr<Node>>& nodes, F f) {
 template <typename F>
 void for_each_weighted(const std::vector<std::unique_ptr<Node>>& nodes, F f) {
   for (const auto& n : nodes) {
-    if (n->kind == Node::kResidual || n->kind == Node::kAttn) for_each_weighted(n->body, f);
+    if (n->kind == Node::kResidual || n->kind == Node::kAttn || n->kind == Node::kRecur) for_each_weighted(n->body, f);
     if (n->kind == Node::kLinear || n->kind == Node::kNorm || n->kind == Node::kBatchNorm) f(*n);
   }
 }
@@ -957,19 +1290,24 @@ Ctxt linear_forward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt x) {
   return y;
 }
 
-// dL/dD_i = g (*) rot_i(x) summed over the batch; returns dL/dx when asked.
-Ctxt linear_backward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt g, bool need) {
+// dL/dD_i += g (*) rot_i(x) (summed over the batch), dL/dB += g; x null:
+// the bias only.
+void linear_gradient(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt g, Ctxt x) {
+  if (!n.trainable) return;
   const CC& cc = ctx.cc();
   rf.fit(g, 1);
-  if (n.trainable) {
-    rf.fit(n.in, 1);
-    const std::vector<Ctxt> rot = ctx.rotate_many(n.in, n.offs);
+  if (x && !n.offs.empty()) {
+    rf.fit(x, 1);
+    const std::vector<Ctxt> rot = ctx.rotate_many(x, n.offs);
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
     for (size_t i = 0; i < n.offs.size(); ++i) add_to(ctx, n.gD[i], cc->EvalMult(g, rot[i]));
-    if (n.B) add_to(ctx, n.gB, g);
   }
-  n.in = nullptr;
-  if (!need) return nullptr;
+  if (n.B) add_to(ctx, n.gB, g);
+}
+
+// The transposed map applied to g (g fitted by the caller).
+Ctxt linear_transpose(const FHEContext& ctx, const Node& n, const Ctxt& g) {
+  const CC& cc = ctx.cc();
   std::vector<Ctxt> terms(n.offs.size());
   if (!n.trainable) {
     // rot_{-o}(g * diag) = rot_{-o}(g) * rot_{-o}(diag): the rotations all
@@ -991,6 +1329,73 @@ Ctxt linear_backward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt g, bool n
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
   for (size_t i = 0; i < n.offs.size(); ++i) terms[i] = ctx.rotate(cc->EvalMult(n.D[i], g), -n.offs[i]);
   return sum(ctx, std::move(terms));
+}
+
+// dL/dD_i = g (*) rot_i(x) summed over the batch; returns dL/dx when asked.
+Ctxt linear_backward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt g, bool need) {
+  rf.fit(g, 1);
+  linear_gradient(ctx, rf, n, g, n.in);
+  n.in = nullptr;
+  return need ? linear_transpose(ctx, n, g) : nullptr;
+}
+
+// RecPass on ciphertexts: the slot maps through the linear nodes, every
+// operand fitted to the level budget first.
+struct RecCtxtOps {
+  using V = Ctxt;
+  const FHEContext& ctx;
+  Refresh& rf;
+  Node& n;
+  const CC& cc() const { return ctx.cc(); }
+  Node& map(int w) { return *n.body[static_cast<size_t>(w)]; }
+  V lin(int w, V x) { return linear_forward(ctx, rf, map(w), x); }
+  V lin_t(int w, V g) {
+    rf.fit(g, 1);
+    return linear_transpose(ctx, map(w), g);
+  }
+  void grad(int w, V g, V x) { linear_gradient(ctx, rf, map(w), g, x); }
+  V bias(int w, V u) {
+    Node& m = map(w);
+    if (m.trainable && m.B) return cc()->EvalAdd(u, m.B);
+    return m.bias.empty() ? u : add_plain(ctx, u, m.bias);
+  }
+  V add(const V& a, const V& b) { return cc()->EvalAdd(a, b); }
+  V sub(const V& a, const V& b) { return cc()->EvalSub(a, b); }
+  V neg(const V& a) { return cc()->EvalNegate(a); }
+  V mul(V a, V b) {
+    rf.fit(a, 1);
+    rf.fit(b, 1);
+    return cc()->EvalMult(a, b);
+  }
+  V mulp(V a, const std::vector<double>& p) {
+    rf.fit(a, 1);
+    return mul_plain(ctx, a, p);
+  }
+  V addp(const V& a, const std::vector<double>& p) { return add_plain(ctx, a, p); }
+  V rot(const V& a, int64_t k) { return ctx.rotate(a, normalize_rotation(k, ctx.slots())); }
+  V series(V a, const std::vector<double>& c) {
+    rf.fit(a, poly_depth(static_cast<uint32_t>(c.size() - 1)));
+    std::vector<double> cc_ = c;
+    return cc()->EvalChebyshevSeries(a, cc_, -1.0, 1.0);
+  }
+  V twice_minus_one(const V& a) { return cc()->EvalSub(cc()->EvalAdd(a, a), 1.0); }
+};
+
+Ctxt recurrent_forward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt x) {
+  RecCtxtOps o{ctx, rf, n};
+  RecPass<RecCtxtOps> p{o, *n.rec, n.rx, n.rxn, n.rh};
+  Ctxt y = p.forward(x);
+  n.rs = p.save();
+  for (auto& m : n.body) m->in = nullptr;  // the pass keeps its own inputs
+  return y;
+}
+
+Ctxt recurrent_backward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt g, bool need) {
+  RecCtxtOps o{ctx, rf, n};
+  RecPass<RecCtxtOps> p{o, *n.rec, n.rx, n.rxn, n.rh};
+  p.load(n.rs);
+  n.rs.clear();
+  return p.backward(g, need);
 }
 
 // Sum of the slots c .. c+width-1 into slot c (the token or head window),
@@ -1344,6 +1749,7 @@ Ctxt forward_node(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt x) {
       rf.fit(r, 1);
       return bn_affine(ctx, rf, n, ctx.cc()->EvalMult(c, r));
     }
+    case Node::kRecur: return recurrent_forward(ctx, rf, n, x);
     case Node::kResidual: {
       n.in = x;
       Ctxt y = forward_nodes(ctx, rf, n.body, x);
@@ -1428,6 +1834,7 @@ Ctxt backward_node(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt g, bool nee
       return need ? g : nullptr;
     case Node::kBoot:
       return need ? ctx.bootstrap(g) : nullptr;
+    case Node::kRecur: return recurrent_backward(ctx, rf, n, g, need);
     default:
       throw std::logic_error("backward_node: " + n.layer->type() + " goes through backward_batch");
   }
@@ -1451,6 +1858,7 @@ void swap_state(Node& n, Node::Sample& s) {
   n.A.swap(s.A);
   n.pick_b.swap(s.pick_b);
   n.pick_a.swap(s.pick_a);
+  n.rs.swap(s.rs);
   if (n.kind == Node::kAttn) {
     s.body.resize(n.body.size());
     for (size_t i = 0; i < n.body.size(); ++i) swap_state(*n.body[i], s.body[i]);
@@ -1636,7 +2044,7 @@ void update_linear(const FHEContext& ctx, Refresh& rf, Node& n, double step) {
     std::vector<Ctxt> parts;
     for (const auto& dm : g.masks) parts.push_back(mul_plain(ctx, dm.first < 0 ? n.gB : n.gD[static_cast<size_t>(dm.first)], dm.second));
     Ctxt total = allsum(ctx, sum(ctx, std::move(parts)));
-    for (const auto& dm : g.masks) contrib[gi].push_back(mul_plain(ctx, total, scaled(dm.second, step)));
+    for (const auto& dm : g.masks) contrib[gi].push_back(mul_plain(ctx, total, scaled(dm.second, step * g.factor)));
   }
   for (size_t gi = 0; gi < n.groups.size(); ++gi)
     for (size_t j = 0; j < n.groups[gi].masks.size(); ++j) {
@@ -1955,6 +2363,121 @@ std::vector<std::vector<double>> plain_forward(const std::vector<std::shared_ptr
   return xs;
 }
 
+// RecPass on cleartext slot vectors: the reference of the encrypted pass,
+// with the parameters' gradients (not the scaled slot values').
+struct RecSlotOps {
+  using V = std::vector<double>;
+  const std::array<Recurrent::SlotMap, 3>& maps;
+  const std::vector<double>& p;
+  std::vector<double>* grads;  // null: frozen
+  std::vector<int> index;      // RecPass map index -> maps[]
+  size_t slots;
+
+  const Recurrent::SlotMap& map(int w) const { return maps[static_cast<size_t>(index[static_cast<size_t>(w)])]; }
+  double val(int q) const { return p[static_cast<size_t>(q)]; }
+  static double at(const V& v, size_t i) { return i < v.size() ? v[i] : 0.0; }
+  V lin(int w, const V& x) {
+    V y(slots, 0.0);
+    for (const auto& e : map(w).w) y[e.row] += val(e.param) * e.scale * x[e.col];
+    return bias(w, y);
+  }
+  V lin_t(int w, const V& g) {
+    V y(slots, 0.0);
+    for (const auto& e : map(w).w) y[e.col] += val(e.param) * e.scale * g[e.row];
+    return y;
+  }
+  void grad(int w, const V& g, const V& x) {
+    if (!grads) return;
+    std::vector<double>& gr = *grads;
+    if (!x.empty())
+      for (const auto& e : map(w).w) gr[static_cast<size_t>(e.param)] += e.scale * g[e.row] * x[e.col];
+    for (const auto& b : map(w).b) {
+      const double d = b.scale * g[b.row];
+      gr[static_cast<size_t>(b.param)] += d;
+      if (b.pair >= 0) gr[static_cast<size_t>(b.pair)] += d;
+    }
+  }
+  V bias(int w, V u) {
+    for (const auto& b : map(w).b) u[b.row] += (val(b.param) + (b.pair >= 0 ? val(b.pair) : 0.0)) * b.scale;
+    return u;
+  }
+  V add(const V& a, const V& b) {
+    V y(a);
+    for (size_t i = 0; i < y.size(); ++i) y[i] += b[i];
+    return y;
+  }
+  V sub(const V& a, const V& b) {
+    V y(a);
+    for (size_t i = 0; i < y.size(); ++i) y[i] -= b[i];
+    return y;
+  }
+  V neg(const V& a) {
+    V y(a);
+    for (double& v : y) v = -v;
+    return y;
+  }
+  V mul(const V& a, const V& b) {
+    V y(a);
+    for (size_t i = 0; i < y.size(); ++i) y[i] *= b[i];
+    return y;
+  }
+  V mulp(const V& a, const std::vector<double>& m) {
+    V y(a);
+    for (size_t i = 0; i < y.size(); ++i) y[i] *= at(m, i);
+    return y;
+  }
+  V addp(const V& a, const std::vector<double>& m) {
+    V y(a);
+    for (size_t i = 0; i < y.size(); ++i) y[i] += at(m, i);
+    return y;
+  }
+  V rot(const V& a, int64_t k) {
+    const int64_t n = static_cast<int64_t>(a.size());
+    V y(a.size());
+    for (int64_t i = 0; i < n; ++i) y[static_cast<size_t>(i)] = a[static_cast<size_t>((((i + k) % n) + n) % n)];
+    return y;
+  }
+  V series(const V& a, const std::vector<double>& c) {
+    V y(a.size());
+    for (size_t i = 0; i < a.size(); ++i) y[i] = chebyshev_eval(c, -1.0, 1.0, a[i]);
+    return y;
+  }
+  V twice_minus_one(const V& a) {
+    V y(a);
+    for (double& v : y) v = 2.0 * v - 1.0;
+    return y;
+  }
+};
+
+std::vector<double> plain_recurrent_backward(Recurrent* rc, bool train, const std::vector<double>& x,
+                                             const std::vector<double>& g, Grads& grads) {
+  const auto maps = rc->slot_maps();
+  const std::vector<double> p = rc->params();
+  std::vector<double>* gr = nullptr;
+  if (train) {
+    auto& v = grads[rc];
+    if (v.empty()) v.assign(p.size(), 0.0);
+    gr = &v;
+  }
+  const size_t slots = rc->plain_slots();
+  RecSlotOps o{maps, p, gr, {}, slots};
+  int ids[3] = {-1, -1, -1};
+  for (size_t k = 0; k < 3; ++k)
+    if (!maps[k].w.empty() || !maps[k].b.empty()) {
+      ids[k] = static_cast<int>(o.index.size());
+      o.index.push_back(static_cast<int>(k));
+    }
+  RecPass<RecSlotOps> pass{o, *rc, ids[0], ids[1], ids[2]};
+  std::vector<double> xs(slots, 0.0), gs(slots, 0.0);
+  for (size_t i = 0; i < x.size(); ++i) xs[rc->in_layout().slot(rc->in_shape(), i)] = x[i];
+  for (size_t i = 0; i < g.size(); ++i) gs[rc->out_layout().slot(rc->out_shape(), i)] = g[i];
+  pass.forward(xs);
+  const std::vector<double> dx = pass.backward(gs, true);
+  std::vector<double> gx(x.size());
+  for (size_t i = 0; i < x.size(); ++i) gx[i] = dx[rc->in_layout().slot(rc->in_shape(), i)];
+  return gx;
+}
+
 void plain_backward(const std::vector<std::shared_ptr<Layer>>& layers, size_t from, const std::vector<char>& train,
                     const PlainTrace& tr, std::vector<std::vector<double>>& gs, Grads& grads) {
   for (size_t k = layers.size(); k-- > from;) {
@@ -1979,7 +2502,9 @@ void plain_backward(const std::vector<std::shared_ptr<Layer>>& layers, size_t fr
     for (size_t b = 0; b < gs.size(); ++b) {
       const std::vector<double>& x = tr.in[k][b];
       std::vector<double>& g = gs[b];
-      if (auto* lin = dynamic_cast<LinearLayer*>(l)) {
+      if (auto* rc = dynamic_cast<Recurrent*>(l)) {
+        g = plain_recurrent_backward(rc, train[k], x, g, grads);
+      } else if (auto* lin = dynamic_cast<LinearLayer*>(l)) {
         g = plain_linear_backward(lin, train[k], x, g, grads);
       } else if (auto* ln = dynamic_cast<LayerNorm*>(l)) {
         g = plain_layernorm_backward(ln, train[k], x, g, grads);
@@ -2056,6 +2581,10 @@ uint32_t Trainer::min_level_budget() const {
           }
           break;
         case Node::kResidual: walk(n.body); break;
+        case Node::kRecur:
+          m = std::max({m, poly_depth(n.rec->degree()),
+                        n.rec->cell() == Recurrent::Cell::kRNN ? 0u : poly_depth(n.rec->cell_degree())});
+          break;
         default: break;
       }
     }
@@ -2336,8 +2865,17 @@ void Trainer::decrypt_weights(const FHEContext& ctx) {
     for (size_t i = 0; i < n.offs.size(); ++i) take(n.D[i], n.owner[i]);
     if (n.B) take(n.B, n.bias_owner);
     // Shared weights hold the same value in every slot (up to CKKS noise).
+    const std::vector<double> old = p;
     for (size_t k = 0; k < p.size(); ++k)
-      if (count[k] > 0) p[k] = total[k] / count[k];
+      if (count[k] > 0) p[k] = total[k] / count[k] / (n.pscale.empty() ? 1.0 : n.pscale[k]);
+    // A slot holding b_ih + b_hh: both moved by the same steps.
+    for (size_t k = 0; k < n.ppair.size(); ++k)
+      if (count[k] > 0 && n.ppair[k] >= 0) {
+        const size_t q = static_cast<size_t>(n.ppair[k]);
+        const double half = 0.5 * (p[k] - old[k] - old[q]);
+        p[k] = old[k] + half;
+        p[q] = old[q] + half;
+      }
     n.layer->set_params(p);
   });
   for_each_attention(nodes_, [](Node& n) { n.att->set_params(n.att->params()); });
