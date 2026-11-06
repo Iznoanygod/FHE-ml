@@ -1090,6 +1090,23 @@ the text models), which training cannot rule out for unseen data. With
 (logit errors around 5e-2); with 59 bits values near 1 occasionally wrap
 around in the bootstrap, so the script uses 55 (`--scale-bits`).
 
+### Training recurrent layers
+
+`Trainer` trains recurrent layers by backpropagation through time, on
+encrypted sequences and weights, with the same `make_trainer` /
+`train_step` calls as any other network. The backward pass solves the
+adjoint recurrence the way the forward pass solves the recurrence: all
+tokens at once, n − 1 sweeps for a sequence of n tokens (n for the LSTM's
+cell state), each about two levels (see
+[docs/DESIGN.md](docs/DESIGN.md#recurrent-layers)). The gradients are those
+of the series the layer evaluates, so `train_plain` matches torch autograd
+through `fheml.nn.RNN` / `GRU` / `LSTM` to about 1e-10, and the encrypted
+step matches `train_plain` to about 1e-8 (`tests/test_train.py`). A whole
+step is deep: 25 levels for a 3-token RNN and about 50 for a 3-token GRU or
+LSTM at degree 9, so long sequences train with a level budget
+(`make_trainer(..., level_budget=...)`), which bootstraps the states and
+gradients inside the step.
+
 ## Detection and segmentation on COCO
 
 `examples/python/coco_cnn.py` takes a CNN on COCO 2017 from the image to the
@@ -1183,9 +1200,11 @@ trainer.decrypt_weights(ctx)                             # key holder: trained w
 
 * **What trains:** conv2d (grouped, depthwise, dilated, 1-D), convtranspose2d,
   dense, tokendense and affine weights and biases,
-  layernorm's and batchnorm's gamma and beta, and the four projections of attention
+  layernorm's and batchnorm's gamma and beta, the four projections of attention
   (quadratic or softmax scores, any number of heads, masked and segmented),
-  with shared weights handled exactly. Gradients flow through square, poly,
+  and the weights and biases of RNN, GRU and LSTM layers (backpropagation
+  through time, see [Recurrent networks](#recurrent-networks)), with shared
+  weights handled exactly. Gradients flow through square, poly,
   chebyshev, exact ReLU, upsampling, average and max pooling, token mean,
   layernorm, batchnorm, dropout, attention, residual and bootstrap layers.
   Exact ReLU keeps its comparison bit from the forward pass and multiplies

@@ -381,6 +381,32 @@ over n tokens laid out like a transformer's (token t at slots t·B + j).
   5-level stretch the RNN needs one bootstrap per step, GRU and LSTM three.
   `place_bootstraps` folds scales through the layer: an input scale into
   W_ih, an output scale into the last step's series or masks.
+- **Training: backpropagation through time on the same layout.** The
+  `Trainer` keeps the three slot maps (input projection, the GRU candidate's
+  input projection, the token-shifted recurrent map;
+  `Recurrent::slot_maps`) as ordinary diagonal-ciphertext linear nodes. Each
+  weight is shared by every token's slots, so its gradient is a masked
+  rotate-and-sum like a convolution tap's. The slots hold the weights
+  divided by their series interval, so the update masks carry the square
+  of that factor and the step is SGD on torch's parameters; a bias slot
+  holding b_ih + b_hh takes both parameters' steps. The forward pass is
+  the inference iteration above, and its last step's values are exact for
+  every token. The adjoint recurrence runs the other way (dh_t needs
+  dpre_{t+1}; for the LSTM dc_t needs f_{t+1} dc_{t+1}; for the GRU dh_t
+  also gets z_{t+1} dh_{t+1}). It is again triangular, so the same Jacobi
+  iteration solves it on all tokens at once in n − 1 sweeps (n for the LSTM
+  cell). Each sweep is one product with per-token coefficients, a few
+  region rotations and the transposed recurrent map, about 2 levels (3 for
+  the LSTM). The coefficients are computed once from the forward values:
+  the gate series' derivative at the pre-activations, the gates, the
+  previous states and the cell series' derivative, each masked to the
+  state slots. The three maps' gradients are then one product each with
+  their inputs, and dL/dx goes through the input maps' transposes. As in
+  inference, one description (`RecPass` in src/train.cpp) runs on
+  ciphertexts, on level counters (the step's depth) and on cleartext slots
+  (`train_plain`). `tests/test_train.py` checks `train_plain` against torch
+  autograd through `fheml.nn.RNN` / `GRU` / `LSTM` (to about 1e-10), and the
+  encrypted step against `train_plain` (to about 1e-8).
 
 ## Encrypted weights
 
@@ -784,7 +810,8 @@ All of the following are tested under encryption:
   and Adam / AdamW updates on encrypted data, weights and optimizer state
   match the plaintext optimizers, with and without bootstrapping; this
   includes layer norm (gamma, beta), batch norm (batch statistics and running
-  statistics), dropout, attention (quadratic or softmax scores, masked and
+  statistics), dropout, recurrent layers (RNN, GRU, LSTM, backpropagation
+  through time), attention (quadratic or softmax scores, masked and
   segmented), whose backward passes reuse the forward's rotations and masks,
   and exact max pooling and ReLU, whose backward passes reuse the forward's
   comparison bits.

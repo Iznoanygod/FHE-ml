@@ -162,4 +162,33 @@ if torch is not None:
                   np.abs(np.subtract(a.running_var, b.running_var)).max() for a, b in bns)
     print(f"batch norm + dropout: max weight error {err:.1e}, running statistics {run_err:.1e}")
     assert err < 1e-4 and run_err < 1e-4
+
+    # Recurrent layers train by backpropagation through time: torch's
+    # autograd through the same series (fheml.nn.GRU / LSTM) gives the
+    # reference SGD step, which train_plain and the encrypted step match.
+    for cls in (hnn.RNN, hnn.GRU, hnn.LSTM):
+        torch.manual_seed(4)
+        T, I, H = 3, 2, 3
+        model = nn.Sequential(cls(I, H, last=True), nn.Linear(H, 2)).double()
+        enc, ref = (fheml.from_torch(model, (T, I)) for _ in range(2))
+        for n in (enc, ref):
+            n.compile()
+        xb, tb = rng.uniform(-1, 1, (2, T, I)), rng.uniform(-1, 1, (2, 2))
+        opt = torch.optim.SGD(model.parameters(), lr=0.5)
+        loss = 0.5 * ((model(torch.as_tensor(xb)) - torch.as_tensor(tb)) ** 2).sum() / len(xb)
+        loss.backward()
+        opt.step()
+        rec = model[0]
+        wih = np.zeros((rec.weight_ih.shape[0], ref.input_shape.w))  # the exporter pads tokens to the stride
+        wih[:, :I] = rec.weight_ih.detach().numpy()
+        want = np.concatenate([wih.ravel(), *(p.detach().numpy().ravel() for p in (rec.weight_hh, rec.bias_ih, rec.bias_hh))])
+        fheml.train_plain(ref, [fheml._prepare(ref, x) for x in xb], tb, lr=0.5)
+        torch_err = np.abs(np.asarray(ref.layers[0].params()) - want).max()
+        trainer, ctx = fheml.make_trainer(enc, secure=False, bootstrapping=False)
+        trainer.encrypt_weights(ctx)
+        fheml.train_step(trainer, ctx, [fheml._prepare(enc, x) for x in xb], tb, lr=0.5)
+        trainer.decrypt_weights(ctx)
+        err = np.abs(params(enc) - params(ref)).max()
+        print(f"{cls.__name__:4s} BPTT: train_plain vs torch autograd {torch_err:.1e}, encrypted vs train_plain {err:.1e}")
+        assert torch_err < 1e-9 and err < 1e-4
 print("PASSED")
