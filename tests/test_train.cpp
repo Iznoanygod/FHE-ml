@@ -123,6 +123,75 @@ Network multiplexed_cnn(unsigned seed) {
   return n;
 }
 
+// Depthwise dilated conv (shared taps per channel), a transposed conv and
+// bilinear upsampling (fixed) before the head.
+Network conv_variants(unsigned seed) {
+  Rng r(seed);
+  ConvGeometry dw;
+  dw.stride = 2;
+  dw.pad_h = dw.pad_w = 2;
+  dw.dil_h = dw.dil_w = 2;
+  dw.groups = 2;
+  ConvGeometry up;
+  up.stride = 2;
+  up.pad_h = up.pad_w = 1;
+  up.out_pad_h = up.out_pad_w = 1;
+  Network n(Shape{2, 6, 6});
+  n.emplace<Conv2d>(2, 2, 3, 3, dw, r.vec(18, 0.4), r.vec(2, 0.1))
+      .emplace<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25})
+      .emplace<ConvTranspose2d>(2, 1, 3, 3, up, r.vec(18, 0.4), r.vec(1, 0.1))
+      .emplace<Upsample>("bilinear", 3, 3)
+      .emplace<Dense>(9, 2, r.vec(18, 0.3), r.vec(2, 0.1));
+  return n;
+}
+
+// Conv1d over a (C, L) = (3, 8) signal.
+Network conv1d(unsigned seed) {
+  Rng r(seed);
+  ConvGeometry g;
+  g.pad_w = 1;
+  Network n(Shape{3, 1, 8});
+  n.emplace<Conv2d>(3, 2, 1, 3, g, r.vec(18, 0.4), r.vec(2, 0.1))
+      .emplace<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25})
+      .emplace<Dense>(16, 2, r.vec(32, 0.3), r.vec(2, 0.1));
+  return n;
+}
+
+// Batch norm with batch statistics: per channel over a conv's 4x4 maps,
+// and over the features of a vector.
+std::shared_ptr<BatchNorm> batchnorm(size_t c, Rng& r) {
+  std::vector<double> gamma(c), mean = r.vec(c, 0.1), var(c);
+  for (double& g : gamma) g = 1.0 + r.vec(1, 0.3)[0];
+  for (double& v : var) v = 1.0 + r.vec(1, 0.3)[0];
+  return std::make_shared<BatchNorm>(gamma, r.vec(c, 0.2), mean, var, 0.1, 0.1, 0.0, 2.0, 31, 1);
+}
+
+Network bn_cnn(unsigned seed) {
+  Rng r(seed);
+  Network n(Shape{1, 4, 4});
+  n.emplace<Conv2d>(1, 2, 3, 3, 1, 1, r.vec(18, 0.4), r.vec(2, 0.1))
+      .add(batchnorm(2, r))
+      .emplace<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25})
+      .emplace<Dense>(32, 4, r.vec(128, 0.2), r.vec(4, 0.1))
+      .add(batchnorm(4, r))
+      .emplace<Square>()
+      .emplace<Dense>(4, 2, r.vec(8, 0.4), r.vec(2, 0.1));
+  return n;
+}
+
+// Dropout before an activation and inside a residual block.
+Network dropout_mlp(unsigned seed) {
+  Rng r(seed);
+  Layers body = {std::make_shared<Dense>(5, 5, r.vec(25, 0.3), r.vec(5, 0.1)), std::make_shared<Dropout>(0.4, 9)};
+  Network n(Shape{6, 1, 1});
+  n.emplace<Dense>(6, 5, r.vec(30, 0.4), r.vec(5, 0.1))
+      .add(std::make_shared<Dropout>(0.3, 7))
+      .emplace<PolyActivation>(std::vector<double>{0.0, 0.5, 0.25})
+      .add(std::make_shared<Residual>(body))
+      .emplace<Dense>(5, 2, r.vec(10, 0.4), r.vec(2, 0.1));
+  return n;
+}
+
 // conv -> exact max pool (scheme switching) -> poly -> dense. Small conv
 // weights keep the pooled values inside the comparison range.
 Network pool_cnn(unsigned seed) {
@@ -227,6 +296,60 @@ Network attention_tokens(unsigned seed, bool softmax, bool subtract_max = false)
   return n;
 }
 
+// Encoder-decoder shape: tokens 0-1 are the source (segment 0), 2-3 the
+// target (segment 1) with their own token, layer-norm and attention weights.
+// The source attends to itself, the target to the source and causally to
+// itself (masked offsets, as in inference).
+Network encdec_tokens(unsigned seed, bool softmax) {
+  Rng r(seed);
+  const int t = 4, d = 8;
+  const std::vector<int> seg = {0, 0, 1, 1};
+  std::vector<double> mask(t * t, 0.0);
+  for (int i = 0; i < t; ++i)
+    for (int j = 0; j < t; ++j) mask[i * t + j] = (j < 2 && (i >= 2 || j <= 1)) || (i >= 2 && j >= 2 && j <= i);
+  const std::vector<double> w = r.vec(2 * 40, 0.4), b = r.vec(t * d, 0.1);
+  Network prefix(Shape{t, 1, 5});
+  prefix.emplace<TokenDense>(t, 5, d, w, b, seg);
+  prefix.compile();
+  auto base = layernorm(t, d, r, prefix);
+  std::vector<double> gamma = base->gamma(), beta = base->beta();
+  for (int j = 0; j < d; ++j) {
+    gamma.push_back(1.0 + r.vec(1, 0.4)[0]);
+    beta.push_back(r.vec(1, 0.2)[0]);
+  }
+  auto ln = std::make_shared<LayerNorm>(t, d, gamma, beta, 0.05, base->var_min(), base->var_max(), 31, 1, seg);
+  auto wv = [&](double sc) { return r.vec(2 * d * d, sc); };
+  auto bv = [&] { return r.vec(t * d, 0.1); };
+  auto at = std::make_shared<Attention>(t, d, wv(0.2), wv(0.2), wv(0.2), wv(0.2), bv(), bv(), bv(), bv(),
+                                        std::vector<double>{4.0 / (8 * t), 4.0 / (8 * t), 1.0 / (8 * t)}, 2, seg, mask);
+  if (softmax) {
+    SoftmaxOptions o;
+    o.lo = -1.5;
+    o.hi = 1.5;
+    o.exp_degree = 15;
+    o.inv_degree = 31;
+    o.newton = 2;
+    at->set_softmax(o);
+  }
+  Network n(Shape{t, 1, 5});
+  n.emplace<TokenDense>(t, 5, d, w, b, seg)
+      .add(ln)
+      .add(at)
+      .emplace<TokenMean>(t, d)
+      .emplace<Dense>(d, 2, r.vec(16, 0.4), r.vec(2, 0.1));
+  return n;
+}
+
+// Exact ReLU (scheme switching) between dense layers.
+Network relu_mlp(unsigned seed) {
+  Rng r(seed);
+  Network n(Shape{6, 1, 1});
+  n.emplace<Dense>(6, 5, r.vec(30, 0.4), r.vec(5, 0.1))
+      .emplace<ExactReLU>(4.0)
+      .emplace<Dense>(5, 2, r.vec(10, 0.4), r.vec(2, 0.1));
+  return n;
+}
+
 // A pre-norm transformer block: LayerNorm + softmax attention, LayerNorm +
 // MLP, each with a residual connection.
 Network transformer_block(unsigned seed) {
@@ -275,10 +398,21 @@ Batch batch(const Network& n, size_t count, unsigned seed, bool onehot = false) 
 
 // Cross-entropy with the exact softmax: train_plain's gradient uses the
 // polynomial one, so the check also bounds the approximation error.
+// Restarts every dropout layer's mask sequence (the numerical gradient must
+// see the masks the analytic one used).
+void reseed_dropout(const Layers& ls, uint64_t seed) {
+  for (const auto& l : ls) {
+    if (auto* r = dynamic_cast<Residual*>(l.get())) reseed_dropout(r->body(), seed);
+    if (auto* d = dynamic_cast<Dropout*>(l.get())) d->reseed(seed);
+  }
+}
+
 double loss(const Network& net, const Batch& b, const Loss& kind) {
+  reseed_dropout(net.layers(), 1);
   double l = 0;
+  const auto ys = forward_plain_batch(net, b.xs);  // batch norms: batch statistics, as in training
   for (size_t s = 0; s < b.xs.size(); ++s) {
-    auto y = net.forward_plain(b.xs[s]);
+    const auto& y = ys[s];
     if (kind.kind == Loss::kCrossEntropy) {
       l += cross_entropy_plain(y, b.ts[s]);
       continue;
@@ -295,6 +429,7 @@ void gradient_check(const std::string& name, const Builder& make, const std::vec
   Batch b = batch(net, 3, 7, kind.kind == Loss::kCrossEntropy);
   // One SGD step with lr = 1 moves the parameters by -grad.
   std::vector<double> p0 = all_params(net);
+  reseed_dropout(net.layers(), 1);
   train_plain(net, b.xs, b.ts, 1.0, frozen, kind);
   std::vector<double> p1 = all_params(net);
 
@@ -342,7 +477,7 @@ FHEContext training_context(const Trainer& tr, bool boot, uint32_t updates, uint
 // level budget and bootstrap range.
 void encrypted_check(const std::string& name, const Builder& make, size_t updates, bool boot, double tol,
                      const std::vector<size_t>& frozen = {}, double lr = 0.5, uint32_t window = 0,
-                     const Loss& kind = Loss{}, uint32_t budget = 0, double range = 1.0,
+                     const Loss& kind = Loss{}, uint32_t budget = 0, double range = 1.0, bool batched = false,
                      const Optimizer& opt = Optimizer{}) {
   const bool onehot = kind.kind == Loss::kCrossEntropy;
   Network plain = make();
@@ -374,9 +509,19 @@ void encrypted_check(const std::string& name, const Builder& make, size_t update
     Batch b = batch(plain, 2, 100 + static_cast<unsigned>(u), onehot);
     train_plain(plain, b.xs, b.ts, lr, frozen, kind, opt, &state);
     size_t boots = 0;
-    for (size_t s = 0; s < b.xs.size(); ++s) {
-      tr.accumulate(ctx, tr.encrypt_input(ctx, b.xs[s]), tr.encrypt_target(ctx, b.ts[s]));
+    if (batched) {
+      std::vector<Ctxt> xs, ts;
+      for (size_t s = 0; s < b.xs.size(); ++s) {
+        xs.push_back(tr.encrypt_input(ctx, b.xs[s]));
+        ts.push_back(tr.encrypt_target(ctx, b.ts[s]));
+      }
+      tr.accumulate_batch(ctx, xs, ts);
       boots += tr.sample_bootstraps();
+    } else {
+      for (size_t s = 0; s < b.xs.size(); ++s) {
+        tr.accumulate(ctx, tr.encrypt_input(ctx, b.xs[s]), tr.encrypt_target(ctx, b.ts[s]));
+        boots += tr.sample_bootstraps();
+      }
     }
     tr.update(ctx, lr);
     if (budget)
@@ -395,6 +540,13 @@ void encrypted_check(const std::string& name, const Builder& make, size_t update
   check(max_diff(before, want) > 10 * tol, name + " training changed the weights");
   check_err("encrypted training " + name, max_diff(want, got), tol);
   check_err("inference with trained encrypted weights " + name, max_diff(y, plain.forward_plain(probe.xs[0])), 10 * tol);
+  for (size_t i = 0; i < plain.layers().size(); ++i)
+    if (auto* pb = dynamic_cast<BatchNorm*>(plain.layers()[i].get())) {
+      auto* eb = dynamic_cast<BatchNorm*>(enc.layers()[i].get());
+      check_err("batch norm running statistics " + name,
+                std::max(max_diff(pb->running_mean(), eb->running_mean()), max_diff(pb->running_var(), eb->running_var())),
+                tol);
+    }
   if (!frozen.empty()) {
     // Frozen layers keep their weights.
     Network orig = make();
@@ -402,6 +554,12 @@ void encrypted_check(const std::string& name, const Builder& make, size_t update
     Layer* c = enc.layers()[frozen[0]].get();
     check(max_diff(a->params(), c->params()) == 0.0, name + " frozen layer unchanged");
   }
+  // OpenFHE keeps every context and its evaluation keys in static stores;
+  // drop them so a full run's memory stays at one check's.
+  lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::ClearEvalMultKeys();
+  lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::ClearEvalSumKeys();
+  lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::ClearEvalAutomorphismKeys();
+  lbcrypto::CryptoContextFactory<lbcrypto::DCRTPoly>::ReleaseAllContexts();
 }
 
 // Softmax cross-entropy: logits of the test networks stay within [-2, 2].
@@ -544,26 +702,28 @@ void optimizer_tests(bool quick) {
   optimizer_reference_tests();
   // The state lives at the weights' level, so a second update reads it;
   // shared weights (conv taps, layer norm gamma) carry one broadcast state.
-  encrypted_check("mlp, momentum", [] { return mlp(1); }, 2, false, 1e-4, {}, 0.3, 0, Loss{}, 0, 1.0,
+  encrypted_check("mlp, momentum", [] { return mlp(1); }, 2, false, 1e-4, {}, 0.3, 0, Loss{}, 0, 1.0, false,
                   Optimizer::sgd(0.9));
-  encrypted_check("cnn, nesterov + weight decay", [] { return cnn(2); }, 2, false, 1e-4, {}, 0.3, 0, Loss{}, 0, 1.0,
+  encrypted_check("cnn, nesterov + weight decay", [] { return cnn(2); }, 2, false, 1e-4, {}, 0.3, 0, Loss{}, 0, 1.0, false,
                   Optimizer::sgd(0.9, 0.05, true));
-  encrypted_check("mlp, adam", [] { return mlp(1); }, 2, false, 1e-4, {}, 0.05, 0, Loss{}, 0, 1.0,
+  encrypted_check("mlp, adam", [] { return mlp(1); }, 2, false, 1e-4, {}, 0.05, 0, Loss{}, 0, 1.0, false,
                   Optimizer::adam(0.9, 0.99, 0.04, 4.0));
-  encrypted_check("layernorm, adamw", [] { return norm_tokens(9); }, 1, false, 1e-4, {}, 0.05, 0, Loss{}, 0, 1.0,
+  encrypted_check("layernorm, adamw", [] { return norm_tokens(9); }, 1, false, 1e-4, {}, 0.05, 0, Loss{}, 0, 1.0, false,
                   Optimizer::adamw(0.1, 0.9, 0.99, 0.04, 4.0));
   // Bootstrapped weights and state over three updates.
   if (!quick)
     encrypted_check("mlp, adamw, bootstrapped weights and state", [] { return mlp(6); }, 3, true, 1e-3, {}, 0.05, 0,
-                    Loss{}, 0, 1.0, Optimizer::adamw(0.1, 0.9, 0.99, 0.04, 1.0));
-  // The update itself split by bootstraps under a level budget.
+                    Loss{}, 0, 1.0, false, Optimizer::adamw(0.1, 0.9, 0.99, 0.04, 1.0));
+  // The update itself split by bootstraps under a level budget. The
+  // moments and the root pass through range-16 bootstraps (error ~16 x 2e-4
+  // each, divided by the root's eps), so runs land between 7e-4 and 1e-3.
   {
     Network probe = cnn(7);
     probe.compile();
     const Optimizer o = Optimizer::adam(0.9, 0.99, 0.04, 1.0);
     const uint32_t budget = Trainer(probe, {}, Loss{}, o).min_level_budget();
-    encrypted_check("cnn, adam, level budget", [] { return cnn(7); }, 2, true, 1e-3, {}, 0.05, 0, Loss{}, budget, 16.0,
-                    o);
+    encrypted_check("cnn, adam, level budget", [] { return cnn(7); }, 2, true, 2e-3, {}, 0.05, 0, Loss{}, budget, 16.0,
+                    false, o);
   }
 }
 
@@ -587,6 +747,8 @@ int main(int argc, char** argv) {
     check(n.layers()[0]->out_layout().m == 2 && n.layers()[2]->out_layout().m == 2, "multiplexed cnn layouts (m = 2)");
   }
   gradient_check("multiplexed cnn", [] { return multiplexed_cnn(13); });
+  gradient_check("depthwise dilated conv, convtranspose, upsample", [] { return conv_variants(15); });
+  gradient_check("conv1d", [] { return conv1d(16); });
   gradient_check("tokens (residual, chebyshev, per-token bias)", [] { return tokens(4); });
   gradient_check("mlp, first layer frozen", [] { return mlp(5); }, {0});
   gradient_check("layernorm (gamma, beta, backward through the normalisation)", [] { return norm_tokens(9); });
@@ -595,6 +757,11 @@ int main(int argc, char** argv) {
   gradient_check("softmax attention, frozen", [] { return attention_tokens(11, true); }, {1});
   gradient_check("pre-norm transformer block", [] { return transformer_block(12); });
   gradient_check("max pool 2x2", [] { return pool_cnn(13); });
+  gradient_check("masked segmented quadratic attention (encoder-decoder)", [] { return encdec_tokens(17, false); });
+  gradient_check("masked segmented softmax attention (encoder-decoder)", [] { return encdec_tokens(18, true); });
+  gradient_check("exact relu", [] { return relu_mlp(19); });
+  gradient_check("batch norm (batch statistics, conv and vector)", [] { return bn_cnn(20); });
+  gradient_check("dropout", [] { return dropout_mlp(21); });
   gradient_check("max pool 3x3 stride 1, output layer", [] { return pool_output(14); });
 
   encrypted_check("mlp", [] { return mlp(1); }, 1, false, 1e-4);
@@ -602,6 +769,8 @@ int main(int argc, char** argv) {
   encrypted_check("cnn", [] { return cnn(2); }, 1, false, 1e-4);
   encrypted_check("strided cnn", [] { return strided_cnn(3); }, 1, false, 1e-4);
   encrypted_check("multiplexed cnn", [] { return multiplexed_cnn(13); }, 1, false, 1e-4);
+  encrypted_check("depthwise dilated conv, convtranspose, upsample", [] { return conv_variants(15); }, 1, false, 1e-4);
+  encrypted_check("conv1d", [] { return conv1d(16); }, 1, false, 1e-4);
   encrypted_check("tokens", [] { return tokens(4); }, 1, false, 1e-4);
   encrypted_check("mlp, fine-tune last layer", [] { return mlp(5); }, 1, false, 1e-4, {0});
   encrypted_check("layernorm", [] { return norm_tokens(9); }, 1, false, 1e-4);
@@ -610,6 +779,14 @@ int main(int argc, char** argv) {
   // Scheme-switching comparisons in the forward pass; the backward pass
   // reuses their bits.
   encrypted_check("max pool 2x2", [] { return pool_cnn(13); }, 1, false, 1e-3);
+  encrypted_check("masked segmented quadratic attention", [] { return encdec_tokens(17, false); }, 1, false, 1e-4);
+  encrypted_check("masked segmented softmax attention", [] { return encdec_tokens(18, true); }, 1, false, 1e-4);
+  encrypted_check("exact relu", [] { return relu_mlp(19); }, 1, false, 1e-3);
+  encrypted_check("batch norm, batched", [] { return bn_cnn(20); }, 1, false, 1e-4, {}, 0.5, 0, Loss{}, 0, 1.0, true);
+  encrypted_check("mlp, batched", [] { return mlp(1); }, 1, false, 1e-4, {}, 0.5, 0, Loss{}, 0, 1.0, true);
+  encrypted_check("dropout", [] { return dropout_mlp(21); }, 2, false, 1e-4);
+  encrypted_check("batch norm, level budget", [] { return bn_cnn(20); }, 1, true, 1e-3, {}, 0.3, 0, Loss{}, 12, 8.0,
+                  true);
   if (!quick) encrypted_check("max pool 3x3 stride 1, output layer", [] { return pool_output(14); }, 1, false, 1e-3);
   if (!quick) encrypted_check("softmax attention, frozen (forward only)", [] { return attention_tokens(11, true); }, 1, false, 1e-4, {1});
   // Rotation-key ladder: the same training with composed rotations.

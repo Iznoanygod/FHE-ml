@@ -255,12 +255,16 @@ logits = fheml.infer(net, ctx, image)        # image: (1, 28, 28) numpy array
 
 | torch | fheml |
 | --- | --- |
-| `nn.Conv2d` (square kernel, zero padding, groups=1) | `conv2d` |
+| `nn.Conv2d` (any kernel, groups/depthwise, dilation, zero or `'same'` padding) | `conv2d` |
+| `nn.Conv1d` on a `(C, L)` input | `conv2d` with `kh = 1` on the `(C, 1, L)` shape |
+| `nn.ConvTranspose2d`, `nn.ConvTranspose1d` | `convtranspose2d` |
+| `nn.Upsample` (nearest, nearest-exact, bilinear, linear; integer factors or `size=`) | `upsample` |
 | `nn.Linear` | `dense` on vectors; `tokendense` on `(tokens, dim)` inputs |
 | `nn.AvgPool2d`, `nn.AdaptiveAvgPool2d(1)` | `avgpool2d` |
 | `hnn.MaxPool2d(k, stride, range=R)` (square window, no padding) | `maxpool2d` (exact, scheme switching) |
-| `nn.BatchNorm2d` / `nn.BatchNorm1d` | folded into the preceding conv/linear, else `affine` |
-| `nn.Flatten`, `nn.Dropout`, `nn.Identity` | nothing |
+| `nn.BatchNorm2d` / `nn.BatchNorm1d` (vectors and `(C, L)` signals) | folded into the preceding conv/linear, else `affine`; `batchnorm` with `from_torch(..., batchnorm_range=(lo, hi))` (trains with batch statistics) |
+| `nn.Dropout` | `dropout` (identity at inference) |
+| `nn.Flatten`, `nn.Identity` | nothing |
 | `hnn.Poly`, `hnn.Square`, `hnn.Chebyshev` | `poly`, `square`, `chebyshev` |
 | `hnn.Attention(dim, tokens, heads=H)`, `hnn.Residual`, `hnn.TokenMean`, `hnn.PosEmbedding` | `attention` (single or multi-head), `residual`, `tokenmean`, per-token bias |
 | `hnn.Attention(..., softmax={...})` | `attention` with softmax scores (`SoftmaxOptions`) |
@@ -614,8 +618,10 @@ net = fheml.from_torch(model, (S + T, 64))
 ```
 
 Masks and segments cost no levels and no extra rotations; offsets that a
-mask leaves empty are skipped. They are inference-only: the encrypted
-trainer rejects them.
+mask leaves empty are skipped. The encrypted trainer runs the same masked
+offsets, so causal decoders and encoder-decoders train end to end under
+encryption too (segmented layer norms train one gamma and beta per
+segment).
 
 ## Datasets and the example harness
 
@@ -1175,12 +1181,25 @@ for xs, ts in batches:
 trainer.decrypt_weights(ctx)                             # key holder: trained weights back into net
 ```
 
-* **What trains:** conv2d, dense, tokendense and affine weights and biases,
-  layernorm's gamma and beta, and the four projections of attention
-  (quadratic or softmax scores, any number of heads), with shared weights
-  handled exactly. Gradients flow through square, poly, chebyshev, average
-  and max pooling, token mean, layernorm, attention, residual and bootstrap
-  layers. Max pooling routes each window's gradient to the tap that won,
+* **What trains:** conv2d (grouped, depthwise, dilated, 1-D), convtranspose2d,
+  dense, tokendense and affine weights and biases,
+  layernorm's and batchnorm's gamma and beta, and the four projections of attention
+  (quadratic or softmax scores, any number of heads, masked and segmented),
+  with shared weights handled exactly. Gradients flow through square, poly,
+  chebyshev, exact ReLU, upsampling, average and max pooling, token mean,
+  layernorm, batchnorm, dropout, attention, residual and bootstrap layers.
+  Exact ReLU keeps its comparison bit from the forward pass and multiplies
+  the gradient by it, so its backward pass costs one level and no scheme
+  switching.
+* **Batch norm and dropout:** a network with a `batchnorm` layer trains a
+  batch layer by layer (`Trainer.accumulate_batch`; `fheml.train_step` does
+  this whenever `trainer.batch_coupled`). Each batch norm normalises with
+  the batch's own mean and variance per channel, computed homomorphically
+  from the sum of the batch's ciphertexts, and moves its encrypted running
+  statistics toward them (torch's momentum update, unbiased variance).
+  Inference uses the running statistics. `dropout` draws a fresh mask per
+  sample and scales the kept units by 1/(1-p), as torch does. The mask is a
+  plaintext product, and at inference the layer costs nothing. Max pooling routes each window's gradient to the tap that won,
   multiplying by the comparison bits its forward pass already computed, so
   the backward pass adds no scheme switching (`ceil(log2 k²)` levels).
   The softmax and the layer norm's inverse square root are differentiated as

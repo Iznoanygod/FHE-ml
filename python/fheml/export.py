@@ -4,7 +4,9 @@
 (see ``fheml.nn`` for the HE-friendly modules) into an ``fheml.Network``.
 ``input_shape`` excludes the batch dimension:
 
-* ``(C, H, W)`` image: Conv2d, AvgPool2d, AdaptiveAvgPool2d(1), BatchNorm2d,
+* ``(C, H, W)`` image: Conv2d (groups/depthwise, dilation, rectangular
+  padding), ConvTranspose2d, Upsample (nearest, bilinear), AvgPool2d,
+  AdaptiveAvgPool2d(1), BatchNorm2d,
   ``fheml.nn.MaxPool2d`` (exact, scheme switching); ``nn.Flatten`` then
   ``nn.Linear`` for the head.
 * ``(n, d)`` token sequence: ``nn.Linear`` acts per token, plus Attention
@@ -12,6 +14,9 @@
   PosEmbedding, TokenMean, SegmentLinear (one weight set per token
   segment: the source and target of an encoder-decoder) and the recurrent
   RNN, GRU and LSTM (every hidden state, or the last one as a vector).
+* ``(C, L)`` signal (the token state read channel-first, as torch's
+  Conv1d reads it): Conv1d, ConvTranspose1d, Upsample (nearest, linear),
+  BatchNorm1d.
 * ``(k,)`` vector: Linear, BatchNorm1d.
 
 Any of them may end with ``fheml.nn.ArgMax`` (a one-hot per group of the
@@ -53,7 +58,9 @@ class _Exporter:
     """Walks the module tree tracking the activation shape and emits a list of
     layer specs (plain tuples), so later passes can fold or pad weights."""
 
-    def __init__(self, maxpool_range=None, exact_relu=None):
+    def __init__(self, maxpool_range=None, exact_relu=None, batchnorm_range=None):
+        self.batchnorm_range = batchnorm_range
+        self.dropouts = 0
         self.max_token_width = 0
         self.maxpool_range = maxpool_range
         self.exact_relu = exact_relu
@@ -71,7 +78,14 @@ class _Exporter:
             specs, state = self.run(m, state)
             out.extend(specs)
             return state
-        if isinstance(m, (nn.Identity, nn.Dropout, hnn.Bootstrap)):
+        if isinstance(m, (nn.Dropout, nn.Dropout1d, nn.Dropout2d)):
+            if isinstance(m, (nn.Dropout1d, nn.Dropout2d)):
+                raise ValueError(f"nn.{name} (channel dropout) is unsupported: use nn.Dropout")
+            if m.p > 0:
+                self.dropouts += 1  # each layer its own mask sequence
+                out.append(("dropout", float(m.p), self.dropouts))
+            return state
+        if isinstance(m, (nn.Identity, hnn.Bootstrap)):
             if isinstance(m, hnn.Bootstrap):
                 out.append(("bootstrap",))
             return state
@@ -80,17 +94,10 @@ class _Exporter:
                 raise ValueError("nn.Flatten: only start_dim=1, end_dim=-1 is supported")
             return ("vector", int(np.prod(state[1:])))
 
-        if isinstance(m, nn.Conv2d):
-            self.need(kind, "image", name)
-            c, h, w = state[1:]
-            if m.groups != 1 or _pair(m.dilation, "Conv2d dilation") != 1 or m.padding_mode != "zeros":
-                raise ValueError("nn.Conv2d: groups, dilation and padding modes other than the defaults are unsupported")
-            if isinstance(m.padding, str):
-                raise ValueError("nn.Conv2d: give padding as a number")
-            k = _pair(m.kernel_size, "Conv2d kernel size")
-            s, p = _pair(m.stride, "Conv2d stride"), _pair(m.padding, "Conv2d padding")
-            out.append(("conv2d", m.in_channels, m.out_channels, k, k, s, p, _np(m.weight), _np(m.bias)))
-            return ("image", m.out_channels, (h + 2 * p - k) // s + 1, (w + 2 * p - k) // s + 1)
+        if isinstance(m, (nn.Conv1d, nn.Conv2d, nn.ConvTranspose1d, nn.ConvTranspose2d)):
+            return self.conv(m, state, out)
+        if isinstance(m, nn.Upsample):
+            return self.upsample(m, state, out)
         if isinstance(m, nn.AvgPool2d):
             self.need(kind, "image", name)
             if _pair(m.padding, "AvgPool2d padding") != 0 or m.ceil_mode:
@@ -131,10 +138,17 @@ class _Exporter:
         if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
             if isinstance(m, nn.BatchNorm2d):
                 self.need(kind, "image", name)
-            elif kind != "vector":
-                raise ValueError("nn.BatchNorm1d is supported on vectors only (after Flatten/Linear/TokenMean)")
+            elif kind not in ("vector", "tokens"):
+                raise ValueError("nn.BatchNorm1d is supported on vectors and (C, L) signals only")
             if m.running_mean is None:
                 raise ValueError(f"{name}: needs track_running_stats=True")
+            if self.batchnorm_range is not None:
+                if not m.affine:
+                    raise ValueError(f"{name}: batchnorm_range needs affine=True")
+                lo, hi = self.batchnorm_range
+                out.append(("batchnorm", _np(m.weight), _np(m.bias), _np(m.running_mean), _np(m.running_var),
+                            float(m.eps), float(m.momentum if m.momentum is not None else 0.1), float(lo), float(hi)))
+                return state
             scale = 1.0 / np.sqrt(_np(m.running_var) + m.eps)
             shift = -_np(m.running_mean) * scale
             if m.affine:
@@ -280,6 +294,90 @@ class _Exporter:
         raise ValueError(f"unsupported module {name}: build the model from nn.Sequential, the supported "
                          "torch.nn layers and fheml.nn modules")
 
+    def conv(self, m, state, out):
+        """Conv1d/Conv2d and their transposes. A (C, L) signal is the token
+        state (torch's Conv1d reads (N, C, L) exactly like a (N, tokens, dim)
+        sequence), lowered as a (C, 1, L) image with kh = 1."""
+        name = type(m).__name__
+        one_d = isinstance(m, (nn.Conv1d, nn.ConvTranspose1d))
+        transposed = isinstance(m, (nn.ConvTranspose1d, nn.ConvTranspose2d))
+        if one_d:
+            self.need(state[0], "tokens", name + " (a (C, L) signal)")
+            c, h, w = state[1], 1, state[2]
+        else:
+            self.need(state[0], "image", name)
+            c, h, w = state[1:]
+        if m.padding_mode != "zeros":
+            raise ValueError(f"nn.{name}: only zero padding is supported")
+
+        def hw(v):
+            v = tuple(v) if isinstance(v, (tuple, list)) else (v,)
+            return (1, int(v[0])) if one_d else ((int(v[0]),) * 2 if len(v) == 1 else (int(v[0]), int(v[1])))
+
+        kh, kw = hw(m.kernel_size)
+        sh, sw = hw(m.stride)
+        dh, dw = hw(m.dilation)
+        if one_d:
+            dh = 1
+        if sh != sw and not one_d:
+            raise ValueError(f"nn.{name}: only equal strides along both axes are supported, got {(sh, sw)}")
+        stride = sw
+        if isinstance(m.padding, str):
+            if m.padding == "valid":
+                ph = pw = 0
+            else:  # "same" (stride 1 only, torch enforces it)
+                th, tw = dh * (kh - 1), dw * (kw - 1)
+                if th % 2 or tw % 2:
+                    raise ValueError(f"nn.{name}: padding='same' with an even kernel extent pads asymmetrically; "
+                                     "use an odd kernel or explicit padding")
+                ph, pw = th // 2, tw // 2
+        else:
+            ph, pw = hw(m.padding)
+        if one_d:
+            ph = 0
+        geom = dict(stride=stride, pad=ph, pad_w=pw, groups=m.groups, dilation_h=dh, dilation_w=dw)
+        ic, oc = m.in_channels, m.out_channels
+        wt = _np(m.weight)
+        if transposed:
+            oph, opw = hw(m.output_padding)
+            if one_d:
+                oph = 0
+            geom.update(output_padding_h=oph, output_padding_w=opw)
+            oh = (h - 1) * stride - 2 * ph + dh * (kh - 1) + oph + 1
+            ow = (w - 1) * stride - 2 * pw + dw * (kw - 1) + opw + 1
+            out.append(("convtranspose2d", ic, oc, kh, kw, geom, wt.reshape(ic, oc // m.groups, kh, kw), _np(m.bias)))
+        else:
+            oh = (h + 2 * ph - dh * (kh - 1) - 1) // stride + 1
+            ow = (w + 2 * pw - dw * (kw - 1) - 1) // stride + 1
+            out.append(("conv2d", ic, oc, kh, kw, geom, wt.reshape(oc, ic // m.groups, kh, kw), _np(m.bias)))
+        if oh <= 0 or ow <= 0:
+            raise ValueError(f"nn.{name}: empty output for input {state[1:]}")
+        return ("tokens", oc, ow) if one_d else ("image", oc, oh, ow)
+
+    def upsample(self, m, state, out):
+        if m.mode not in ("nearest", "nearest-exact", "linear", "bilinear"):
+            raise ValueError(f"nn.Upsample: mode {m.mode!r} is unsupported (nearest, nearest-exact, linear, bilinear)")
+        one_d = state[0] == "tokens"
+        if m.mode == ("bilinear" if one_d else "linear"):
+            raise ValueError(f"nn.Upsample: mode {m.mode!r} needs a {'(C, H, W) image' if one_d else '(C, L) signal'}")
+        if state[0] not in ("image", "tokens"):
+            raise ValueError("nn.Upsample expects a (C, H, W) image or a (C, L) signal")
+        c, h, w = (state[1], 1, state[2]) if one_d else state[1:]
+        dims = (w,) if one_d else (h, w)
+        if m.size is not None:
+            size = m.size if isinstance(m.size, (tuple, list)) else (m.size,) * len(dims)
+            size = tuple(int(v) for v in size)
+        else:
+            sf = m.scale_factor if isinstance(m.scale_factor, (tuple, list)) else (m.scale_factor,) * len(dims)
+            if any(float(f) != int(f) for f in sf):
+                raise ValueError("nn.Upsample: only integer scale factors are supported (or give size=)")
+            size = tuple(int(d * int(f)) for d, f in zip(dims, sf))
+        oh, ow = (1, size[0]) if one_d else size
+        align = bool(m.align_corners) if m.mode in ("linear", "bilinear") else False
+        mode = "bilinear" if m.mode == "linear" else m.mode
+        out.append(("upsample", mode, oh, ow, align))
+        return ("tokens", c, ow) if one_d else ("image", c, oh, ow)
+
     @staticmethod
     def need(kind, want, name):
         if kind != want:
@@ -324,8 +422,19 @@ def _shape(t):
 
 def _build(s):
     k = s[0]
-    if k == "conv2d":
-        return _fheml.Conv2d(*s[1:7], _flat(s[7]), _flat(s[8]))
+    if k in ("conv2d", "convtranspose2d"):
+        _, ic, oc, kh, kw, g, w, b = s
+        g = dict(g)
+        stride, pad = g.pop("stride"), g.pop("pad")
+        cls = _fheml.Conv2d if k == "conv2d" else _fheml.ConvTranspose2d
+        return cls(ic, oc, kh, kw, stride, pad, _flat(w), _flat(b), **g)
+    if k == "upsample":
+        return _fheml.Upsample(*s[1:])
+    if k == "dropout":
+        return _fheml.Dropout(s[1], s[2])
+    if k == "batchnorm":
+        _, g, b, rm, rv, eps, mom, lo, hi = s
+        return _fheml.BatchNorm(_flat(g), _flat(b), _flat(rm), _flat(rv), eps, mom, lo, hi, 31, 1)
     if k == "avgpool2d":
         return _fheml.AvgPool2d(*s[1:])
     if k == "maxpool2d":
@@ -378,7 +487,8 @@ def _build(s):
     raise AssertionError(k)
 
 
-def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range=None, exact_relu=None):
+def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range=None, exact_relu=None,
+               batchnorm_range=None):
     """Converts a trained torch model to an ``fheml.Network`` (not yet compiled).
 
     token_width: for token inputs, zero-pad each input token to this width
@@ -394,6 +504,11 @@ def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range
       random input and raise if they disagree.
     maxpool_range: input bound R of every plain nn.MaxPool2d (exported as the
       exact scheme-switching max pool; fheml.nn.MaxPool2d carries its own).
+    batchnorm_range: (var_min, var_max). None (default) folds batch norms into
+      the preceding conv/linear for inference. Given, they stay BatchNorm
+      layers (still one affine level at inference) that the encrypted Trainer
+      trains with batch statistics, 1/sqrt(var + eps) being a Chebyshev
+      series on this variance range.
     """
     shape = tuple(int(v) for v in input_shape)
     if len(shape) == 3:
@@ -405,7 +520,7 @@ def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range
     else:
         raise ValueError("input_shape must be (C, H, W), (tokens, dim) or (features,)")
 
-    ex = _Exporter(maxpool_range, exact_relu)
+    ex = _Exporter(maxpool_range, exact_relu, batchnorm_range)
     modules = model if isinstance(model, nn.Sequential) else [model]
     with torch.no_grad():
         specs, _ = ex.run(modules, state)

@@ -94,6 +94,19 @@ Each linear layer costs one level. `Network::fuse_linear()` multiplies runs of
 adjacent linear layers (conv → pool → affine) into one matrix. That saves a
 level per merged layer, at the cost of more diagonals.
 
+The convolution family is written this way too. `Conv2d` covers channel
+groups (a depthwise convolution is `groups = channels`), dilation and
+separate vertical and horizontal padding; a 1-D convolution over a `(C, L)`
+signal is the same layer on the `(C, 1, L)` shape with `kh = 1`.
+`ConvTranspose2d` is the transpose of a strided convolution's matrix, and
+`Upsample` (nearest, nearest-exact, bilinear, or linear on signals) is a
+fixed matrix with at most four entries per row. None of them needs special
+evaluation code: their cost is set by their distinct slot offsets, so a
+depthwise 3×3 has 9 diagonals per channel block where a dense one has
+`9 (Ci + Co - 1)`. Shared taps train like any other conv weight (a masked
+rotate-and-sum of the gradient), which gives U-Net- and MobileNet-style
+encoders and decoders the same encrypted training as plain CNNs.
+
 Because a layer is nothing more than its logical matrix and bias,
 `LinearMap` takes them directly: a fixed sparse matrix between any two
 shapes, plus a bias per output element. It covers the rearrangements that no
@@ -440,6 +453,40 @@ gap slots there and must not reach the layer below. `train_plain` runs the
 same tournament in the clear (a tie keeps the first tap, as `[a < b] = 0`
 does).
 
+**Exact ReLU** keeps the comparison bit of its forward pass,
+`s = out_scale · [x > 0]`, and the backward pass is `g ⊙ s`: one level, no
+scheme switching. **Masked and segmented attention** backpropagate over the
+offsets the forward evaluated (`Attention::offsets()`), with the same score
+and head masks, so a causal decoder or an encoder-decoder trains like plain
+self-attention.
+
+**Batch norm** couples the samples of a batch, so a network with one trains
+the batch layer by layer (`Trainer::accumulate_batch`): every node runs all
+samples before the next node does, and each sample's forward state is kept
+for the backward pass. For a batch of `B` the batch norm computes
+
+| Value | Computation | Levels |
+| --- | --- | --- |
+| mean | `μ = M(Σ_b x_b)` | 1 |
+| variance | `σ² = M(Σ_b (x_b - μ)²)` | 2 |
+| `r ≈ 1/√(σ² + ε)` | Chebyshev series on `[var_min, var_max]` + Newton | as `layernorm` |
+| output | `y_b = γ ⊙ (x_b - μ) ⊙ r + β` | 2 |
+
+where `M` is a fixed linear map: the mean over a channel's positions,
+replicated to them, divided by `B` (one level, cached per batch size). The
+backward pass is the usual one, `∂L/∂x_b = r ⊙ (g̃_b - M(Σ g̃) - x̂_b ⊙
+M(Σ g̃ ⊙ x̂))` with `g̃ = γ ⊙ g`, so it needs two more applications of `M`.
+The running mean and variance are ciphertexts updated with torch's
+momentum rule (unbiased variance) and are bootstrapped with the weights.
+Inference uses them as a channel affine map: `r` from the running variance,
+`y = γ ⊙ (x - m) ⊙ r + β`.
+
+**Dropout** draws a fresh mask per sample at each step from the layer's
+seeded generator and multiplies it in as a plaintext (one level). Kept units
+are scaled by `1/(1 - p)` (inverted dropout, as torch), so the expected
+activation equals the inference one and the layer is the identity at
+inference. The backward pass multiplies the gradient by the same mask.
+
 The loss is `0.5 |y - t|²`, so `g = y - t` with an encrypted target `t`. No
 masking is needed: unused slots of `y` only meet zero rows of the matrices,
 and the update masks keep gradients out of unused weight slots.
@@ -543,7 +590,6 @@ that.
   (`ContextOptions::rotation_window`, see below) the trainer composes every
   rotation from 2·log2(slots) keys instead; `Trainer::rotation_indices(true)`
   then lists only the hoisted rotations of the frozen prefix.
-- **Attention:** no backward pass yet.
 
 ## Parameters and bootstrapping
 
@@ -736,10 +782,12 @@ All of the following are tested under encryption:
 - Python bindings for all of the above.
 - Encrypted training (`Trainer`): SGD (momentum, Nesterov, weight decay)
   and Adam / AdamW updates on encrypted data, weights and optimizer state
-  match the plaintext optimizers, with and without bootstrapping; this includes
-  layer norm (gamma, beta) and attention (quadratic or softmax scores),
-  whose backward passes reuse the forward's rotations and masks, and exact
-  max pooling, whose backward pass reuses the forward's comparison bits.
+  match the plaintext optimizers, with and without bootstrapping; this
+  includes layer norm (gamma, beta), batch norm (batch statistics and running
+  statistics), dropout, attention (quadratic or softmax scores, masked and
+  segmented), whose backward passes reuse the forward's rotations and masks,
+  and exact max pooling and ReLU, whose backward passes reuse the forward's
+  comparison bits.
 - PyTorch export (`fheml.from_torch`): torch-trained CNN and ViT run
   encrypted with logits matching torch to about 1e-6.
 
@@ -767,9 +815,8 @@ All of the following are tested under encryption:
 5. **Bootstrap placement**: per-segment slot counts, and a cost model that
    weighs an earlier bootstrap against the scale layers around residual
    blocks (the planner is greedy-latest with back-off).
-6. **Batch-norm and residual connections.**
-   - Fold BN into the convolutions at load time.
-   - Add a residual `Add` layer that aligns levels and layouts.
+6. **Residual connections on images.** Add a residual `Add` layer that
+   aligns levels and layouts.
 7. **More PyTorch export.** `fheml.from_torch` covers `nn.Sequential` models
    (see the README). Next: tracing arbitrary `forward` code with `torch.fx`,
    and a range penalty during training so Chebyshev activations stay inside

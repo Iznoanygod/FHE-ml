@@ -5,7 +5,12 @@
 //
 //   fheml 1
 //   input C H W
-//   conv2d IN_C OUT_C KH KW STRIDE PAD HAS_BIAS   followed by weights [, bias]
+//   conv2d IN_C OUT_C KH KW STRIDE PAD HAS_BIAS [groups G] [dilation DH DW] [padw PW]
+//                                                 followed by weights [OUT_C][IN_C/G][KH][KW] [, bias];
+//                                                 PAD is the vertical padding, PW the horizontal (default PAD)
+//   convtranspose2d IN_C OUT_C KH KW STRIDE PAD HAS_BIAS [groups G] [dilation DH DW] [padw PW] [outpad OH OW]
+//                                                 followed by weights [IN_C][OUT_C/G][KH][KW] [, bias]
+//   upsample MODE OUT_H OUT_W ALIGN               MODE nearest|nearest-exact|bilinear, fixed output size
 //   dense IN OUT HAS_BIAS                         followed by weights [, bias]
 //   avgpool2d K STRIDE
 //   maxpool2d K STRIDE RANGE                     exact max via scheme switching, inputs in [-RANGE, RANGE]
@@ -19,6 +24,9 @@
 //   tokendense N IN OUT NB                        followed by weights [OUT][IN], NB bias values (0, OUT or N*OUT)
 //   tokenmean N D
 //   layernorm N D EPS VAR_MIN VAR_MAX DEGREE NEWTON   followed by D gammas, D betas
+//   batchnorm C EPS MOMENTUM VAR_MIN VAR_MAX DEGREE NEWTON
+//                                                 followed by C gammas, C betas, C running means, C running variances
+//   dropout P SEED                                identity at inference; training zeroes with probability P
 //   attention N D HAS_BIAS [heads H]              followed by Wq Wk Wv Wo [, bq bk bv bo], 3 score coefficients
 //                                                 (3 per head with "heads H")
 //   residual K                                    followed by K layers (y = body(x) + x)

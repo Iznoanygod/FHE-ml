@@ -249,19 +249,59 @@ std::string LinearLayer::describe() const {
 
 // ---------------------------------------------------------------------- Conv2d
 
+namespace {
+
+void check_geometry(const ConvGeometry& g, int in_c, int out_c, const char* what) {
+  const std::string w = what;
+  if (g.stride < 1) throw std::invalid_argument(w + ": stride must be >= 1");
+  if (g.pad_h < 0 || g.pad_w < 0) throw std::invalid_argument(w + ": padding must be >= 0");
+  if (g.dil_h < 1 || g.dil_w < 1) throw std::invalid_argument(w + ": dilation must be >= 1");
+  if (g.groups < 1 || in_c % g.groups || out_c % g.groups)
+    throw std::invalid_argument(w + ": groups must divide the input and output channels");
+  if (g.out_pad_h < 0 || g.out_pad_w < 0 || g.out_pad_h >= std::max(g.stride, g.dil_h) ||
+      g.out_pad_w >= std::max(g.stride, g.dil_w))
+    throw std::invalid_argument(w + ": output padding must be smaller than the stride or the dilation");
+}
+
+// " groups G dilation DH DW padw PW outpad OH OW", only the non-default parts.
+void save_geometry(std::ostream& os, const ConvGeometry& g, bool transposed) {
+  if (g.groups != 1) os << " groups " << g.groups;
+  if (g.dil_h != 1 || g.dil_w != 1) os << " dilation " << g.dil_h << " " << g.dil_w;
+  if (g.pad_w != g.pad_h) os << " padw " << g.pad_w;
+  if (transposed && (g.out_pad_h || g.out_pad_w)) os << " outpad " << g.out_pad_h << " " << g.out_pad_w;
+}
+
+}  // namespace
+
 Conv2d::Conv2d(int in_c, int out_c, int kh, int kw, int stride, int pad, std::vector<double> weights,
                std::vector<double> bias)
-    : in_c_(in_c), out_c_(out_c), kh_(kh), kw_(kw), stride_(stride), pad_(pad), w_(std::move(weights)),
-      b_(std::move(bias)) {
-  if (w_.size() != static_cast<size_t>(out_c) * in_c * kh * kw) throw std::invalid_argument("conv2d: bad weight count");
+    : Conv2d(in_c, out_c, kh, kw,
+             [&] {
+               ConvGeometry g;
+               g.stride = stride;
+               g.pad_h = g.pad_w = pad;
+               return g;
+             }(),
+             std::move(weights), std::move(bias)) {}
+
+Conv2d::Conv2d(int in_c, int out_c, int kh, int kw, ConvGeometry g, std::vector<double> weights,
+               std::vector<double> bias)
+    : in_c_(in_c), out_c_(out_c), kh_(kh), kw_(kw), g_(g), w_(std::move(weights)), b_(std::move(bias)) {
+  if (in_c < 1 || out_c < 1 || kh < 1 || kw < 1) throw std::invalid_argument("conv2d: bad sizes");
+  check_geometry(g_, in_c, out_c, "conv2d");
+  if (g_.out_pad_h || g_.out_pad_w) throw std::invalid_argument("conv2d: output padding is for transposed convolutions");
+  if (w_.size() != static_cast<size_t>(out_c) * (in_c / g_.groups) * kh * kw)
+    throw std::invalid_argument("conv2d: bad weight count");
   if (!b_.empty() && b_.size() != static_cast<size_t>(out_c)) throw std::invalid_argument("conv2d: bad bias count");
-  if (stride < 1) throw std::invalid_argument("conv2d: stride must be >= 1");
 }
 
 std::string Conv2d::describe() const {
   std::ostringstream os;
-  os << "conv2d " << in_c_ << "->" << out_c_ << " k=" << kh_ << "x" << kw_ << " s=" << stride_ << " p=" << pad_
-     << LinearLayer::describe();
+  os << "conv2d " << in_c_ << "->" << out_c_ << " k=" << kh_ << "x" << kw_ << " s=" << g_.stride << " p=" << g_.pad_h;
+  if (g_.pad_w != g_.pad_h) os << "x" << g_.pad_w;
+  if (g_.dil_h != 1 || g_.dil_w != 1) os << " d=" << g_.dil_h << "x" << g_.dil_w;
+  if (g_.groups != 1) os << " g=" << g_.groups;
+  os << LinearLayer::describe();
   return os.str();
 }
 
@@ -269,27 +309,38 @@ Shape Conv2d::configure(const Shape& in) {
   if (in.c != in_c_) throw std::invalid_argument("conv2d: input channels mismatch (" + in.str() + ")");
   in_ = in;
   out_.c = out_c_;
-  out_.h = (in.h + 2 * pad_ - kh_) / stride_ + 1;
-  out_.w = (in.w + 2 * pad_ - kw_) / stride_ + 1;
-  if (out_.h <= 0 || out_.w <= 0) throw std::invalid_argument("conv2d: empty output");
+  out_.h = (in.h + 2 * g_.pad_h - g_.dil_h * (kh_ - 1) - 1) / g_.stride + 1;
+  out_.w = (in.w + 2 * g_.pad_w - g_.dil_w * (kw_ - 1) - 1) / g_.stride + 1;
+  if (out_.h <= 0 || out_.w <= 0 || in.h + 2 * g_.pad_h < g_.dil_h * (kh_ - 1) + 1 ||
+      in.w + 2 * g_.pad_w < g_.dil_w * (kw_ - 1) + 1)
+    throw std::invalid_argument("conv2d: empty output");
   return out_;
+}
+
+std::vector<LinearLayer::ParamRef> Conv2d::taps() const {
+  std::vector<ParamRef> refs;
+  const int gi = in_c_ / g_.groups, go = out_c_ / g_.groups;
+  for (int o = 0; o < out_c_; ++o)
+    for (int y = 0; y < out_.h; ++y)
+      for (int x = 0; x < out_.w; ++x) {
+        const size_t row = (static_cast<size_t>(o) * out_.h + y) * out_.w + x;
+        for (int il = 0; il < gi; ++il) {
+          const int i = (o / go) * gi + il;
+          for (int dy = 0; dy < kh_; ++dy)
+            for (int dx = 0; dx < kw_; ++dx) {
+              const int iy = y * g_.stride - g_.pad_h + dy * g_.dil_h, ix = x * g_.stride - g_.pad_w + dx * g_.dil_w;
+              if (iy < 0 || iy >= in_.h || ix < 0 || ix >= in_.w) continue;  // zero padding
+              refs.push_back({row, (static_cast<size_t>(i) * in_.h + iy) * in_.w + ix,
+                              ((o * gi + il) * kh_ + dy) * kw_ + dx});
+            }
+        }
+      }
+  return refs;
 }
 
 SparseMatrix Conv2d::matrix() const {
   SparseMatrix m(out_.size(), in_.size());
-  for (int o = 0; o < out_c_; ++o)
-    for (int y = 0; y < out_.h; ++y)
-      for (int x = 0; x < out_.w; ++x) {
-        size_t row = (static_cast<size_t>(o) * out_.h + y) * out_.w + x;
-        for (int i = 0; i < in_c_; ++i)
-          for (int dy = 0; dy < kh_; ++dy)
-            for (int dx = 0; dx < kw_; ++dx) {
-              int iy = y * stride_ - pad_ + dy, ix = x * stride_ - pad_ + dx;
-              if (iy < 0 || iy >= in_.h || ix < 0 || ix >= in_.w) continue;  // zero padding
-              double wv = w_[((static_cast<size_t>(o) * in_c_ + i) * kh_ + dy) * kw_ + dx];
-              m.add(row, (static_cast<size_t>(i) * in_.h + iy) * in_.w + ix, wv);
-            }
-      }
+  for (const auto& r : taps()) m.add(r.row, r.col, w_[static_cast<size_t>(r.param)]);
   return m;
 }
 
@@ -300,23 +351,7 @@ std::vector<double> Conv2d::bias() const {
   return b;
 }
 
-std::vector<LinearLayer::ParamRef> Conv2d::weight_refs() const {
-  std::vector<ParamRef> refs;
-  for (int o = 0; o < out_c_; ++o)
-    for (int y = 0; y < out_.h; ++y)
-      for (int x = 0; x < out_.w; ++x) {
-        size_t row = (static_cast<size_t>(o) * out_.h + y) * out_.w + x;
-        for (int i = 0; i < in_c_; ++i)
-          for (int dy = 0; dy < kh_; ++dy)
-            for (int dx = 0; dx < kw_; ++dx) {
-              int iy = y * stride_ - pad_ + dy, ix = x * stride_ - pad_ + dx;
-              if (iy < 0 || iy >= in_.h || ix < 0 || ix >= in_.w) continue;
-              refs.push_back({row, (static_cast<size_t>(i) * in_.h + iy) * in_.w + ix,
-                              ((o * in_c_ + i) * kh_ + dy) * kw_ + dx});
-            }
-      }
-  return refs;
-}
+std::vector<LinearLayer::ParamRef> Conv2d::weight_refs() const { return taps(); }
 
 std::vector<int> Conv2d::bias_refs() const {
   if (b_.empty()) return {};
@@ -334,10 +369,173 @@ void Conv2d::set_params(const std::vector<double>& p) {
 }
 
 void Conv2d::save(std::ostream& os) const {
-  os << "conv2d " << in_c_ << " " << out_c_ << " " << kh_ << " " << kw_ << " " << stride_ << " " << pad_ << " "
-     << (b_.empty() ? 0 : 1) << "\n";
+  os << "conv2d " << in_c_ << " " << out_c_ << " " << kh_ << " " << kw_ << " " << g_.stride << " " << g_.pad_h << " "
+     << (b_.empty() ? 0 : 1);
+  save_geometry(os, g_, false);
+  os << "\n";
   write_vec(os, w_);
   write_vec(os, b_);
+}
+
+// ------------------------------------------------------------- ConvTranspose2d
+
+ConvTranspose2d::ConvTranspose2d(int in_c, int out_c, int kh, int kw, ConvGeometry g, std::vector<double> weights,
+                                 std::vector<double> bias)
+    : in_c_(in_c), out_c_(out_c), kh_(kh), kw_(kw), g_(g), w_(std::move(weights)), b_(std::move(bias)) {
+  if (in_c < 1 || out_c < 1 || kh < 1 || kw < 1) throw std::invalid_argument("convtranspose2d: bad sizes");
+  check_geometry(g_, in_c, out_c, "convtranspose2d");
+  if (w_.size() != static_cast<size_t>(in_c) * (out_c / g_.groups) * kh * kw)
+    throw std::invalid_argument("convtranspose2d: bad weight count");
+  if (!b_.empty() && b_.size() != static_cast<size_t>(out_c))
+    throw std::invalid_argument("convtranspose2d: bad bias count");
+}
+
+std::string ConvTranspose2d::describe() const {
+  std::ostringstream os;
+  os << "convtranspose2d " << in_c_ << "->" << out_c_ << " k=" << kh_ << "x" << kw_ << " s=" << g_.stride
+     << " p=" << g_.pad_h;
+  if (g_.pad_w != g_.pad_h) os << "x" << g_.pad_w;
+  if (g_.dil_h != 1 || g_.dil_w != 1) os << " d=" << g_.dil_h << "x" << g_.dil_w;
+  if (g_.groups != 1) os << " g=" << g_.groups;
+  if (g_.out_pad_h || g_.out_pad_w) os << " op=" << g_.out_pad_h << "x" << g_.out_pad_w;
+  os << LinearLayer::describe();
+  return os.str();
+}
+
+Shape ConvTranspose2d::configure(const Shape& in) {
+  if (in.c != in_c_) throw std::invalid_argument("convtranspose2d: input channels mismatch (" + in.str() + ")");
+  in_ = in;
+  out_.c = out_c_;
+  out_.h = (in.h - 1) * g_.stride - 2 * g_.pad_h + g_.dil_h * (kh_ - 1) + g_.out_pad_h + 1;
+  out_.w = (in.w - 1) * g_.stride - 2 * g_.pad_w + g_.dil_w * (kw_ - 1) + g_.out_pad_w + 1;
+  if (out_.h <= 0 || out_.w <= 0) throw std::invalid_argument("convtranspose2d: empty output");
+  return out_;
+}
+
+std::vector<LinearLayer::ParamRef> ConvTranspose2d::taps() const {
+  std::vector<ParamRef> refs;
+  const int gi = in_c_ / g_.groups, go = out_c_ / g_.groups;
+  for (int i = 0; i < in_c_; ++i)
+    for (int iy = 0; iy < in_.h; ++iy)
+      for (int ix = 0; ix < in_.w; ++ix) {
+        const size_t col = (static_cast<size_t>(i) * in_.h + iy) * in_.w + ix;
+        for (int ol = 0; ol < go; ++ol) {
+          const int o = (i / gi) * go + ol;
+          for (int ky = 0; ky < kh_; ++ky)
+            for (int kx = 0; kx < kw_; ++kx) {
+              const int y = iy * g_.stride - g_.pad_h + ky * g_.dil_h, x = ix * g_.stride - g_.pad_w + kx * g_.dil_w;
+              if (y < 0 || y >= out_.h || x < 0 || x >= out_.w) continue;  // cropped by the padding
+              refs.push_back({(static_cast<size_t>(o) * out_.h + y) * out_.w + x, col,
+                              ((i * go + ol) * kh_ + ky) * kw_ + kx});
+            }
+        }
+      }
+  return refs;
+}
+
+SparseMatrix ConvTranspose2d::matrix() const {
+  SparseMatrix m(out_.size(), in_.size());
+  for (const auto& r : taps()) m.add(r.row, r.col, w_[static_cast<size_t>(r.param)]);
+  return m;
+}
+
+std::vector<double> ConvTranspose2d::bias() const {
+  if (b_.empty()) return {};
+  std::vector<double> b(out_.size());
+  for (size_t i = 0; i < b.size(); ++i) b[i] = b_[i / (static_cast<size_t>(out_.h) * out_.w)];
+  return b;
+}
+
+std::vector<int> ConvTranspose2d::bias_refs() const {
+  if (b_.empty()) return {};
+  std::vector<int> r(out_.size());
+  for (size_t i = 0; i < r.size(); ++i)
+    r[i] = static_cast<int>(w_.size() + i / (static_cast<size_t>(out_.h) * out_.w));
+  return r;
+}
+
+std::vector<double> ConvTranspose2d::params() const { return concat(w_, b_); }
+
+void ConvTranspose2d::set_params(const std::vector<double>& p) {
+  split(p, w_, b_, "convtranspose2d");
+  invalidate();
+}
+
+void ConvTranspose2d::save(std::ostream& os) const {
+  os << "convtranspose2d " << in_c_ << " " << out_c_ << " " << kh_ << " " << kw_ << " " << g_.stride << " "
+     << g_.pad_h << " " << (b_.empty() ? 0 : 1);
+  save_geometry(os, g_, true);
+  os << "\n";
+  write_vec(os, w_);
+  write_vec(os, b_);
+}
+
+// -------------------------------------------------------------------- Upsample
+
+Upsample::Upsample(std::string mode, int out_h, int out_w, bool align_corners)
+    : mode_(std::move(mode)), out_h_(out_h), out_w_(out_w), align_(align_corners) {
+  if (mode_ != "nearest" && mode_ != "nearest-exact" && mode_ != "bilinear")
+    throw std::invalid_argument("upsample: mode must be nearest, nearest-exact or bilinear");
+  if (out_h < 1 || out_w < 1) throw std::invalid_argument("upsample: bad output size");
+  if (align_ && mode_ != "bilinear") throw std::invalid_argument("upsample: align_corners is for bilinear only");
+}
+
+std::string Upsample::describe() const {
+  std::ostringstream os;
+  os << "upsample " << mode_ << (align_ ? " align" : "") << " " << in_.str() << "->" << out_.str()
+     << LinearLayer::describe();
+  return os.str();
+}
+
+Shape Upsample::configure(const Shape& in) {
+  in_ = in;
+  out_ = Shape{in.c, out_h_, out_w_};
+  return out_;
+}
+
+namespace {
+
+// Source taps (index, weight) of output position d along one axis, as torch
+// computes them (aten/src/ATen/native/UpSample.h, scale = in / out).
+std::vector<std::pair<int, double>> upsample_taps(const std::string& mode, bool align, int in, int out, int d) {
+  if (mode != "bilinear") {
+    const double scale = static_cast<double>(in) / out;
+    const double src = mode == "nearest" ? d * scale : (d + 0.5) * scale;
+    return {{std::min(static_cast<int>(std::floor(src)), in - 1), 1.0}};
+  }
+  double src;
+  if (align)
+    src = out > 1 ? static_cast<double>(d) * (in - 1) / (out - 1) : 0.0;
+  else
+    src = std::max(0.0, (d + 0.5) * static_cast<double>(in) / out - 0.5);
+  const int i0 = std::min(static_cast<int>(std::floor(src)), in - 1);
+  const int i1 = std::min(i0 + 1, in - 1);
+  const double l = src - i0;
+  if (i1 == i0 || l == 0.0) return {{i0, 1.0}};
+  return {{i0, 1.0 - l}, {i1, l}};
+}
+
+}  // namespace
+
+SparseMatrix Upsample::matrix() const {
+  SparseMatrix m(out_.size(), in_.size());
+  for (int y = 0; y < out_.h; ++y) {
+    const auto ty = upsample_taps(mode_, align_, in_.h, out_.h, y);
+    for (int x = 0; x < out_.w; ++x) {
+      const auto tx = upsample_taps(mode_, align_, in_.w, out_.w, x);
+      for (int c = 0; c < out_.c; ++c) {
+        const size_t row = (static_cast<size_t>(c) * out_.h + y) * out_.w + x;
+        for (const auto& [iy, wy] : ty)
+          for (const auto& [ix, wx] : tx)
+            m.add(row, (static_cast<size_t>(c) * in_.h + iy) * in_.w + ix, wy * wx);
+      }
+    }
+  }
+  return m;
+}
+
+void Upsample::save(std::ostream& os) const {
+  os << "upsample " << mode_ << " " << out_h_ << " " << out_w_ << " " << (align_ ? 1 : 0) << "\n";
 }
 
 // ----------------------------------------------------------------------- Dense
@@ -810,6 +1008,106 @@ void ChannelAffine::save(std::ostream& os) const {
   write_vec(os, shift_);
 }
 
+// ------------------------------------------------------------------- BatchNorm
+
+BatchNorm::BatchNorm(std::vector<double> gamma, std::vector<double> beta, std::vector<double> running_mean,
+                     std::vector<double> running_var, double eps, double momentum, double var_min, double var_max,
+                     uint32_t degree, uint32_t newton)
+    : gamma_(std::move(gamma)), beta_(std::move(beta)), rm_(std::move(running_mean)), rv_(std::move(running_var)),
+      eps_(eps), momentum_(momentum), var_min_(var_min), var_max_(var_max), degree_(degree), newton_(newton) {
+  const size_t c = gamma_.size();
+  if (!c || beta_.size() != c || rm_.size() != c || rv_.size() != c)
+    throw std::invalid_argument("batchnorm: gamma, beta and the running statistics need one value per channel");
+  if (!(eps > 0.0) || !(momentum >= 0.0 && momentum <= 1.0))
+    throw std::invalid_argument("batchnorm: need eps > 0 and momentum in [0, 1]");
+  if (!(var_min >= 0.0 && var_min < var_max) || degree < 1)
+    throw std::invalid_argument("batchnorm: need 0 <= var_min < var_max and degree >= 1");
+  for (double v : rv_)
+    if (!(v + eps_ > 0.0)) throw std::invalid_argument("batchnorm: running variance + eps must be positive");
+  coeffs_ = lbcrypto::EvalChebyshevCoefficients([this](double v) { return 1.0 / std::sqrt(v + eps_); }, var_min_,
+                                                var_max_, degree_);
+}
+
+std::string BatchNorm::describe() const {
+  std::ostringstream os;
+  os << "batchnorm " << gamma_.size() << " var [" << var_min_ << ", " << var_max_ << "] deg " << degree_
+     << LinearLayer::describe();
+  return os.str();
+}
+
+Shape BatchNorm::configure(const Shape& in) {
+  if (static_cast<size_t>(in.c) != gamma_.size()) throw std::invalid_argument("batchnorm: channel mismatch");
+  return in_ = out_ = in;
+}
+
+SparseMatrix BatchNorm::matrix() const {
+  SparseMatrix m(in_.size(), in_.size());
+  const size_t hw = positions();
+  for (size_t i = 0; i < in_.size(); ++i) {
+    const size_t c = i / hw;
+    m.add(i, i, gamma_[c] / std::sqrt(rv_[c] + eps_));
+  }
+  return m;
+}
+
+std::vector<double> BatchNorm::bias() const {
+  std::vector<double> b(in_.size());
+  const size_t hw = positions();
+  for (size_t i = 0; i < b.size(); ++i) {
+    const size_t c = i / hw;
+    b[i] = beta_[c] - rm_[c] * gamma_[c] / std::sqrt(rv_[c] + eps_);
+  }
+  return b;
+}
+
+std::vector<double> BatchNorm::params() const { return concat(gamma_, beta_); }
+
+void BatchNorm::set_params(const std::vector<double>& p) {
+  split(p, gamma_, beta_, "batchnorm");
+  invalidate();
+}
+
+void BatchNorm::set_running(std::vector<double> mean, std::vector<double> var) {
+  if (mean.size() != gamma_.size() || var.size() != gamma_.size())
+    throw std::invalid_argument("batchnorm: running statistics size mismatch");
+  for (double& v : var) v = std::max(v, 0.0);  // CKKS noise around a zero variance
+  rm_ = std::move(mean);
+  rv_ = std::move(var);
+  invalidate();
+}
+
+void BatchNorm::absorb_input_scale(double c) {
+  if (!(c > 0.0)) throw std::invalid_argument("batchnorm: input scale must be positive");
+  for (double& m : rm_) m *= c;
+  for (double& v : rv_) v *= c * c;
+  eps_ *= c * c;
+  var_min_ *= c * c;
+  var_max_ *= c * c;
+  coeffs_ = lbcrypto::EvalChebyshevCoefficients([this](double v) { return 1.0 / std::sqrt(v + eps_); }, var_min_,
+                                                var_max_, degree_);
+  invalidate();
+}
+
+double BatchNorm::inv_sqrt(double v) const {
+  double r = lbcrypto::EvalChebyshevFunctionPtxt([this](double u) { return 1.0 / std::sqrt(u + eps_); }, {v},
+                                                 var_min_, var_max_, degree_)[0];
+  for (uint32_t i = 0; i < newton_; ++i) r = 1.5 * r - 0.5 * (v + eps_) * r * r * r;
+  return r;
+}
+
+uint32_t BatchNorm::inv_sqrt_depth() const {
+  return poly_depth(degree_) + (var_min_ == -1.0 && var_max_ == 1.0 ? 0 : 1) + 2 * newton_;
+}
+
+void BatchNorm::save(std::ostream& os) const {
+  os << std::setprecision(std::numeric_limits<double>::max_digits10) << "batchnorm " << gamma_.size() << " " << eps_
+     << " " << momentum_ << " " << var_min_ << " " << var_max_ << " " << degree_ << " " << newton_ << "\n";
+  write_vec(os, gamma_);
+  write_vec(os, beta_);
+  write_vec(os, rm_);
+  write_vec(os, rv_);
+}
+
 // ----------------------------------------------------------------------- Scale
 
 Scale::Scale(std::vector<double> factors) : factors_(std::move(factors)) {
@@ -1145,6 +1443,32 @@ void ExactReLU::rescale(double in, double out) {
 void ExactReLU::save(std::ostream& os) const {
   os << std::setprecision(std::numeric_limits<double>::max_digits10) << "exactrelu " << range_ << " " << out_scale_
      << " " << (after_bootstrap_ ? 1 : 0) << "\n";
+}
+
+Dropout::Dropout(double p, uint64_t seed) : p_(p), seed_(seed), rng_(seed) {
+  if (!(p >= 0.0 && p < 1.0)) throw std::invalid_argument("dropout: p must be in [0, 1)");
+}
+
+std::string Dropout::describe() const {
+  std::ostringstream os;
+  os << "dropout p=" << p_;
+  return os.str();
+}
+
+std::vector<double> Dropout::draw() {
+  std::vector<double> m(out_.size());
+  std::uniform_real_distribution<double> u(0.0, 1.0);
+  for (double& v : m) v = u(rng_) < p_ ? 0.0 : 1.0 / (1.0 - p_);
+  return m;
+}
+
+void Dropout::reseed(uint64_t seed) {
+  seed_ = seed;
+  rng_.seed(seed);
+}
+
+void Dropout::save(std::ostream& os) const {
+  os << std::setprecision(std::numeric_limits<double>::max_digits10) << "dropout " << p_ << " " << seed_ << "\n";
 }
 
 void Bootstrap::save(std::ostream& os) const { os << "bootstrap\n"; }

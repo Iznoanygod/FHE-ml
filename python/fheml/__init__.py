@@ -64,6 +64,10 @@ ChannelAffine = _accepting_numpy(_fheml.ChannelAffine)
 Chebyshev = _fheml.Chebyshev
 ExactReLU = _fheml.ExactReLU
 Conv2d = _accepting_numpy(_fheml.Conv2d)
+ConvTranspose2d = _accepting_numpy(_fheml.ConvTranspose2d)
+Upsample = _fheml.Upsample
+BatchNorm = _accepting_numpy(_fheml.BatchNorm)
+Dropout = _fheml.Dropout
 Dense = _accepting_numpy(_fheml.Dense)
 Poly = _accepting_numpy(_fheml.Poly)
 TokenDense = _accepting_numpy(_fheml.TokenDense)
@@ -237,19 +241,37 @@ def make_trainer(net, frozen=(), secure=True, bootstrapping=True, updates=1, ful
     return trainer, ctx
 
 
-def train_step(trainer, ctx, xs, targets, lr):
+def train_step(trainer, ctx, xs, targets, lr, batched=None):
     """One encrypted optimizer update on a batch of (numpy) samples.
+
+    batched: process the batch layer by layer (Trainer.accumulate_batch),
+    which batch norms need for their batch statistics; it keeps every
+    sample's activations until the backward pass. None = only when the
+    network has a trained BatchNorm layer (Trainer.batch_coupled).
 
     The client encrypts each input and target; the server accumulates
     gradients and updates the encrypted weights. Returns the decrypted
     outputs (for monitoring; only the key holder can do this).
     """
-    outs = []
-    for x, t in zip(xs, targets):
-        y = trainer.accumulate(ctx, trainer.encrypt_input(ctx, _flat(x)), trainer.encrypt_target(ctx, _flat(t)))
-        outs.append(trainer.decrypt_output(ctx, y))
+    if batched is None:
+        batched = trainer.batch_coupled
+    if batched:
+        ys = trainer.accumulate_batch(ctx, [trainer.encrypt_input(ctx, _flat(x)) for x in xs],
+                                      [trainer.encrypt_target(ctx, _flat(t)) for t in targets])
+        outs = [trainer.decrypt_output(ctx, y) for y in ys]
+    else:
+        outs = []
+        for x, t in zip(xs, targets):
+            y = trainer.accumulate(ctx, trainer.encrypt_input(ctx, _flat(x)), trainer.encrypt_target(ctx, _flat(t)))
+            outs.append(trainer.decrypt_output(ctx, y))
     trainer.update(ctx, lr)
     return np.asarray(outs)
+
+
+def forward_plain_batch(net, xs):
+    """Outputs on a batch as training computes them: batch norms use the
+    batch's statistics, dropout layers draw their masks."""
+    return np.asarray(_fheml.forward_plain_batch(net, [_flat(x) for x in xs]))
 
 
 def train_plain(net, xs, targets, lr, frozen=(), loss=None, optimizer=None, state=None):

@@ -47,12 +47,58 @@ std::vector<int> read_segments(std::istream& is, int n) {
 
 std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
   std::shared_ptr<Layer> layer;
-  if (tok == "conv2d") {
-    int ic, oc, kh, kw, s, p, hb;
-    is >> ic >> oc >> kh >> kw >> s >> p >> hb;
-    auto w = read_vec(is, static_cast<size_t>(oc) * ic * kh * kw, "conv2d weights");
-    auto b = hb ? read_vec(is, oc, "conv2d bias") : std::vector<double>{};
-    layer = std::make_shared<Conv2d>(ic, oc, kh, kw, s, p, std::move(w), std::move(b));
+  if (tok == "conv2d" || tok == "convtranspose2d") {
+    int ic, oc, kh, kw, hb;
+    ConvGeometry g;
+    is >> ic >> oc >> kh >> kw >> g.stride >> g.pad_h >> hb;
+    g.pad_w = g.pad_h;
+    for (;;) {  // optional "groups G", "dilation DH DW", "padw PW", "outpad OH OW"
+      std::string next;
+      auto pos = is.tellg();
+      if (is >> next && next == "groups") {
+        is >> g.groups;
+      } else if (next == "dilation") {
+        is >> g.dil_h >> g.dil_w;
+      } else if (next == "padw") {
+        is >> g.pad_w;
+      } else if (next == "outpad") {
+        is >> g.out_pad_h >> g.out_pad_w;
+      } else {
+        is.clear();
+        is.seekg(pos);
+        break;
+      }
+    }
+    if (g.groups < 1) throw std::runtime_error("model file: bad " + tok + " groups");
+    const size_t nw = tok == "conv2d" ? static_cast<size_t>(oc) * (ic / g.groups) * kh * kw
+                                      : static_cast<size_t>(ic) * (oc / g.groups) * kh * kw;
+    auto w = read_vec(is, nw, tok + " weights");
+    auto b = hb ? read_vec(is, oc, tok + " bias") : std::vector<double>{};
+    if (tok == "conv2d")
+      layer = std::make_shared<Conv2d>(ic, oc, kh, kw, g, std::move(w), std::move(b));
+    else
+      layer = std::make_shared<ConvTranspose2d>(ic, oc, kh, kw, g, std::move(w), std::move(b));
+  } else if (tok == "batchnorm") {
+    size_t c;
+    double eps, mom, vmin, vmax;
+    uint32_t deg, newton;
+    is >> c >> eps >> mom >> vmin >> vmax >> deg >> newton;
+    auto g = read_vec(is, c, "batchnorm gamma");
+    auto b = read_vec(is, c, "batchnorm beta");
+    auto m = read_vec(is, c, "batchnorm running mean");
+    auto v = read_vec(is, c, "batchnorm running var");
+    layer = std::make_shared<BatchNorm>(std::move(g), std::move(b), std::move(m), std::move(v), eps, mom, vmin, vmax,
+                                        deg, newton);
+  } else if (tok == "dropout") {
+    double p;
+    uint64_t seed;
+    is >> p >> seed;
+    layer = std::make_shared<Dropout>(p, seed);
+  } else if (tok == "upsample") {
+    std::string mode;
+    int oh, ow, align;
+    is >> mode >> oh >> ow >> align;
+    layer = std::make_shared<Upsample>(mode, oh, ow, align != 0);
   } else if (tok == "dense") {
     int i, o, hb;
     is >> i >> o >> hb;
@@ -414,7 +460,7 @@ Fold fold_kind(const Layer& l) {
     // MaxPool2d: max(c x) = c max(x), c > 0, taken by its gather; ArgMax:
     // argmax(c x) = argmax(x), its gather takes 1/c (the range stays put).
     return Fold::kAbsorb;
-  if (l.is_bootstrap()) return Fold::kPass;
+  if (l.is_bootstrap() || dynamic_cast<const Dropout*>(&l)) return Fold::kPass;
   if (auto* lin = dynamic_cast<const LinearLayer*>(&l)) {
     if (lin->trainable()) return Fold::kAbsorb;
     return lin->bias().empty() ? Fold::kPass : Fold::kBlock;
@@ -526,6 +572,7 @@ void absorb_input(std::shared_ptr<Layer>& l, double c) {
   if (auto* mp = dynamic_cast<MaxPool2d*>(l.get())) return mp->set_gain(mp->gain() / c);
   if (auto* rec = dynamic_cast<Recurrent*>(l.get())) return rec->absorb_input_scale(c);
   if (auto* am = dynamic_cast<ArgMax*>(l.get())) return am->set_gain(am->gain() / c);
+  if (auto* bn = dynamic_cast<BatchNorm*>(l.get())) return bn->absorb_input_scale(c);
   if (auto* at = dynamic_cast<Attention*>(l.get())) {
     // q, k and v are linear in the input: their weights (not biases) take 1/c.
     std::vector<double> p = at->params();

@@ -108,10 +108,45 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("trainable", &Layer::trainable);
 
   py::class_<LinearLayer, Layer, std::shared_ptr<LinearLayer>>(m, "LinearLayer");
+  auto geometry = [](int stride, int pad, int pad_w, int groups, int dil_h, int dil_w, int op_h, int op_w) {
+    ConvGeometry g;
+    g.stride = stride;
+    g.pad_h = pad;
+    g.pad_w = pad_w < 0 ? pad : pad_w;
+    g.groups = groups;
+    g.dil_h = dil_h;
+    g.dil_w = dil_w;
+    g.out_pad_h = op_h;
+    g.out_pad_w = op_w;
+    return g;
+  };
   py::class_<Conv2d, LinearLayer, std::shared_ptr<Conv2d>>(m, "Conv2d")
-      .def(py::init<int, int, int, int, int, int, Vec, Vec>(), py::arg("in_channels"), py::arg("out_channels"),
-           py::arg("kh"), py::arg("kw"), py::arg("stride"), py::arg("pad"), py::arg("weights"),
-           py::arg("bias") = Vec{});
+      .def(py::init([geometry](int ic, int oc, int kh, int kw, int stride, int pad, Vec w, Vec b, int groups,
+                               int dil_h, int dil_w, int pad_w) {
+             return std::make_shared<Conv2d>(ic, oc, kh, kw, geometry(stride, pad, pad_w, groups, dil_h, dil_w, 0, 0),
+                                             std::move(w), std::move(b));
+           }),
+           py::arg("in_channels"), py::arg("out_channels"), py::arg("kh"), py::arg("kw"), py::arg("stride"),
+           py::arg("pad"), py::arg("weights"), py::arg("bias") = Vec{}, py::arg("groups") = 1,
+           py::arg("dilation_h") = 1, py::arg("dilation_w") = 1, py::arg("pad_w") = -1,
+           "Convolution; weights [out][in/groups][kh][kw]. pad is the vertical padding, pad_w the horizontal one "
+           "(-1 = pad). A 1-D convolution over (C, L) is kh = 1, pad = 0 on the (C, 1, L) shape.");
+  py::class_<ConvTranspose2d, LinearLayer, std::shared_ptr<ConvTranspose2d>>(m, "ConvTranspose2d")
+      .def(py::init([geometry](int ic, int oc, int kh, int kw, int stride, int pad, Vec w, Vec b, int groups,
+                               int dil_h, int dil_w, int pad_w, int op_h, int op_w) {
+             return std::make_shared<ConvTranspose2d>(ic, oc, kh, kw,
+                                                      geometry(stride, pad, pad_w, groups, dil_h, dil_w, op_h, op_w),
+                                                      std::move(w), std::move(b));
+           }),
+           py::arg("in_channels"), py::arg("out_channels"), py::arg("kh"), py::arg("kw"), py::arg("stride"),
+           py::arg("pad"), py::arg("weights"), py::arg("bias") = Vec{}, py::arg("groups") = 1,
+           py::arg("dilation_h") = 1, py::arg("dilation_w") = 1, py::arg("pad_w") = -1,
+           py::arg("output_padding_h") = 0, py::arg("output_padding_w") = 0,
+           "Transposed convolution (torch ConvTranspose2d); weights [in][out/groups][kh][kw].");
+  py::class_<Upsample, LinearLayer, std::shared_ptr<Upsample>>(m, "Upsample")
+      .def(py::init<std::string, int, int, bool>(), py::arg("mode"), py::arg("out_h"), py::arg("out_w"),
+           py::arg("align_corners") = false,
+           "Upsampling to (out_h, out_w): nearest, nearest-exact or bilinear (linear on (C, 1, L) signals).");
   py::class_<Dense, LinearLayer, std::shared_ptr<Dense>>(m, "Dense")
       .def(py::init<int, int, Vec, Vec>(), py::arg("inputs"), py::arg("outputs"), py::arg("weights"),
            py::arg("bias") = Vec{});
@@ -165,6 +200,22 @@ PYBIND11_MODULE(_fheml, m) {
            "sequence or into another token. One level.")
       .def_property_readonly("index", &Select::index);
   py::class_<Bootstrap, Layer, std::shared_ptr<Bootstrap>>(m, "Bootstrap").def(py::init<>());
+  py::class_<Dropout, Layer, std::shared_ptr<Dropout>>(m, "Dropout")
+      .def(py::init<double, uint64_t>(), py::arg("p"), py::arg("seed") = 0,
+           "Identity at inference; the Trainer drops elements with probability p (a fresh plaintext mask per sample "
+           "and step, scaled by 1/(1-p), one level).")
+      .def_property_readonly("p", &Dropout::p)
+      .def("reseed", &Dropout::reseed, py::arg("seed"));
+  py::class_<BatchNorm, LinearLayer, std::shared_ptr<BatchNorm>>(m, "BatchNorm")
+      .def(py::init<Vec, Vec, Vec, Vec, double, double, double, double, uint32_t, uint32_t>(), py::arg("gamma"),
+           py::arg("beta"), py::arg("running_mean"), py::arg("running_var"), py::arg("eps") = 1e-5,
+           py::arg("momentum") = 0.1, py::arg("var_min") = 0.0, py::arg("var_max") = 4.0, py::arg("degree") = 15,
+           py::arg("newton") = 1,
+           "Batch norm: running statistics at inference (an affine layer); the Trainer uses the batch's statistics "
+           "with 1/sqrt(var + eps) as a Chebyshev series on [var_min, var_max] plus Newton steps.")
+      .def_property_readonly("running_mean", &BatchNorm::running_mean)
+      .def_property_readonly("running_var", &BatchNorm::running_var)
+      .def("set_running", &BatchNorm::set_running, py::arg("mean"), py::arg("var"));
   py::class_<Residual, Layer, std::shared_ptr<Residual>>(m, "Residual")
       .def(py::init<std::vector<LayerPtr>>(), py::arg("body"));
   py::class_<LayerNorm, Layer, std::shared_ptr<LayerNorm>>(m, "LayerNorm")
@@ -366,6 +417,7 @@ PYBIND11_MODULE(_fheml, m) {
       .def_property_readonly("weight_ciphertexts", &Trainer::weight_ciphertexts)
       .def_property_readonly("first_trained_layer", &Trainer::first_trained_layer)
       .def_property_readonly("weight_level", &Trainer::weight_level)
+      .def_property_readonly("batch_coupled", &Trainer::batch_coupled)
       .def("rotation_indices", &Trainer::rotation_indices, py::arg("ladder") = false)
       .def("context_options", &Trainer::context_options, py::arg("secure") = true, py::arg("bootstrapping") = true,
            py::arg("updates") = 1, py::arg("rotation_window") = 0)
@@ -385,6 +437,23 @@ PYBIND11_MODULE(_fheml, m) {
             return Ciphertext{t.accumulate(c, x.ct, y.ct)};
           },
           py::arg("ctx"), py::arg("x"), py::arg("target"))
+      .def(
+          "accumulate_batch",
+          [](Trainer& t, const FHEContext& c, const std::vector<Ciphertext>& xs, const std::vector<Ciphertext>& ys) {
+            std::vector<Ctxt> x, y;
+            for (const auto& e : xs) x.push_back(e.ct);
+            for (const auto& e : ys) y.push_back(e.ct);
+            std::vector<Ctxt> out;
+            {
+              py::gil_scoped_release release;
+              out = t.accumulate_batch(c, x, y);
+            }
+            std::vector<Ciphertext> r;
+            for (auto& o : out) r.push_back(Ciphertext{o});
+            return r;
+          },
+          py::arg("ctx"), py::arg("xs"), py::arg("targets"),
+          "Forward and backward pass of a whole batch, layer by layer (batch norms use the batch's statistics).")
       .def("update", &Trainer::update, py::arg("ctx"), py::arg("lr"), py::call_guard<py::gil_scoped_release>())
       .def(
           "forward",
@@ -401,6 +470,8 @@ PYBIND11_MODULE(_fheml, m) {
 
   m.def("gpu_backend_built", &gpu_backend_built, "True when built with FIDESlib (-DFHEML_GPU=ON).");
   m.def("gpu_device_count", &gpu_device_count, "Visible CUDA devices (0 without the GPU backend).");
+  m.def("forward_plain_batch", &forward_plain_batch, py::arg("net"), py::arg("xs"),
+        "Outputs on a batch as training computes them (batch statistics in batch norms, dropout masks drawn).");
   m.def("train_plain", &train_plain, py::arg("net"), py::arg("xs"), py::arg("targets"), py::arg("lr"),
         py::arg("frozen") = std::vector<size_t>{}, py::arg("loss") = Loss{}, py::arg("optimizer") = Optimizer{},
         py::arg("state") = static_cast<OptimizerState*>(nullptr),
