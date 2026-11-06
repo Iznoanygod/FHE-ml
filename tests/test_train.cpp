@@ -8,6 +8,8 @@
 // 4. Deep networks under a level budget: activations and gradients are
 //    bootstrapped inside the step (a softmax transformer block, softmax with
 //    the scheme-switching row maximum).
+// 5. Optimizers: momentum, Nesterov, weight decay, Adam and AdamW, with
+//    their state encrypted and carried over several updates.
 #include <cmath>
 #include <cstdio>
 #include <algorithm>
@@ -340,7 +342,8 @@ FHEContext training_context(const Trainer& tr, bool boot, uint32_t updates, uint
 // level budget and bootstrap range.
 void encrypted_check(const std::string& name, const Builder& make, size_t updates, bool boot, double tol,
                      const std::vector<size_t>& frozen = {}, double lr = 0.5, uint32_t window = 0,
-                     const Loss& kind = Loss{}, uint32_t budget = 0, double range = 1.0) {
+                     const Loss& kind = Loss{}, uint32_t budget = 0, double range = 1.0,
+                     const Optimizer& opt = Optimizer{}) {
   const bool onehot = kind.kind == Loss::kCrossEntropy;
   Network plain = make();
   plain.compile();
@@ -349,7 +352,8 @@ void encrypted_check(const std::string& name, const Builder& make, size_t update
   // (only the slots needed with a level budget: sparse bootstraps are more
   // precise and faster, and activations are bootstrapped many times).
   enc.compile(boot && !budget ? 2048 : 0);
-  Trainer tr(enc, frozen, kind);
+  Trainer tr(enc, frozen, kind, opt);
+  OptimizerState state;
   if (budget) {
     tr.set_level_budget(budget, range);
     check(tr.unbounded_step_depth() > budget && tr.step_depth() <= budget, name + " step fits the level budget",
@@ -368,7 +372,7 @@ void encrypted_check(const std::string& name, const Builder& make, size_t update
   std::vector<double> before = all_params(plain);
   for (size_t u = 0; u < updates; ++u) {
     Batch b = batch(plain, 2, 100 + static_cast<unsigned>(u), onehot);
-    train_plain(plain, b.xs, b.ts, lr, frozen, kind);
+    train_plain(plain, b.xs, b.ts, lr, frozen, kind, opt, &state);
     size_t boots = 0;
     for (size_t s = 0; s < b.xs.size(); ++s) {
       tr.accumulate(ctx, tr.encrypt_input(ctx, b.xs[s]), tr.encrypt_target(ctx, b.ts[s]));
@@ -464,11 +468,115 @@ void cross_entropy_tests(bool quick) {
                     0, cross_entropy(true));
 }
 
+// Adam's encrypted rsqrt against 1 / sqrt(u + eps), and the plaintext
+// optimizers against their textbook definitions (exact square root): SGD
+// with momentum 0 is the plain step, and every optimizer's step follows from
+// the batch gradient.
+void optimizer_reference_tests() {
+  {
+    const Optimizer o = Optimizer::adam(0.9, 0.999, 0.04, 4.0);
+    double err = 0.0;
+    for (int i = 0; i <= 1000; ++i) {
+      const double u = 4.0 * i / 1000.0;
+      err = std::max(err, std::fabs(o.rsqrt(u) * std::sqrt(u + o.eps) - 1.0));
+    }
+    check_err("adam rsqrt, degree 31 + 2 newton on [0, 100 eps]", err, 1e-10);
+  }
+  struct Case {
+    std::string name;
+    Optimizer o;
+  };
+  const std::vector<Case> cases = {
+      {"sgd", Optimizer::sgd()},
+      {"sgd, weight decay", Optimizer::sgd(0.0, 0.1)},
+      {"momentum", Optimizer::sgd(0.9)},
+      {"nesterov, weight decay", Optimizer::sgd(0.9, 0.1, true)},
+      {"sgdw (decoupled decay)", Optimizer::sgd(0.8, 0.1, false, true)},
+      {"adam", Optimizer::adam(0.9, 0.99, 0.04, 4.0)},
+      {"adamw", Optimizer::adamw(0.1, 0.9, 0.99, 0.04, 4.0)},
+  };
+  for (const Case& c : cases) {
+    // The batch gradient of each step (an SGD step with lr = 1 on a copy),
+    // then the optimizer's textbook update from it.
+    Network net = mlp(21), probe = mlp(21);
+    net.compile();
+    probe.compile();
+    OptimizerState st;
+    const double lr = 0.05;
+    std::vector<double> p = all_params(net), m(p.size(), 0.0), v(p.size(), 0.0);
+    double err = 0.0;
+    for (int t = 1; t <= 3; ++t) {
+      Batch b = batch(net, 2, 300 + static_cast<unsigned>(t));
+      std::vector<Layer*> ls;
+      trainable_layers(probe.layers(), ls);
+      {
+        size_t k = 0;
+        for (auto* l : ls) {
+          auto q = l->params();
+          for (double& x : q) x = p[k++];
+          l->set_params(q);
+        }
+      }
+      train_plain(probe, b.xs, b.ts, 1.0);
+      const std::vector<double> after = all_params(probe);
+      const Optimizer& o = c.o;
+      for (size_t i = 0; i < p.size(); ++i) {
+        const double g = (p[i] - after[i]) + (o.decoupled ? 0.0 : o.weight_decay * p[i]);
+        double d = g;
+        if (o.kind == Optimizer::kSGD && o.momentum != 0.0) {
+          m[i] = t == 1 ? g : o.momentum * m[i] + g;
+          d = o.nesterov ? g + o.momentum * m[i] : m[i];
+        } else if (o.kind == Optimizer::kAdam) {
+          m[i] = o.beta1 * m[i] + (1 - o.beta1) * g;
+          v[i] = o.beta2 * v[i] + (1 - o.beta2) * g * g;
+          d = m[i] / (1 - std::pow(o.beta1, t)) / std::sqrt(v[i] / (1 - std::pow(o.beta2, t)) + o.eps);
+        }
+        p[i] -= lr * (d + (o.decoupled ? o.weight_decay * p[i] : 0.0));
+      }
+      train_plain(net, b.xs, b.ts, lr, {}, Loss{}, o, &st);
+      err = std::max(err, max_diff(all_params(net), p));
+    }
+    check_err("plain optimizer " + c.name + ", 3 steps", err, 1e-9);
+  }
+}
+
+void optimizer_tests(bool quick) {
+  optimizer_reference_tests();
+  // The state lives at the weights' level, so a second update reads it;
+  // shared weights (conv taps, layer norm gamma) carry one broadcast state.
+  encrypted_check("mlp, momentum", [] { return mlp(1); }, 2, false, 1e-4, {}, 0.3, 0, Loss{}, 0, 1.0,
+                  Optimizer::sgd(0.9));
+  encrypted_check("cnn, nesterov + weight decay", [] { return cnn(2); }, 2, false, 1e-4, {}, 0.3, 0, Loss{}, 0, 1.0,
+                  Optimizer::sgd(0.9, 0.05, true));
+  encrypted_check("mlp, adam", [] { return mlp(1); }, 2, false, 1e-4, {}, 0.05, 0, Loss{}, 0, 1.0,
+                  Optimizer::adam(0.9, 0.99, 0.04, 4.0));
+  encrypted_check("layernorm, adamw", [] { return norm_tokens(9); }, 1, false, 1e-4, {}, 0.05, 0, Loss{}, 0, 1.0,
+                  Optimizer::adamw(0.1, 0.9, 0.99, 0.04, 4.0));
+  // Bootstrapped weights and state over three updates.
+  if (!quick)
+    encrypted_check("mlp, adamw, bootstrapped weights and state", [] { return mlp(6); }, 3, true, 1e-3, {}, 0.05, 0,
+                    Loss{}, 0, 1.0, Optimizer::adamw(0.1, 0.9, 0.99, 0.04, 1.0));
+  // The update itself split by bootstraps under a level budget.
+  {
+    Network probe = cnn(7);
+    probe.compile();
+    const Optimizer o = Optimizer::adam(0.9, 0.99, 0.04, 1.0);
+    const uint32_t budget = Trainer(probe, {}, Loss{}, o).min_level_budget();
+    encrypted_check("cnn, adam, level budget", [] { return cnn(7); }, 2, true, 1e-3, {}, 0.05, 0, Loss{}, budget, 16.0,
+                    o);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const bool quick = argc > 1 && std::strcmp(argv[1], "--quick") == 0;
+  if (argc > 1 && std::strcmp(argv[1], "--optimizers") == 0) {
+    optimizer_tests(false);
+    std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");
+    return g_failures ? 1 : 0;
+  }
 
   gradient_check("mlp", [] { return mlp(1); });
   gradient_check("cnn (shared weights, affine, square, avgpool)", [] { return cnn(2); });
@@ -539,6 +647,7 @@ int main(int argc, char** argv) {
   }
 
   cross_entropy_tests(quick);
+  optimizer_tests(quick);
 
   std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "PASSED", g_failures, g_failures == 1 ? "" : "s");
   return g_failures ? 1 : 0;

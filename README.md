@@ -57,9 +57,10 @@ That code is kept in [`legacy/`](legacy/) for reference.
   `fheml.from_torch(model, input_shape)` gives the encrypted network.
   `fheml.nn.RNN`, `GRU` and `LSTM` are torch's recurrent cells with the
   series the encrypted layer evaluates.
-* **Encrypted training.** `Trainer` runs SGD with backpropagation entirely on
-  ciphertexts: encrypted inputs, labels, weights, activations and gradients.
-  The encrypted weights are bootstrapped after every update. Freezing the
+* **Encrypted training.** `Trainer` runs backpropagation and SGD (momentum,
+  Nesterov, weight decay) or Adam / AdamW entirely on ciphertexts: encrypted
+  inputs, labels, weights, activations, gradients and optimizer state.
+  The encrypted weights and state are bootstrapped after every update. Freezing the
   first layers turns the same API into encrypted fine-tuning. See
   [Encrypted training](#encrypted-training).
 * **Deep networks.** `Bootstrap` layers refresh ciphertexts, and
@@ -1159,13 +1160,15 @@ of each image's time. 128-bit parameters do not fit this machine.
 ## Encrypted training
 
 `Trainer` trains a network on encrypted data. The client encrypts inputs and
-one-hot targets; the server runs forward, backward and SGD updates on
-ciphertexts and never sees the data, the labels, the gradients or the weights.
+one-hot targets; the server runs forward, backward and optimizer updates on
+ciphertexts and never sees the data, the labels, the gradients, the optimizer
+state or the weights.
 Only the secret-key holder can decrypt the trained model.
 
 ```python
 net.compile()
-trainer, ctx = fheml.make_trainer(net, frozen=[], secure=True)  # bootstraps the weights after each update
+trainer, ctx = fheml.make_trainer(net, frozen=[], secure=True,  # bootstraps the weights after each update
+                                  optimizer=fheml.adamw(weight_decay=0.01, eps=0.01, v_max=1.0))
 trainer.encrypt_weights(ctx)
 for xs, ts in batches:
     fheml.train_step(trainer, ctx, xs, ts, lr=1.0)       # encrypt, accumulate gradients, update
@@ -1205,7 +1208,20 @@ trainer.decrypt_weights(ctx)                             # key holder: trained w
   one update of the MLP at degree 7 / 7) and far more than the ~6 a
   bootstrap leaves there, so 128-bit cross-entropy training needs ring 2^17
   or bootstraps inside the softmax (not done yet).
-* **Check:** `fheml.train_plain` runs the same SGD in the clear.
+* **Optimizer:** `fheml.sgd(momentum, weight_decay, nesterov, decoupled)`
+  (default plain SGD), `fheml.adam(betas, eps, v_max, weight_decay)` and
+  `fheml.adamw(weight_decay, ...)`, with torch.optim's update rules. The
+  momentum buffer and Adam's moments are ciphertexts, one per weight
+  ciphertext, bootstrapped with the weights. The constants (learning rate,
+  momentum, bias corrections) fold into the gradient's masks, so momentum and
+  weight decay cost one level; Adam's `1/sqrt(v + eps)` is the layer norm's
+  Chebyshev series plus Newton steps on `[0, v_max]` (`v_max` bounds the
+  squared gradient; keep `v_max / eps` near 100 at degree 31), 12 levels
+  after the gradient at degree 31 with two Newton steps, which a level budget
+  splits with bootstraps like the rest of the step. `eps` sits inside the
+  square root.
+* **Check:** `fheml.train_plain` runs the same optimizer in the clear (pass
+  an `fheml.OptimizerState` for momentum and Adam).
   `tests/test_train.cpp` shows the decrypted weights match it to about 1e-8
   without bootstrapping and 3e-4 with it, and checks the plaintext gradients
   against finite differences.

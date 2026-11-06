@@ -16,9 +16,12 @@
 // Activations backpropagate through their derivative polynomial, evaluated
 // under encryption. The loss is 0.5 * |y - t|^2 against an encrypted target
 // (so dL/dy = y - t), or softmax cross-entropy (see Loss). Gradients are
-// summed over a batch and applied in one update, after which the weights are
-// bootstrapped so the next step starts
-// fresh; without bootstrapping only as many updates fit as the depth allows.
+// averaged over a batch and applied in one update by the optimizer (SGD with
+// momentum, Nesterov momentum and weight decay, or Adam / AdamW; see
+// Optimizer), whose per-weight state is encrypted like the weights. After the
+// update the weights and the optimizer state are bootstrapped so the next
+// step starts fresh; without bootstrapping only as many updates fit as the
+// depth allows.
 //
 // Layer norms train gamma and beta (shared over the tokens like a conv tap)
 // and backpropagate through the normalisation with the forward's 1/sqrt;
@@ -47,6 +50,7 @@
 #ifndef FHEML_TRAIN_H_
 #define FHEML_TRAIN_H_
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -94,6 +98,96 @@ struct Loss {
   }
 };
 
+// The optimizer that applies the averaged gradient g of every parameter p
+// (lr is passed to Trainer::update, so schedules are the caller's):
+//
+// kSGD (torch.optim.SGD): g' = g + wd p, b = mu b + g', and
+//   p -= lr (nesterov ? g' + mu b : b)   (b = g' when momentum is 0).
+// kAdam (torch.optim.Adam): g' = g + wd p, m = b1 m + (1 - b1) g',
+//   v = b2 v + (1 - b2) g'^2, and after t updates
+//   p -= lr m / (1 - b1^t) * rsqrt(v / (1 - b2^t)),
+//   rsqrt(u) ~ 1 / sqrt(u + eps): a Chebyshev series on [0, v_max] plus
+//   `newton` Newton steps, the same approximation as LayerNorm's.
+// decoupled (SGDW, AdamW): the decay is not part of g' but applied to the
+// weights directly, p -= lr wd p.
+//
+// Adam keeps the bias-corrected m / (1 - b1^t) and v / (1 - b2^t) (the
+// same recurrences with public per-step constants), so its state stays at
+// the gradient's magnitude and keeps its precision through bootstraps.
+// Every state vector (b, or m and v) is a ciphertext per weight ciphertext,
+// zero wherever the weight ciphertext is, and is bootstrapped with the
+// weights. Shared weights carry one state broadcast over their slots, like
+// their gradient. The update constants (lr, the momentum and bias
+// corrections) are public and fold into the plaintext masks of the gradient,
+// so SGD costs no level beyond plain SGD and one with momentum or decay
+// (the state and weight products); Adam costs 1 (g'^2) +
+// poly_depth(degree) + 1 + 2 newton + 1 (the product with m) after the
+// gradient.
+//
+// eps sits inside the square root and bounds how steep the series is: with
+// v_max / eps = 100, degree 31 and 2 Newton steps reach a relative error of
+// 3e-12; v_max / eps = 1000 needs degree 63 and 3 steps (5e-7 with 31 and
+// 3). v_max bounds the bias-corrected v, i.e. the squared gradient; slots
+// past it break the series.
+struct Optimizer {
+  enum Kind { kSGD, kAdam };
+  Kind kind = kSGD;
+  double weight_decay = 0.0;
+  bool decoupled = false;
+  // kSGD
+  double momentum = 0.0;
+  bool nesterov = false;
+  // kAdam
+  double beta1 = 0.9, beta2 = 0.999;
+  double eps = 1e-2, v_max = 1.0;
+  uint32_t degree = 31, newton = 2;
+
+  static Optimizer sgd(double momentum = 0.0, double weight_decay = 0.0, bool nesterov = false,
+                       bool decoupled = false) {
+    Optimizer o;
+    o.momentum = momentum;
+    o.weight_decay = weight_decay;
+    o.nesterov = nesterov;
+    o.decoupled = decoupled;
+    return o;
+  }
+  static Optimizer adam(double beta1 = 0.9, double beta2 = 0.999, double eps = 1e-2, double v_max = 1.0,
+                        double weight_decay = 0.0, bool decoupled = false, uint32_t degree = 31, uint32_t newton = 2) {
+    Optimizer o;
+    o.kind = kAdam;
+    o.beta1 = beta1;
+    o.beta2 = beta2;
+    o.eps = eps;
+    o.v_max = v_max;
+    o.weight_decay = weight_decay;
+    o.decoupled = decoupled;
+    o.degree = degree;
+    o.newton = newton;
+    return o;
+  }
+  static Optimizer adamw(double weight_decay = 1e-2, double beta1 = 0.9, double beta2 = 0.999, double eps = 1e-2,
+                         double v_max = 1.0, uint32_t degree = 31, uint32_t newton = 2) {
+    return adam(beta1, beta2, eps, v_max, weight_decay, true, degree, newton);
+  }
+
+  bool has_state() const { return kind == kAdam || momentum != 0.0; }
+  // Levels from the gradient (and the weights) to the weight increment, see above.
+  uint32_t depth() const;
+  // 1 / sqrt(u + eps) as the encrypted update evaluates it (u = the
+  // bias-corrected v).
+  double rsqrt(double u) const;
+  void validate() const;
+  std::string describe() const;
+};
+
+// Plaintext optimizer state for train_plain: per layer the momentum buffer
+// (or m) and v, and the number of updates so far.
+struct OptimizerState {
+  std::map<const Layer*, std::vector<double>> m, v;
+  uint64_t steps = 0;
+  void reset() { *this = OptimizerState{}; }
+};
+
 // The softmax Trainer computes under encryption for cross-entropy (same
 // polynomials), and the exact -sum t log softmax(y).
 std::vector<double> softmax_plain(const Loss& loss, const std::vector<double>& y);
@@ -106,7 +200,8 @@ class Trainer {
   // the network may contain linear layers, square / poly / chebyshev
   // activations, layernorm, attention, maxpool2d, bootstrap and residual
   // layers.
-  explicit Trainer(Network& net, std::vector<size_t> frozen = {}, Loss loss = Loss{});
+  explicit Trainer(Network& net, std::vector<size_t> frozen = {}, Loss loss = Loss{},
+                   Optimizer optimizer = Optimizer{});
   ~Trainer();
   Trainer(const Trainer&) = delete;
   Trainer& operator=(const Trainer&) = delete;
@@ -157,9 +252,12 @@ class Trainer {
   // Forward and backward pass for one sample; adds its gradient to the
   // batch. Returns the (encrypted) network output.
   Ctxt accumulate(const FHEContext& ctx, const Ctxt& x, const Ctxt& target);
-  // w -= lr / n * (sum of the n accumulated gradients), then bootstraps the
-  // weights when the context supports it.
+  // One optimizer step with the mean of the n accumulated gradients (plain
+  // SGD: w -= lr / n * their sum), then bootstraps the weights and the
+  // optimizer state when the context supports it.
   void update(const FHEContext& ctx, double lr);
+  // Updates applied since encrypt_weights (Adam's t).
+  uint64_t steps() const { return steps_; }
   // Inference with the current encrypted weights.
   Ctxt forward(const FHEContext& ctx, const Ctxt& x);
   std::vector<double> decrypt_output(const FHEContext& ctx, const Ctxt& y) const;
@@ -174,6 +272,7 @@ class Trainer {
   uint32_t weight_level() const;
   std::string summary() const;
   const Loss& loss() const { return loss_; }
+  const Optimizer& optimizer() const { return opt_; }
 
   struct Node;
   struct CrossEntropy;
@@ -188,6 +287,8 @@ class Trainer {
   uint32_t base_level_ = 0;  // level weights and inputs are encrypted at
   bool encrypted_ = false;
   Loss loss_;
+  Optimizer opt_;
+  uint64_t steps_ = 0;
   std::unique_ptr<CrossEntropy> ce_;
 
   // dL/dy for the network output y (bootstrapping inside it under a level budget).
@@ -197,11 +298,13 @@ class Trainer {
   size_t sample_bootstraps_ = 0;
 };
 
-// Plaintext reference of Trainer: one SGD update on a batch with the same
-// loss, the same polynomials and the same weight sharing. Updates the
+// Plaintext reference of Trainer: one optimizer update on a batch with the
+// same loss, the same polynomials and the same weight sharing. Updates the
 // network's layers in place (compile() again before encrypted inference).
+// Optimizers with state keep it in `state` across calls (required then).
 void train_plain(Network& net, const std::vector<std::vector<double>>& xs, const std::vector<std::vector<double>>& ts,
-                 double lr, const std::vector<size_t>& frozen = {}, const Loss& loss = Loss{});
+                 double lr, const std::vector<size_t>& frozen = {}, const Loss& loss = Loss{},
+                 const Optimizer& optimizer = Optimizer{}, OptimizerState* state = nullptr);
 
 }  // namespace fheml
 

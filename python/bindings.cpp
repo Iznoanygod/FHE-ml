@@ -316,10 +316,45 @@ PYBIND11_MODULE(_fheml, m) {
   m.def("cross_entropy_plain", &cross_entropy_plain, py::arg("y"), py::arg("target"),
         "Exact -sum t log softmax(y).");
 
-  py::class_<Trainer>(m, "Trainer", "Encrypted SGD training (see include/fheml/train.h).")
-      .def(py::init<Network&, std::vector<size_t>, Loss>(), py::arg("net"), py::arg("frozen") = std::vector<size_t>{},
-           py::arg("loss") = Loss{}, py::keep_alive<1, 2>())
+  py::class_<Optimizer> opt(m, "Optimizer",
+                            "Training optimizer: Optimizer.sgd(...), Optimizer.adam(...), Optimizer.adamw(...) "
+                            "(see train.h).");
+  py::enum_<Optimizer::Kind>(opt, "Kind").value("SGD", Optimizer::kSGD).value("ADAM", Optimizer::kAdam);
+  opt.def(py::init<>())
+      .def_readwrite("kind", &Optimizer::kind)
+      .def_readwrite("weight_decay", &Optimizer::weight_decay)
+      .def_readwrite("decoupled", &Optimizer::decoupled)
+      .def_readwrite("momentum", &Optimizer::momentum)
+      .def_readwrite("nesterov", &Optimizer::nesterov)
+      .def_readwrite("beta1", &Optimizer::beta1)
+      .def_readwrite("beta2", &Optimizer::beta2)
+      .def_readwrite("eps", &Optimizer::eps)
+      .def_readwrite("v_max", &Optimizer::v_max)
+      .def_readwrite("degree", &Optimizer::degree)
+      .def_readwrite("newton", &Optimizer::newton)
+      .def_static("sgd", &Optimizer::sgd, py::arg("momentum") = 0.0, py::arg("weight_decay") = 0.0,
+                  py::arg("nesterov") = false, py::arg("decoupled") = false)
+      .def_static("adam", &Optimizer::adam, py::arg("beta1") = 0.9, py::arg("beta2") = 0.999, py::arg("eps") = 1e-2,
+                  py::arg("v_max") = 1.0, py::arg("weight_decay") = 0.0, py::arg("decoupled") = false,
+                  py::arg("degree") = 31, py::arg("newton") = 2)
+      .def_static("adamw", &Optimizer::adamw, py::arg("weight_decay") = 1e-2, py::arg("beta1") = 0.9,
+                  py::arg("beta2") = 0.999, py::arg("eps") = 1e-2, py::arg("v_max") = 1.0, py::arg("degree") = 31,
+                  py::arg("newton") = 2)
+      .def_property_readonly("depth", &Optimizer::depth)
+      .def("rsqrt", &Optimizer::rsqrt, py::arg("u"), "Adam's 1 / sqrt(u + eps) as the encrypted update evaluates it.")
+      .def("__repr__", &Optimizer::describe);
+  py::class_<OptimizerState>(m, "OptimizerState", "Plaintext optimizer state for train_plain.")
+      .def(py::init<>())
+      .def_readonly("steps", &OptimizerState::steps)
+      .def("reset", &OptimizerState::reset);
+
+  py::class_<Trainer>(m, "Trainer", "Encrypted training (see include/fheml/train.h).")
+      .def(py::init<Network&, std::vector<size_t>, Loss, Optimizer>(), py::arg("net"),
+           py::arg("frozen") = std::vector<size_t>{}, py::arg("loss") = Loss{}, py::arg("optimizer") = Optimizer{},
+           py::keep_alive<1, 2>())
       .def_property_readonly("loss", &Trainer::loss)
+      .def_property_readonly("optimizer", &Trainer::optimizer)
+      .def_property_readonly("steps", &Trainer::steps)
       .def_property_readonly("step_depth", &Trainer::step_depth)
       .def_property_readonly("unbounded_step_depth", &Trainer::unbounded_step_depth)
       .def("set_level_budget", &Trainer::set_level_budget, py::arg("levels"), py::arg("range") = 1.0,
@@ -367,7 +402,9 @@ PYBIND11_MODULE(_fheml, m) {
   m.def("gpu_backend_built", &gpu_backend_built, "True when built with FIDESlib (-DFHEML_GPU=ON).");
   m.def("gpu_device_count", &gpu_device_count, "Visible CUDA devices (0 without the GPU backend).");
   m.def("train_plain", &train_plain, py::arg("net"), py::arg("xs"), py::arg("targets"), py::arg("lr"),
-        py::arg("frozen") = std::vector<size_t>{}, py::arg("loss") = Loss{},
-        "Plaintext reference of Trainer: one SGD update on a batch.",
+        py::arg("frozen") = std::vector<size_t>{}, py::arg("loss") = Loss{}, py::arg("optimizer") = Optimizer{},
+        py::arg("state") = static_cast<OptimizerState*>(nullptr),
+        "Plaintext reference of Trainer: one optimizer update on a batch (state: an OptimizerState for "
+        "optimizers with state).",
         py::call_guard<py::gil_scoped_release>());
 }

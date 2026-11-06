@@ -168,6 +168,47 @@ size_t first_trainable(const Network& net, const std::vector<size_t>& frozen) {
 
 }  // namespace
 
+// ------------------------------------------------------------------ Optimizer
+
+uint32_t Optimizer::depth() const {
+  if (kind != kAdam) return 0;
+  return 1 + poly_depth(degree) + 1 + 2 * newton + 1;
+}
+
+double Optimizer::rsqrt(double u) const {
+  const double e = eps;
+  double r = lbcrypto::EvalChebyshevFunctionPtxt([e](double x) { return 1.0 / std::sqrt(x + e); }, {u}, 0.0, v_max,
+                                                 degree)[0];
+  for (uint32_t i = 0; i < newton; ++i) r = 1.5 * r - 0.5 * (u + eps) * r * r * r;
+  return r;
+}
+
+void Optimizer::validate() const {
+  if (!(weight_decay >= 0.0)) throw std::invalid_argument("optimizer: weight decay must be non-negative");
+  if (kind == kSGD) {
+    if (!(momentum >= 0.0 && momentum < 1.0)) throw std::invalid_argument("optimizer: momentum must be in [0, 1)");
+    if (nesterov && momentum == 0.0) throw std::invalid_argument("optimizer: nesterov needs a momentum");
+    return;
+  }
+  if (!(beta1 >= 0.0 && beta1 < 1.0 && beta2 >= 0.0 && beta2 < 1.0))
+    throw std::invalid_argument("optimizer: Adam betas must be in [0, 1)");
+  if (!(eps > 0.0 && v_max > 0.0)) throw std::invalid_argument("optimizer: Adam eps and v_max must be positive");
+  if (degree < 1) throw std::invalid_argument("optimizer: the rsqrt series needs a degree");
+}
+
+std::string Optimizer::describe() const {
+  std::ostringstream os;
+  if (kind == kSGD) {
+    os << (decoupled && weight_decay ? "SGDW" : "SGD");
+    if (momentum) os << ", " << (nesterov ? "nesterov " : "") << "momentum " << momentum;
+  } else {
+    os << (decoupled && weight_decay ? "AdamW" : "Adam") << " (betas " << beta1 << ", " << beta2 << "; rsqrt degree "
+       << degree << " on [0, " << v_max << "] with eps " << eps << ", " << newton << " newton)";
+  }
+  if (weight_decay) os << ", weight decay " << weight_decay;
+  return os.str();
+}
+
 // ----------------------------------------------------------------------- Node
 
 struct Trainer::Node {
@@ -199,6 +240,10 @@ struct Trainer::Node {
   // Encrypted state.
   std::vector<Ctxt> D, gD;
   Ctxt B, gB;
+  // Optimizer state (see Optimizer): the momentum buffer or Adam's m, and
+  // Adam's v, per diagonal and for the bias; null before the first update.
+  std::vector<Ctxt> mD, vD;
+  Ctxt mB, vB;
   Ctxt in;  // forward input of the current sample
 
   // Activations: derivative polynomial (power basis or Chebyshev series).
@@ -517,11 +562,25 @@ std::unique_ptr<Node> build(Layer* l, bool train, uint32_t slots) {
 // Mirrors the encrypted step with integer levels. w = level of the weights.
 struct Sim {
   uint32_t w;
+  const Optimizer* opt = nullptr;
   uint32_t max = 0;
-  uint32_t new_w = 0;
+  uint32_t new_w = 0;  // of the weights and the optimizer state
   uint32_t see(uint32_t l) {
     max = std::max(max, l);
     return l;
+  }
+  // The optimizer step from the masked gradient at level p (see
+  // optimizer_step).
+  void update(uint32_t p) {
+    uint32_t d = see(p);
+    const bool scaled = opt && (opt->weight_decay != 0.0 || opt->has_state());
+    if (scaled) d = see(std::max(d, w + 1));  // products with the weights and the state
+    if (opt && opt->kind == Optimizer::kAdam) {
+      const uint32_t v = see(std::max(p + 1, w + 1));
+      const uint32_t r = see(v + poly_depth(opt->degree) + 1 + 2 * opt->newton);
+      d = see(std::max(r, d + 1) + 1);
+    }
+    new_w = std::max({new_w, w, d});
   }
 };
 
@@ -578,8 +637,7 @@ uint32_t sim_maxpool_forward(Sim& s, const Node& n, uint32_t x) {
 uint32_t sim_linear_backward(Sim& s, const Node& n, uint32_t g, uint32_t z) {
   if (n.trainable) {
     uint32_t grad = s.see(std::max(g, z) + 1);
-    uint32_t upd = s.see(grad + (n.groups.empty() ? 1 : 2));
-    s.new_w = std::max(s.new_w, std::max(s.w, upd));
+    s.update(grad + (n.groups.empty() ? 1 : 2));
   }
   return s.see(std::max(g, n.trainable ? s.w : g) + 1);
 }
@@ -629,8 +687,7 @@ uint32_t sim_backward(Sim& s, const std::vector<std::unique_ptr<Node>>& nodes, c
         const uint32_t gg = s.see(std::max(g, n.trainable ? s.w : g) + 1);
         if (n.trainable) {
           uint32_t grad = s.see(std::max(g, xh) + 1);
-          uint32_t upd = s.see(grad + (n.groups.empty() ? 1 : 2));
-          s.new_w = std::max(s.new_w, std::max(s.w, upd));
+          s.update(grad + (n.groups.empty() ? 1 : 2));
         }
         const uint32_t m2 = s.see(std::max(gg, xh) + 2);  // block mean of gg (*) x_hat
         const uint32_t inner = s.see(m2 + 1);            // gg - m1 - x_hat (*) m2
@@ -1190,39 +1247,181 @@ Ctxt allsum(const FHEContext& ctx, Ctxt c) {
   return c;
 }
 
-void update_linear(const FHEContext& ctx, Refresh& rf, Node& n, double step) {
+// The batch gradient of every weight ciphertext as the update sees it: each
+// slot holds its parameter's gradient (a shared weight's sum over its slots,
+// broadcast back), zero in the slots no parameter owns, times each of
+// `scales` (carried by the final masks, so the scales cost no level).
+// Returns per scale the diagonals (null where nothing is owned) and the bias.
+struct Projected {
+  std::vector<Ctxt> D;
+  Ctxt B;
+};
+
+std::vector<Projected> project(const FHEContext& ctx, Refresh& rf, Node& n, const std::vector<double>& scales) {
   const CC& cc = ctx.cc();
+  const size_t k = scales.size();
   // Masking takes one level, a shared weight's masked sum and broadcast two.
   rf.fit_all(n.gD, n.groups.empty() ? 1 : 2);
   rf.fit(n.gB, n.groups.empty() ? 1 : 2);
-  std::vector<Ctxt> delta(n.offs.size());
-  Ctxt delta_b;
+  std::vector<Projected> out(k);
+  for (auto& o : out) o.D.assign(n.offs.size(), nullptr);
   // Unshared weights: their own slot's gradient.
-#pragma omp parallel for schedule(dynamic) if (ctx.parallel())
+#pragma omp parallel for collapse(2) schedule(dynamic) if (ctx.parallel())
   for (size_t i = 0; i < n.offs.size(); ++i)
-    if (!n.unshared[i].empty()) delta[i] = mul_plain(ctx, n.gD[i], scaled(n.unshared[i], step));
-  if (!n.bias_unshared.empty()) delta_b = mul_plain(ctx, n.gB, scaled(n.bias_unshared, step));
+    for (size_t j = 0; j < k; ++j)
+      if (!n.unshared[i].empty()) out[j].D[i] = mul_plain(ctx, n.gD[i], scaled(n.unshared[i], scales[j]));
+  if (!n.bias_unshared.empty())
+    for (size_t j = 0; j < k; ++j) out[j].B = mul_plain(ctx, n.gB, scaled(n.bias_unshared, scales[j]));
   // Shared weights: masked sum over their slots, broadcast, masked again.
-  std::vector<std::vector<Ctxt>> contrib(n.groups.size());
+  std::vector<std::vector<std::vector<Ctxt>>> contrib(n.groups.size());
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
   for (size_t gi = 0; gi < n.groups.size(); ++gi) {
     const auto& g = n.groups[gi];
     std::vector<Ctxt> parts;
     for (const auto& dm : g.masks) parts.push_back(mul_plain(ctx, dm.first < 0 ? n.gB : n.gD[static_cast<size_t>(dm.first)], dm.second));
     Ctxt total = allsum(ctx, sum(ctx, std::move(parts)));
-    for (const auto& dm : g.masks) contrib[gi].push_back(mul_plain(ctx, total, scaled(dm.second, step)));
+    contrib[gi].resize(k);
+    for (size_t j = 0; j < k; ++j)
+      for (const auto& dm : g.masks) contrib[gi][j].push_back(mul_plain(ctx, total, scaled(dm.second, scales[j])));
   }
   for (size_t gi = 0; gi < n.groups.size(); ++gi)
-    for (size_t j = 0; j < n.groups[gi].masks.size(); ++j) {
-      int d = n.groups[gi].masks[j].first;
-      add_to(ctx, d < 0 ? delta_b : delta[static_cast<size_t>(d)], contrib[gi][j]);
-    }
-  for (size_t i = 0; i < n.offs.size(); ++i) {
-    if (delta[i]) cc->EvalAddInPlace(n.D[i], delta[i]);
-    n.gD[i] = nullptr;
-  }
-  if (delta_b) cc->EvalAddInPlace(n.B, delta_b);
+    for (size_t j = 0; j < k; ++j)
+      for (size_t q = 0; q < n.groups[gi].masks.size(); ++q) {
+        int d = n.groups[gi].masks[q].first;
+        add_to(ctx, d < 0 ? out[j].B : out[j].D[static_cast<size_t>(d)], contrib[gi][j][q]);
+      }
+  for (auto& c : n.gD) c = nullptr;
   n.gB = nullptr;
+  (void)cc;
+  return out;
+}
+
+// The public constants of one update (see Optimizer), from the learning
+// rate, the batch size and the update count t.
+struct StepConstants {
+  std::vector<double> scales;  // of the projected gradient
+  double gwd = 0.0;            // weight decay inside g'
+  double w_delta = 0.0;        // increment per unit weight from decay (on top of the gradient terms)
+  // kSGD with momentum: b = P0 + gwd w + mu b; dw = P1 + a gwd w + bc b_old
+  double mu = 0.0, a = 0.0, bc = 0.0;
+  // kAdam keeps the bias-corrected moments m^ = m / c1, v^ = v / c2
+  // (c_i = 1 - b_i^t), which stay at the gradient's magnitude however small
+  // c_i is, so their bootstraps keep their precision:
+  // m^ = P0 + (1 - b1) / c1 gwd w + mb m^, g_a = P1 + sqrt((1 - b2) / c2) gwd w,
+  // v^ = g_a^2 + vb v^, dw = (m^ * -lr) * rsqrt(v^) + w_delta w.
+  double m0 = 0.0, mb = 0.0, ga = 0.0, vb = 0.0, mscale = 0.0;
+};
+
+StepConstants step_constants(const Optimizer& o, double lr, double n, uint64_t t) {
+  StepConstants c;
+  c.gwd = o.decoupled ? 0.0 : o.weight_decay;
+  const double decay = o.decoupled ? -lr * o.weight_decay : 0.0;
+  if (o.kind == Optimizer::kSGD) {
+    if (o.momentum == 0.0) {
+      c.scales = {-lr / n};
+      c.w_delta = -lr * c.gwd + decay;
+      return c;
+    }
+    c.mu = o.momentum;
+    c.a = o.nesterov ? -lr * (1.0 + c.mu) : -lr;
+    c.bc = o.nesterov ? -lr * c.mu * c.mu : -lr * c.mu;
+    c.scales = {1.0 / n, c.a / n};
+    c.w_delta = c.a * c.gwd + decay;
+    return c;
+  }
+  const double td = static_cast<double>(t);
+  const double c1 = 1.0 - std::pow(o.beta1, td), c1p = 1.0 - std::pow(o.beta1, td - 1.0);
+  const double c2 = 1.0 - std::pow(o.beta2, td), c2p = 1.0 - std::pow(o.beta2, td - 1.0);
+  c.m0 = (1.0 - o.beta1) / c1;
+  c.mb = o.beta1 * c1p / c1;
+  c.ga = std::sqrt((1.0 - o.beta2) / c2);
+  c.vb = o.beta2 * c2p / c2;
+  c.scales = {c.m0 / n, c.ga / n};
+  c.mscale = -lr;
+  c.w_delta = decay;
+  return c;
+}
+
+// Sum of the non-null terms.
+Ctxt add_terms(const FHEContext& ctx, std::initializer_list<Ctxt> terms) {
+  Ctxt acc;
+  for (const Ctxt& t : terms)
+    if (t) acc = acc ? ctx.cc()->EvalAdd(acc, t) : t;
+  return acc;
+}
+
+// c * x (null when x is null or c is 0); a scalar product costs a level.
+Ctxt scale(const FHEContext& ctx, Refresh& rf, Ctxt& x, double c) {
+  if (!x || c == 0.0) return nullptr;
+  rf.fit(x, 1);
+  return ctx.cc()->EvalMult(x, c);
+}
+
+// One weight ciphertext w with its gradient copies P (one per scale) and
+// state m, v: updates the state and returns the increment of w (null when
+// there is none).
+Ctxt optimizer_step(const FHEContext& ctx, Refresh& rf, const Optimizer& o, const StepConstants& c,
+                    std::vector<double>& rsqrt_c, Ctxt& w, const std::vector<Ctxt>& P, Ctxt& m, Ctxt& v) {
+  const CC& cc = ctx.cc();
+  if (!P[0]) return nullptr;
+  if (o.kind == Optimizer::kSGD) {
+    if (o.momentum == 0.0) return add_terms(ctx, {P[0], scale(ctx, rf, w, c.w_delta)});
+    Ctxt dw = add_terms(ctx, {P[1], scale(ctx, rf, w, c.w_delta), scale(ctx, rf, m, c.bc)});
+    m = add_terms(ctx, {P[0], scale(ctx, rf, w, c.gwd), scale(ctx, rf, m, c.mu)});
+    return dw;
+  }
+  // Adam: the bias-corrected moments, then (m^ * -lr) * rsqrt(v^).
+  m = add_terms(ctx, {P[0], scale(ctx, rf, w, c.m0 * c.gwd), scale(ctx, rf, m, c.mb)});
+  Ctxt ga = add_terms(ctx, {P[1], scale(ctx, rf, w, c.ga * c.gwd)});
+  rf.fit(ga, 1);
+  v = add_terms(ctx, {cc->EvalMult(ga, ga), scale(ctx, rf, v, c.vb)});
+  // Newton steps without scalar products on the root (as in LayerNorm): the
+  // series is scaled by k = 1.5^newton and s <- s - (cn (v^ + eps)) s^3
+  // with cn = 0.5 / (1.5 k^2) divides k by 1.5 per step.
+  double k = std::pow(1.5, static_cast<double>(o.newton));
+  std::vector<double> coef = rsqrt_c;
+  for (double& x : coef) x *= k;
+  rf.fit(v, poly_depth(o.degree) + 1);
+  Ctxt r = cc->EvalChebyshevSeries(v, coef, 0.0, o.v_max);
+  for (uint32_t i = 0; i < o.newton; ++i) {
+    const double cn = 0.5 / (1.5 * k * k);
+    rf.fit(v, 1);
+    Ctxt vc = cc->EvalAdd(cc->EvalMult(v, cn), cn * o.eps);
+    rf.fit(vc, 2);
+    rf.fit(r, 2);
+    r = cc->EvalSub(r, cc->EvalMult(cc->EvalMult(vc, r), cc->EvalMult(r, r)));
+    k /= 1.5;
+  }
+  Ctxt ms = scale(ctx, rf, m, c.mscale);
+  rf.fit(ms, 1);
+  rf.fit(r, 1);
+  return add_terms(ctx, {cc->EvalMult(ms, r), scale(ctx, rf, w, c.w_delta)});
+}
+
+void update_linear(const FHEContext& ctx, Refresh& rf, Node& n, const Optimizer& o, const StepConstants& c,
+                   std::vector<double>& rsqrt_c) {
+  const CC& cc = ctx.cc();
+  std::vector<Projected> P = project(ctx, rf, n, c.scales);
+  n.mD.resize(n.offs.size());
+  n.vD.resize(n.offs.size());
+  std::vector<Ctxt> delta(n.offs.size());
+  // The diagonals are independent; Refresh::fit is not called concurrently
+  // on one ciphertext, but its counter is shared, so run them in sequence
+  // when bootstrapping inside the step.
+#pragma omp parallel for schedule(dynamic) if (ctx.parallel() && !rf.budget)
+  for (size_t i = 0; i < n.offs.size(); ++i) {
+    std::vector<Ctxt> p(P.size());
+    for (size_t j = 0; j < P.size(); ++j) p[j] = P[j].D[i];
+    delta[i] = optimizer_step(ctx, rf, o, c, rsqrt_c, n.D[i], p, n.mD[i], n.vD[i]);
+  }
+  if (n.B) {
+    std::vector<Ctxt> p(P.size());
+    for (size_t j = 0; j < P.size(); ++j) p[j] = P[j].B;
+    Ctxt db = optimizer_step(ctx, rf, o, c, rsqrt_c, n.B, p, n.mB, n.vB);
+    if (db) cc->EvalAddInPlace(n.B, db);
+  }
+  for (size_t i = 0; i < n.offs.size(); ++i)
+    if (delta[i]) cc->EvalAddInPlace(n.D[i], delta[i]);
 }
 
 // Bootstraps weight ciphertexts that are zero outside [0, window), packing
@@ -1485,8 +1684,10 @@ std::vector<double> plain_backward(const std::vector<std::shared_ptr<Layer>>& la
 
 // -------------------------------------------------------------------- Trainer
 
-Trainer::Trainer(Network& net, std::vector<size_t> frozen, Loss loss) : net_(net), loss_(loss) {
+Trainer::Trainer(Network& net, std::vector<size_t> frozen, Loss loss, Optimizer optimizer)
+    : net_(net), loss_(loss), opt_(optimizer) {
   if (!net.slots()) throw std::logic_error("train: compile() the network first");
+  opt_.validate();
   slots_ = net.slots();
   first_ = first_trainable(net, frozen);
   const auto& layers = net.layers();
@@ -1510,7 +1711,7 @@ uint32_t Trainer::unbounded_step_depth() const {
   uint32_t prefix = 0;
   const auto& layers = net_.layers();
   for (size_t i = 0; i < first_; ++i) prefix = layers[i]->is_bootstrap() ? 0 : prefix + layers[i]->depth();
-  Sim s{0};
+  Sim s{0, &opt_};
   SimTrace tr;
   uint32_t y = sim_forward(s, nodes_, prefix, tr);
   sim_backward(s, nodes_, tr, sim_loss(s, ce_.get(), y));
@@ -1547,6 +1748,7 @@ uint32_t Trainer::min_level_budget() const {
   if (ce_)
     m = std::max({m, chebyshev_depth(ce_->o.exp_degree, ce_->exp_lo, ce_->exp_hi),
                   chebyshev_depth(ce_->o.inv_degree, ce_->sum_lo, ce_->sum_hi)});
+  if (opt_.kind == Optimizer::kAdam) m = std::max(m, poly_depth(opt_.degree) + 1);
   return m;
 }
 
@@ -1603,7 +1805,7 @@ ContextOptions Trainer::context_options(bool secure, bool bootstrapping, uint32_
     for (size_t i = 0; i < first_; ++i) prefix += layers[i]->depth();
     uint32_t w = 0, top = 0;
     for (uint32_t u = 0; u < std::max(updates, 1u); ++u) {
-      Sim s{w};
+      Sim s{w, &opt_};
       SimTrace tr;
       uint32_t y = sim_forward(s, nodes_, std::max(prefix, 0u), tr);
       sim_backward(s, nodes_, tr, sim_loss(s, ce_.get(), y));
@@ -1613,7 +1815,7 @@ ContextOptions Trainer::context_options(bool secure, bool bootstrapping, uint32_
     // One more forward pass to use the trained weights. s.max, not just the
     // output level: a max pool's comparisons need two levels below their
     // inputs.
-    Sim s{w};
+    Sim s{w, &opt_};
     SimTrace tr;
     sim_forward(s, nodes_, prefix, tr);
     top = std::max(top, s.max);
@@ -1629,12 +1831,16 @@ void Trainer::encrypt_weights(const FHEContext& ctx) {
     if (!n.trainable) return;
     n.D.assign(n.offs.size(), nullptr);
     n.gD.assign(n.offs.size(), nullptr);
+    n.mD.assign(n.offs.size(), nullptr);
+    n.vD.assign(n.offs.size(), nullptr);
+    n.mB = n.vB = nullptr;
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
     for (size_t i = 0; i < n.offs.size(); ++i) n.D[i] = ctx.encrypt(n.diag[i], base_level_);
     if (!n.bias.empty()) n.B = ctx.encrypt(n.bias, base_level_);
   });
   encrypted_ = true;
   batch_ = 0;
+  steps_ = 0;
 }
 
 Ctxt Trainer::encrypt_input(const FHEContext& ctx, const std::vector<double>& x) const {
@@ -1737,17 +1943,32 @@ Ctxt Trainer::loss_gradient(const FHEContext& ctx, Refresh& rf, Ctxt y, const Ct
 
 void Trainer::update(const FHEContext& ctx, double lr) {
   if (!batch_) throw std::logic_error("train: no accumulated gradients");
-  const double step = -lr / static_cast<double>(batch_);
+  ++steps_;
+  const StepConstants c = step_constants(opt_, lr, static_cast<double>(batch_), steps_);
+  std::vector<double> rsqrt_c;
+  if (opt_.kind == Optimizer::kAdam) {
+    const double e = opt_.eps;
+    rsqrt_c = lbcrypto::EvalChebyshevCoefficients([e](double u) { return 1.0 / std::sqrt(u + e); }, 0.0, opt_.v_max,
+                                                   opt_.degree);
+  }
   Refresh rf = make_refresh(ctx, base_level_, budget_, log_range_);
   for_each_weighted(nodes_, [&](Node& n) {
-    if (n.trainable) update_linear(ctx, rf, n, step);
+    if (n.trainable) update_linear(ctx, rf, n, opt_, c, rsqrt_c);
   });
   if (ctx.options().bootstrapping) {
+    // The weights and the optimizer state, all zero outside the window.
     std::map<uint32_t, std::vector<Ctxt*>> by_window;
     for_each_weighted(nodes_, [&](Node& n) {
       if (!n.trainable) return;
-      for (auto& d : n.D) by_window[n.window].push_back(&d);
-      if (n.B) by_window[n.window].push_back(&n.B);
+      auto add = [&](Ctxt& x) {
+        if (x) by_window[n.window].push_back(&x);
+      };
+      for (auto& d : n.D) add(d);
+      add(n.B);
+      for (auto& x : n.mD) add(x);
+      for (auto& x : n.vD) add(x);
+      add(n.mB);
+      add(n.vB);
     });
     for (auto& kv : by_window) bootstrap_packed(ctx, kv.second, kv.first);
   }
@@ -1795,6 +2016,11 @@ uint32_t Trainer::weight_level() const {
   for_each_weighted(nodes_, [&](const Node& n) {
     for (const auto& d : n.D) l = std::max(l, lvl(d));
     if (n.B) l = std::max(l, lvl(n.B));
+    for (const auto* st : {&n.mD, &n.vD})
+      for (const auto& x : *st)
+        if (x) l = std::max(l, lvl(x));
+    for (const Ctxt* x : {&n.mB, &n.vB})
+      if (*x) l = std::max(l, lvl(*x));
   });
   return l;
 }
@@ -1819,6 +2045,7 @@ std::string Trainer::summary() const {
        << " newton" << (ce_->o.subtract_max ? ", max subtracted" : "") << ")\n";
   else
     os << "loss: mean squared error\n";
+  os << "optimizer: " << opt_.describe() << "\n";
   os << "weight ciphertexts " << weight_ciphertexts() << ", step depth " << step_depth();
   if (budget_ && unbounded_step_depth() > budget_)
     os << " (" << unbounded_step_depth() << " without bootstrapping activations and gradients, range "
@@ -1829,8 +2056,11 @@ std::string Trainer::summary() const {
 // ------------------------------------------------------------- train_plain
 
 void train_plain(Network& net, const std::vector<std::vector<double>>& xs, const std::vector<std::vector<double>>& ts,
-                 double lr, const std::vector<size_t>& frozen, const Loss& loss) {
+                 double lr, const std::vector<size_t>& frozen, const Loss& loss, const Optimizer& opt,
+                 OptimizerState* state) {
   if (xs.size() != ts.size() || xs.empty()) throw std::invalid_argument("train_plain: need matching, non-empty batches");
+  opt.validate();
+  if (opt.has_state() && !state) throw std::invalid_argument("train_plain: this optimizer needs an OptimizerState");
   const auto& layers = net.layers();
   const size_t first = first_trainable(net, frozen);
   std::vector<char> train(layers.size());
@@ -1848,10 +2078,36 @@ void train_plain(Network& net, const std::vector<std::vector<double>>& xs, const
     for (size_t i = 0; i < y.size(); ++i) y[i] -= ts[s][i];
     plain_backward(layers, first, train, tr, y, grads);
   }
-  const double step = lr / static_cast<double>(xs.size());
+  const double n = static_cast<double>(xs.size());
+  const uint64_t t = state ? ++state->steps : 1;
+  const double gwd = opt.decoupled ? 0.0 : opt.weight_decay;
   for (auto& kv : grads) {
     std::vector<double> p = kv.first->params();
-    for (size_t i = 0; i < p.size(); ++i) p[i] -= step * kv.second[i];
+    std::vector<double>* m = state ? &state->m[kv.first] : nullptr;
+    std::vector<double>* v = state ? &state->v[kv.first] : nullptr;
+    if (m && m->empty()) m->assign(p.size(), 0.0);
+    if (v && v->empty() && opt.kind == Optimizer::kAdam) v->assign(p.size(), 0.0);
+    for (size_t i = 0; i < p.size(); ++i) {
+      const double g = kv.second[i] / n + gwd * p[i];
+      double d;
+      if (opt.kind == Optimizer::kSGD) {
+        d = g;
+        if (opt.momentum != 0.0) {
+          double& b = (*m)[i];
+          b = t == 1 ? g : opt.momentum * b + g;
+          d = opt.nesterov ? g + opt.momentum * b : b;
+        }
+      } else {
+        double& mi = (*m)[i];
+        double& vi = (*v)[i];
+        mi = opt.beta1 * mi + (1.0 - opt.beta1) * g;
+        vi = opt.beta2 * vi + (1.0 - opt.beta2) * g * g;
+        const double td = static_cast<double>(t);
+        d = mi / (1.0 - std::pow(opt.beta1, td)) * opt.rsqrt(vi / (1.0 - std::pow(opt.beta2, td)));
+      }
+      const double decay = opt.decoupled ? opt.weight_decay * p[i] : 0.0;
+      p[i] -= lr * (d + decay);
+    }
     kv.first->set_params(p);
   }
   sync_attention(layers);
