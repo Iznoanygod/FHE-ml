@@ -94,6 +94,16 @@ Each linear layer costs one level. `Network::fuse_linear()` multiplies runs of
 adjacent linear layers (conv → pool → affine) into one matrix. That saves a
 level per merged layer, at the cost of more diagonals.
 
+Because a layer is nothing more than its logical matrix and bias,
+`LinearMap` takes them directly: a fixed sparse matrix between any two
+shapes, plus a bias per output element. It covers the rearrangements that no
+convolution expresses, so that post-processing stays encrypted. Examples are
+pixel shuffle (a permutation from `(C r², H, W)` to `(C, rH, rW)`), gathering
+each pixel's neighbourhood into channels, and decoders that add each grid
+cell's own position. It is lowered like any other linear layer: one level,
+plus a rotation per distinct slot offset. Its torch twin is
+`fheml.nn.LinearMap`, which stores (row, col, value) triples.
+
 `LinearTransform::eval_slots` runs the same schedule on cleartext vectors. The
 tests use it to check every plan against the exact product without any
 cryptography.
@@ -313,6 +323,51 @@ calibrated bounds and the planner's `budget`, so a saved model keeps its
 plan. Measured in `tests/test_fheml.cpp`: a two-block transformer
 (LayerNorm, 2-head softmax attention, LayerNorm, MLP) at B = 5 runs with 12
 bootstraps inside layers and decrypts to within 1e-4 of the plaintext.
+
+## Recurrent layers
+
+`Recurrent` (src/recurrent.cpp) evaluates an Elman RNN, a GRU or an LSTM
+over n tokens laid out like a transformer's (token t at slots t·B + j).
+
+- **All steps at once.** The recurrence h_t = f(x_t, h_{t−1}) is a
+  triangular system, solved by Jacobi iteration: the state ciphertext holds
+  every token's state, and one step computes f for all tokens from the
+  previous iterate, shifted by one token. The input projection
+  U = W_ih x + b is computed once; per step the recurrent map is one linear
+  transform from token t−1's slots to token t's (a token-shifted W_hh with
+  2h − 1 diagonals per gate), and the previous cell state (LSTM) or hidden
+  state (GRU) is a rotation by −B. After k steps tokens 0..k−1 are exact;
+  the others hold the state of the same RNN started from zero k tokens
+  earlier, an ordinary RNN state that stays inside the series' intervals. n
+  steps give the exact result with the same depth as a step-by-step
+  evaluation, and no operation depends on the position.
+- **Packed gates.** The gate pre-activations go to G regions of R slots
+  (R = n·B rounded up to a power of two; G = 1, 3, 4), so one Chebyshev
+  series evaluates every sigmoid of a step, and a rotation by g·R brings gate
+  g onto the state slots. The LSTM's tanh candidate is 2 σ(2x) − 1 on the
+  same series. The GRU's W_hn h + b_hn (multiplied by r before its tanh)
+  shares the ciphertext, divided by a weight bound so its unused sigmoid
+  stays in range. Masked products (the i, f, r and z gates times a
+  plaintext mask) keep every slot outside the states at zero, which is what
+  keeps the series' arguments inside their intervals everywhere.
+- **Free interval maps.** The series' intervals are folded into the weights
+  (t = x / a), and the LSTM cell state is kept divided by its tanh interval,
+  so every series runs on [−1, 1] at poly_depth(degree) levels. Per step:
+  1 + pd for the RNN, 2 pd + 4 for GRU and LSTM (5 and 12 at degree 13).
+- **Bootstrapping inside.** One shared description of the step
+  (`Recurrent::run`) is executed three ways: on ciphertexts, on cleartext
+  slot vectors (the plaintext reference and the calibration, which
+  therefore see the junk-free slots and every intermediate iterate) and on
+  level counters (the plan for `level_after`, `level_peak`,
+  `internal_bootstraps`). Before each group of operations it refreshes the
+  operand whose next levels would leave the stretch: the state before the
+  recurrent map, the gate pre-activations before the series, the gates
+  before their products, the cell state before its tanh. These are in
+  [−1, 1] by construction, so a refresh is a bare bootstrap; only the input
+  and its projection carry calibrated bounds (`FHEContext::refresh`). With a
+  5-level stretch the RNN needs one bootstrap per step, GRU and LSTM three.
+  `place_bootstraps` folds scales through the layer: an input scale into
+  W_ih, an output scale into the last step's series or masks.
 
 ## Encrypted weights
 
@@ -630,6 +685,8 @@ All of the following are tested under encryption:
   block) and softmax attention, with and without the scheme-switching
   maximum subtraction.
 - Fused linear layers.
+- Recurrent layers (Elman RNN, GRU, LSTM, all states or the last one), with
+  bootstrapping inside the recurrence, against torch.
 - The square, polynomial and Chebyshev activations, and the exact
   scheme-switching ReLU (checked against `max(x, 0)`, also past bootstraps).
 - Bootstrapping in the middle of a network, placed by hand or by

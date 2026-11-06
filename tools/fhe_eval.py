@@ -14,7 +14,7 @@ An example script defines its model and data and calls these in order:
     fhe_eval.record(args, arch=..., **run)
 
 ``add_args`` gives every example the same encryption flags (--insecure,
---bootstrap, --window, --digits, --level-budget, --ring, --boot-iterations,
+--bootstrap, --budget, --window, --digits, --level-budget, --ring, --boot-iterations,
 --boot-precision, --scale-bits, --packing, --n, --profile, --json). The metrics below
 cover classification, segmentation, detection and sequence tasks.
 """
@@ -43,6 +43,8 @@ def add_args(ap, n=3):
     ap.add_argument("--json", help="append the run's numbers to this JSON-lines file")
     ap.add_argument("--bootstrap", action="store_true",
                     help="fold activation intervals and insert bootstraps automatically (ring 2^16)")
+    ap.add_argument("--budget", type=int, help="levels between bootstraps (default: the most a 128-bit ring-2^16 "
+                    "context allows; toy runs may take more, which saves bootstraps)")
     ap.add_argument("--window", type=int, default=0, help="rotation-key ladder window (0 = one key per rotation)")
     ap.add_argument("--calibration", type=int, default=64, help="training inputs for bootstrap range scaling")
     ap.add_argument("--ring", type=int, help="ring dimension override (insecure runs; bootstrapping precision grows with it)")
@@ -77,14 +79,30 @@ def predict(model, x, batch=512):
         return torch.cat([model(x[i]) for i in batches(len(x), batch, shuffle=False)])
 
 
+def argmax_range(model, x, quantile=0.999, headroom=1.25):
+    """Comparison range for an encrypted ArgMax after model: the largest
+    logit magnitude of all but the top 0.1% of inputs, with 25% headroom.
+    The excluded inputs are ones whose polynomial activations left their
+    intervals; their logits run to thousands and are already wrong, and a
+    range that covered them would cost the comparisons of every other input
+    their precision (FHEW compares (a - b) / range to a fixed resolution)."""
+    logits = predict(model, x).abs().reshape(len(x), -1).amax(1)
+    bound = headroom * float(torch.quantile(logits.double(), quantile))
+    print(f"argmax range {bound:.1f} (largest training logit: median {logits.median():.1f}, "
+          f"{quantile:.1%} below {bound / headroom:.1f}, max {logits.max():.1f})")
+    return bound
+
+
 def train(model, xtr, ytr, xte, yte, epochs, loss_fn=None, metric=None, lr=2e-3, batch=128,
-          range_weight=RANGE_WEIGHT, clip=1.0, weight_decay=0.0, augment=None, log=print):
+          range_weight=RANGE_WEIGHT, clip=1.0, weight_decay=0.0, augment=None, augment_pairs=None, log=print):
     """Adam with a one-cycle schedule. loss_fn(outputs, targets) defaults to
     cross-entropy; metric(outputs, targets) -> float is printed after every
     epoch on the test set. fheml.nn.range_loss keeps polynomial arguments
     (layer norm variances, softmax scores and sums) inside the intervals the
     encrypted series cover; gradient clipping tames polynomial networks
-    early on. augment(x) -> x is applied to each training batch. Returns
+    early on. augment(x) -> x is applied to each training batch;
+    augment_pairs(x, y) -> (x, y) instead transforms inputs and targets
+    together (flipping an image and its segmentation mask). Returns
     (final metric, training seconds)."""
     loss_fn = loss_fn or nn.functional.cross_entropy
     metric = metric or accuracy
@@ -96,9 +114,13 @@ def train(model, xtr, ytr, xte, yte, epochs, loss_fn=None, metric=None, lr=2e-3,
         model.train()
         t = time.time()
         for idx in batches(len(xtr), batch):
-            xb = xtr[idx] if augment is None else augment(xtr[idx])
+            xb, yb = xtr[idx], ytr[idx]
+            if augment is not None:
+                xb = augment(xb)
+            if augment_pairs is not None:
+                xb, yb = augment_pairs(xb, yb)
             opt.zero_grad()
-            loss = loss_fn(model(xb), ytr[idx])
+            loss = loss_fn(model(xb), yb)
             (loss + range_weight * hnn.range_loss(model)).backward()
             if clip:
                 nn.utils.clip_grad_norm_(model.parameters(), clip)
@@ -151,29 +173,37 @@ def box_iou(a, b):
     return inter / np.maximum(area(a) + area(b) - inter, 1e-12)
 
 
-def average_precision(dets, gts, iou=0.5):
+def average_precision(dets, gts, iou=0.5, ignore=None):
     """VOC/COCO-style AP of one class at one IoU threshold.
 
     dets: list over images of (K, 5) arrays (x0, y0, x1, y1, score); gts:
     list over images of (M, 4) boxes. Greedy matching by score, all-point
     interpolated precision (COCO uses 101 recall points; the difference is
-    small). Returns (AP, number of ground-truth boxes)."""
+    small). ignore: optional list over images of (M', 4) boxes that are
+    neither required nor penalized (COCO's crowd regions, objects outside
+    the evaluated size range): a detection that matches no ground-truth box
+    but overlaps one of them by iou is dropped instead of counted as a false
+    positive. Returns (AP, number of ground-truth boxes)."""
     scores, tp = [], []
     total = sum(len(g) for g in gts)
-    for d, g in zip(dets, gts):
+    for i, (d, g) in enumerate(zip(dets, gts)):
         d = np.asarray(d, np.float64).reshape(-1, 5)
         g = np.asarray(g, np.float64).reshape(-1, 4)
+        ign = np.asarray(ignore[i] if ignore is not None else [], np.float64).reshape(-1, 4)
         used = np.zeros(len(g), bool)
         for k in np.argsort(-d[:, 4]):
-            scores.append(d[k, 4])
             if len(g):
                 o = box_iou(d[k, :4], g)
                 o[used] = -1
                 j = int(o.argmax())
                 if o[j] >= iou:
                     used[j] = True
+                    scores.append(d[k, 4])
                     tp.append(1)
                     continue
+            if len(ign) and box_iou(d[k, :4], ign).max() >= iou:
+                continue
+            scores.append(d[k, 4])
             tp.append(0)
     if total == 0:
         return float("nan"), 0
@@ -215,14 +245,21 @@ def plain_score(net, x, y, metric=None, n=2000, outputs=False):
 
 
 def check_ranges(net, xs):
-    """Largest |input| of every Chebyshev / exact-relu / max-pool layer over
-    xs, against its interval (the series diverge outside it; the comparison
-    wraps around)."""
+    """Largest |input| of every Chebyshev / exact-relu / max-pool layer, and
+    the series arguments of every recurrent layer, over xs, against their
+    intervals (the series diverge outside them; the comparison wraps
+    around)."""
     xs = [fheml._prepare(net, x) for x in xs]  # token inputs padded to the token stride
     for i, layer in enumerate(net.layers):
         if layer.type in ("chebyshev", "exactrelu", "maxpool2d"):
             peak = max(np.abs(x).max() for x in xs)
             print(f"  layer {i} {layer.describe()}: max |input| {peak:.2f} over {len(xs)} inputs")
+        if layer.type == "recurrent":
+            r = np.array([layer.series_ranges([x]) for x in xs])
+            out = int((r.max(1) > 1).sum())
+            g, c = np.median(r, 0)
+            print(f"  layer {i} {layer.describe()}: |series argument| (must be <= 1, every step) median max gates "
+                  f"{g:.2f}, cell {c:.2f}; {out} of {len(xs)} inputs leave the intervals")
         xs = [np.asarray(layer.forward_plain(x)) for x in xs]
 
 
@@ -277,7 +314,7 @@ def prepare(net, args, calib, packing=None):
         net.compile()
         check_ranges(net, calib)
         depth = net.depth
-        boots, budget = fheml.auto_bootstrap(net, calib, level_budget=level_budget, max_ring=1 << 16,
+        boots, budget = fheml.auto_bootstrap(net, calib, budget=args.budget, level_budget=level_budget, max_ring=1 << 16,
                                              key_switch_digits=args.digits,
                                              bootstrap_iterations=args.boot_iterations)
         print(f"auto_bootstrap: depth {depth} -> {net.depth}, {boots} bootstraps, at most {budget} levels between them")

@@ -840,6 +840,55 @@ void Scale::save(std::ostream& os) const {
   write_vec(os, factors_);
 }
 
+// ------------------------------------------------------------------- LinearMap
+
+LinearMap::LinearMap(Shape in, Shape out, std::vector<size_t> rows, std::vector<size_t> cols,
+                     std::vector<double> vals, std::vector<double> bias, std::string what)
+    : in0_(in), out0_(out), rows_(std::move(rows)), cols_(std::move(cols)), vals_(std::move(vals)),
+      b_(std::move(bias)), what_(std::move(what)) {
+  if (rows_.size() != cols_.size() || rows_.size() != vals_.size())
+    throw std::invalid_argument("linearmap: rows, cols and values differ in length");
+  for (size_t i = 0; i < rows_.size(); ++i)
+    if (rows_[i] >= out.size() || cols_[i] >= in.size())
+      throw std::invalid_argument("linearmap: entry outside the matrix");
+  if (!b_.empty() && b_.size() != out.size()) throw std::invalid_argument("linearmap: bias size mismatch");
+  if (what_.empty() || what_.find_first_of(" \t\n") != std::string::npos)
+    throw std::invalid_argument("linearmap: the name must be one word");
+  in_ = in;
+  out_ = out;
+}
+
+std::string LinearMap::describe() const {
+  return what_ + " " + in0_.str() + "->" + out0_.str() + LinearLayer::describe();
+}
+
+Shape LinearMap::configure(const Shape& in) {
+  if (in.size() != in0_.size())
+    throw std::invalid_argument("linearmap: input " + in.str() + " does not match " + in0_.str());
+  in_ = in;
+  return out_ = out0_;
+}
+
+SparseMatrix LinearMap::matrix() const {
+  SparseMatrix m(out0_.size(), in0_.size());
+  for (size_t i = 0; i < rows_.size(); ++i) m.add(rows_[i], cols_[i], vals_[i]);
+  return m;
+}
+
+void LinearMap::save(std::ostream& os) const {
+  os << "linearmap " << what_ << " " << in0_.c << " " << in0_.h << " " << in0_.w << " " << out0_.c << " "
+     << out0_.h << " " << out0_.w << " " << vals_.size() << " " << (b_.empty() ? 0 : 1) << "\n";
+  std::vector<double> idx;
+  idx.reserve(2 * rows_.size());
+  for (size_t i = 0; i < rows_.size(); ++i) {
+    idx.push_back(static_cast<double>(rows_[i]));
+    idx.push_back(static_cast<double>(cols_[i]));
+  }
+  write_vec(os, idx);
+  write_vec(os, vals_);
+  write_vec(os, b_);
+}
+
 // ----------------------------------------------------------------- FusedLinear
 
 FusedLinear::FusedLinear(Shape in, Shape out, SparseMatrix m, std::vector<double> b, std::string what)

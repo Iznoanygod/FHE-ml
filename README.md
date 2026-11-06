@@ -45,11 +45,18 @@ That code is kept in [`legacy/`](legacy/) for reference.
     square root on a calibrated variance interval (10–12 levels).
   * `Residual` and `TokenMean` complete the block.
   * See [docs/DESIGN.md](docs/DESIGN.md#transformers).
+* **Recurrent networks.** `Recurrent` is an Elman RNN, GRU or LSTM over a
+  token sequence with its real activations (sigmoid gates and tanh as
+  Chebyshev series). All time steps advance together in SIMD, the gates
+  share one series evaluation, and the layer bootstraps its own state
+  inside the recurrence. See [Recurrent networks](#recurrent-networks).
 * **A Python package**, `import fheml`, wraps the same API with numpy in and
   numpy out.
 * **A PyTorch exporter.** Train with `torch.nn` layers plus the HE-friendly
   modules in `fheml.nn` (polynomial activations, polynomial attention), then
   `fheml.from_torch(model, input_shape)` gives the encrypted network.
+  `fheml.nn.RNN`, `GRU` and `LSTM` are torch's recurrent cells with the
+  series the encrypted layer evaluates.
 * **Encrypted training.** `Trainer` runs SGD with backpropagation entirely on
   ciphertexts: encrypted inputs, labels, weights, activations and gradients.
   The encrypted weights are bootstrapped after every update. Freezing the
@@ -442,6 +449,46 @@ levels and 8 bootstraps; at toy parameters an encrypted image takes about
 about 8e-3. At 128-bit security the four ReLUs alone would take about
 4 × 412 s ≈ 28 minutes per image, against seconds for the Chebyshev model. The trainer has no
 backward pass for it yet; the FIDESlib backend has no scheme switching.
+
+## Encrypted argmax
+
+A prediction is a non-polynomial step as well, so it runs under encryption
+too: `ArgMax(range)` returns a one-hot in place of the logits, 1 at the first
+maximum of every group and 0 elsewhere, in the input's own layout. The
+client decrypts the class (or a label per pixel) and never sees a logit.
+
+```python
+model = nn.Sequential(trained, hnn.ArgMax(range=R))            # over the last dimension
+model = nn.Sequential(trained, hnn.ArgMax(range=R, classes=3)) # groups of 3 features (per-pixel classes of a patch token)
+model = nn.Sequential(cnn, hnn.ArgMax(range=R, dim=1))         # per pixel over an image's channels
+net = fheml.from_torch(model, shape)
+```
+
+The layer packs class j of every group into block j of M slots (a gather,
+one level; the classes are rounded up to K' blocks, the extra ones hold
+−range), then plays a tournament of comparisons like max pooling: each round
+compares the lower half of the blocks with the upper half, keeps
+`a + [a < b](b − a)`, and multiplies a "still winning" bit into every
+original block, the round's comparison copied onto the blocks by rotations.
+The bits after the last round are the one-hot, and a scatter writes them
+back. That is (K' − 1)·M FHEW bootstraps, the same as finding the maximum,
+and `compare_depth() + rounds + 3` levels. Past a bootstrap the bits sit
+above the stretch (the comparisons return at level 12, a bootstrap at
+18–20), so the layer leaves its output `rounds` levels into the stretch and
+needs `rounds + 3` levels of input. `range` bounds the logits, as for max
+pooling; ties go to the lower class.
+
+The scheme-switching keys grow with the number of slots switched at once,
+not with the comparisons: the network sets `ContextOptions::compare_slots`
+to the span its argmax touches, capped at 256. `compare()` masks `a − b` to
+the compared slots, folds the ciphertext onto that period and switches only
+those, in chunks of 256 slots for a wider comparison (each chunk rotated to
+the front and its result masked back). A folded result repeats with the
+switched period, so it is masked to its first `count` slots too: the
+argmax rotates its comparison bits across its whole span, which can be
+wider than 256 slots (16 blocks of 16 for nine channels on a 4×4 map). The switching keys of a 26-level
+toy context at ring 2^14 take about 0.6 GB this way; switching all 8192
+slots does not fit 14 GB.
 
 ## Multiplexed packing
 
@@ -896,6 +943,219 @@ attention loses nothing in accuracy against softmax on these short texts
 faster when the token blocks are wide (SST-2): each head's window sums and
 broadcasts need log2(d/heads) rotations instead of log2(d).
 
+## Vision transformers
+
+`examples/python/vision_transformers.py` runs a ViT classifier on CIFAR-10
+and a segmentation transformer on Oxford-IIIT Pet trimaps (pet, background,
+border), both at 32x32 with 64 tokens of 4x4 patches. Each comes with a
+single-head and a multi-head (`--heads 4`) variant. The client patchifies
+and encrypts the image, and it decrypts a one-hot: the class, or a label for
+every pixel. The patch embedding, the blocks, the head and the argmax all
+run on ciphertexts.
+
+The default block is a standard pre-norm transformer: LayerNorm, softmax
+attention, LayerNorm and a GELU MLP, with a final LayerNorm. The segmentation
+head is a per-patch linear decoder (as in SETR-naive): every output token
+holds the logits of its patch's 16 pixels, and `ArgMax(classes=3)` picks
+each pixel's class (1024 pixels, 3072 comparisons). The model trains with
+the series' arguments clamped to their intervals and penalised outside them
+(range weight 10). It then runs on intervals 1.5x wider at degree 15, so
+test images that stray past the training ranges stay accurate. `--block
+basic` is the very basic transformer instead: a quadratic attention score,
+no LayerNorm and a square activation. It is 12 levels deep and runs at
+128-bit security without bootstrapping.
+
+```sh
+F="--bootstrap --level-budget 3 --digits 4 --scale-bits 59 --window 1 --insecure --ring 16384"
+PYTHONPATH=build/python python3 examples/python/vision_transformers.py --task cifar --heads 4 $F
+PYTHONPATH=build/python python3 examples/python/vision_transformers.py --task pets --heads 4 $F
+```
+
+Measured on 4 cores. The transformer columns use toy parameters (ring
+2^14, 59-bit scaling), with d = 32, MLP 64 and one block. CIFAR is top-1
+accuracy and Pets is mean IoU over the three classes:
+
+| | CIFAR, 1 head | CIFAR, 4 heads | Pets, 1 head | Pets, 4 heads |
+| --- | --- | --- | --- | --- |
+| torch (all test images) | 57.7% | 58.9% | 0.484 | 0.499 |
+| fheml plaintext (2000 / 500 test images) | 57.1% (torch on them: 57.1%) | 59.8% (torch: 59.8%) | 0.483 (torch: 0.483) | 0.503 (torch: 0.503) |
+| Depth | 71: 3 bootstraps between layers, 17 inside LayerNorm, softmax and argmax | 71: 3 + 23 | 68: 3 + 16 | 68: 3 + 22 |
+| Setup, rotation keys | 27 s, 229 keys (7.8 GB) | 19 s, 153 keys (5.2 GB) | 30 s, 232 keys (7.9 GB) | 21 s, 177 keys (6.0 GB) |
+| Time per image | 133-136 s | 163-169 s | 408-409 s | 376-397 s (argmax 225 s) |
+| Peak memory | 11.9 GB | 9.0 GB | 12.3 GB | 9.8 GB |
+| Encrypted vs torch | one-hots within 4e-6, 3/3 same class | 1e-5, 3/3 | 1.5e-5, every pixel the same (2 images) | 1.5e-5, every pixel the same (2 images) |
+
+The heads are sub-blocks of each token's slots, so they need no split or
+concat rotations, and the 4-head models need fewer rotation keys than the
+single-head ones. Time follows the refreshes instead: the 4-head CIFAR
+model's attention plans 23 bootstraps inside its layers against 17, so it is
+about 25% slower, while the 4-head Pets model is a little faster. d = 64
+does not fit: the keys for 16384-slot ciphertexts exceed 14 GB even at toy
+parameters.
+
+The basic block at d = 64 runs at 128-bit security on ring 2^15 (12 levels,
+99 rotation keys, 2.5 GB). Its output is the logits (`--logits`), because
+the argmax's scheme-switching levels do not fit without bootstrapping:
+
+| basic, 128-bit | CIFAR, 1 head | CIFAR, 4 heads | Pets, 1 head | Pets, 4 heads |
+| --- | --- | --- | --- | --- |
+| torch | 54.0% | 56.6% | 0.464 | 0.476 |
+| fheml plaintext | 55.5% (2000 images) | 57.6% | 0.467 (500 images) | 0.479 |
+| Time per image | 43 s | 36 s | 43 s | 41 s |
+| Peak memory | 6.1 GB | 6.2 GB | 5.5 GB | 5.5 GB |
+| Encrypted vs torch (5 images) | 5e-6, 5/5 | 3e-6, 5/5 | every pixel | every pixel |
+
+`train_torch_mnist.py --arch vit` and `--arch lnvit` use the same GELU MLP
+and end in the encrypted argmax as well (`--logits` drops it).
+
+## Recurrent networks
+
+`fheml.Recurrent` (torch twins `fheml.nn.RNN`, `GRU`, `LSTM`) runs a
+single-layer recurrent network over a token sequence, with the weights in
+torch's layout (`load_torch(layer)` copies a trained `nn.RNN` / `nn.GRU` /
+`nn.LSTM` in). It outputs every hidden state, so layers stack, or only the
+last one (`last=True`) for a classifier. The cells keep their real
+activations: the gates' sigmoid is a Chebyshev series on [-gate_a, gate_a]
+(default 16, degree 13), the tanh of the RNN, the GRU candidate and the LSTM
+cell one on [-a, a] (default 8). Wide intervals matter here: an LSTM cell
+state accumulates over the whole sequence, and with [-8, 8] / [-4, 4] most
+sequential-MNIST inputs left them. The LSTM's candidate gate uses
+tanh(x) = 2 sigmoid(2x) - 1, so all four gates share one series evaluation.
+
+```python
+from fheml import nn as hnn
+model = torch.nn.Sequential(hnn.LSTM(28, 32, last=True), torch.nn.Linear(32, 10))
+# ... train (fhe_eval.train adds range_loss, which keeps the series inside their intervals) ...
+net = fheml.from_torch(model, (28, 28))   # 28 time steps of 28 features
+fheml.auto_bootstrap(net, calibration)    # the layer bootstraps its own state
+```
+
+Under encryption all time steps advance together: the state ciphertext
+holds every token's hidden state and one step updates all of them (see
+[docs/DESIGN.md](docs/DESIGN.md#recurrent-layers)). After n steps the result
+is exactly the sequential recurrence, with the same depth: 5 levels per step
+for the RNN and 12 for GRU and LSTM at degree 13. A sequence is therefore
+always deeper than one bootstrapping stretch, and the layer refreshes its
+state whenever the next step would not fit (one bootstrap per RNN step,
+three per GRU or LSTM step at a 5-level budget). Everything it bootstraps
+lies in [-1, 1] by construction, so no scaling levels are spent.
+`Recurrent.series_ranges(xs)` (printed by `fhe_eval.check_ranges`) reports
+how far the series arguments go on real data, at every encrypted step.
+
+`examples/python/rnn_sequences.py` trains RNN, GRU and LSTM classifiers on
+sequential MNIST (the image read row by row, 28 steps of 28 pixels), SST-2
+and AG News (word vectors from the client's embedding lookup, as for the
+text transformers) and runs them encrypted:
+
+```sh
+PYTHONPATH=build/python python3 examples/python/rnn_sequences.py --task smnist --cell lstm --bootstrap --insecure --n 3
+PYTHONPATH=build/python python3 examples/python/rnn_sequences.py --task sst2 --cell gru --bootstrap --insecure --n 3
+PYTHONPATH=build/python python3 examples/python/rnn_sequences.py --task agnews --cell rnn --bootstrap --insecure --n 3
+```
+
+Measured on 4 cores at toy parameters (insecure ring, 55-bit scaling,
+10 levels per stretch for the RNN and 12 for GRU/LSTM), hidden size 32,
+3 encrypted test sequences per model:
+
+| | Accuracy (torch, whole test set) | fheml plaintext (first 1000) | Ring, slots | Bootstraps per sequence | Time per sequence | Encrypted vs torch logits |
+| --- | --- | --- | --- | --- | --- | --- |
+| Sequential MNIST, RNN | 86.8% | 83.3% (torch on them 83.3%) | 4096, 1024 | 13 | 24 s | 7e-5 to 2e-4, 3/3 same class |
+| Sequential MNIST, GRU | 96.4% | 96.0% (96.0%) | 8192, 4096 | 27 | 192 s | 1e-3 to 2e-3, 3/3 |
+| Sequential MNIST, LSTM | 97.0% | 95.9% (96.4%) | 8192, 4096 | 34 | 228 s | 2e-3 to 4e-3, 3/3 |
+| SST-2, RNN | 79.5% | 78.4% (78.4%) | 4096, 1024 | 15 | 25 s | 1e-5 to 8e-5, 3/3 |
+| SST-2, GRU | 79.8% | 79.0% (79.0%) | 8192, 4096 | 31 | 213 s | 4e-4 to 3e-3, 3/3 |
+| SST-2, LSTM | 81.4% | 81.3% (81.3%) | 8192, 4096 | 39 | 262 s | 7e-4 to 2e-3, 3/3 |
+| AG News, RNN | 87.3% | 87.2% (87.2%) | 4096, 512 | 7 | 11 s | 2e-5 to 4e-5, 3/3 |
+| AG News, GRU | 89.1% | 88.6% (88.6%) | 4096, 2048 | 15 | 45 s | 3e-4 to 1e-3, 3/3 |
+| AG News, LSTM | 88.9% | 88.3% (88.3%) | 4096, 2048 | 19 | 55 s | 6e-4 to 2e-3, 3/3 |
+
+Sequential MNIST has 28 steps, SST-2 32 and AG News 16. Peak memory stays
+at 1.7 to 4.4 GB (0.6 to 1.6 GB of rotation keys). Bootstrapping takes
+about three quarters of the time, so the cost follows the bootstrap count:
+GRU and LSTM need one per step at 12 levels plus the refreshes of their
+gates, the RNN one per two steps. Text is padded on the left, so the last
+state the classifier reads comes right after the last word. The
+"fheml plaintext" column is the encrypted computation in the clear: where
+it trails torch, a few test inputs push a gate or cell state outside its
+series interval (4 of 200 sequential-MNIST inputs for the LSTM, none for
+the text models), which training cannot rule out for unseen data. With
+50-bit scaling the bootstraps at 4096 slots lose most of their precision
+(logit errors around 5e-2); with 59 bits values near 1 occasionally wrap
+around in the bootstrap, so the script uses 55 (`--scale-bits`).
+
+## Detection and segmentation on COCO
+
+`examples/python/coco_cnn.py` takes a CNN on COCO 2017 from the image to the
+finished answer under encryption. The server runs the network and all of its
+post-processing on the ciphertext. The client decrypts once and only reads the
+result: boxes and scores for detection, a one-hot label map for segmentation.
+
+```sh
+PYTHONPATH=build/python python3 examples/python/coco_cnn.py --task detect --classes person \
+    --insecure --bootstrap --window 1 --digits 4 --scale-bits 59 --n 2
+PYTHONPATH=build/python python3 examples/python/coco_cnn.py --task segment --classes person \
+    --insecure --bootstrap --window 1 --digits 4 --scale-bits 59 --n 2
+```
+
+**Backbone.** Images are squashed to 48×48. Five 3×3 convolutions with
+BatchNorm and ReLU (widths 12, 24, 24, 48, 48; three of them stride 2) give a
+6×6 grid of features, and a 1×1 convolution reads out each cell's prediction.
+ReLU is a degree-31 Chebyshev series on [-20, 20], and torch trains through
+that same series. The range penalty starts at 60% of the interval, so unseen
+images stay inside it too: the script counts the val images that do not. The
+network is 41 to 60 levels deep, and `--bootstrap` places 5 to 8 bootstraps
+between its layers.
+
+**Detection.** This is a single-shot grid detector. Every cell predicts a box
+(centre within the cell, width, height) and K per-class scores through one
+Chebyshev sigmoid. Non-maximum suppression and box decoding then stay
+encrypted:
+
+1. A `LinearMap` gathers each score's 3×3 neighbourhood into 9 channels
+   (the score itself first, zero padding).
+2. The encrypted `ArgMax` over those channels gives c = 1 where the score is
+   its neighbourhood's maximum.
+3. A residual adds c − 1 to the score.
+4. A second `LinearMap` turns cell offsets into box corners. It adds each
+   cell's own position as a bias.
+5. A Chebyshev ReLU zeroes the suppressed scores and clips the corners at 0.
+
+**Segmentation.** Each cell predicts the logits of its 4×4 block of a 24×24
+label map. A pixel-shuffle `LinearMap` (a permutation) arranges them into the
+map, so no upsampling layer is needed. A per-pixel `ArgMax` over the K + 1
+channels then makes the one-hot labels.
+
+**Evaluation.** Training uses the first 40,000 train2017 images and scoring
+uses all 5000 val2017 images. At 48×48, half of the boxes are smaller than a
+grid cell (8 px). Detection therefore scores the objects at least one cell in
+size and treats smaller ones and crowds as ignore regions
+(`average_precision(ignore=...)`), the way COCO treats crowds.
+
+Measured on 4 cores, toy parameters (ring 2^14, 8192 slots, 59-bit scale,
+`key_switch_digits` 4, ladder window 1):
+
+| | Person detector | Person segmenter | 6-class detector | 6-class segmenter |
+| --- | --- | --- | --- | --- |
+| Torch, val2017 (5000) | AP50 15.4%, AP 4.1%, large AP50 17.5% | mean IoU 0.587 (person 0.32), pixels 86.4% | mAP50 5.9% (person 16.3%), mAP 1.6% | mean IoU 0.243 (person 0.33, bus 0.22, train 0.19), pixels 84.6% |
+| fheml plaintext = torch | yes (20 images) | yes (20 images) | yes (20 images) | yes (20 images) |
+| Depth, bootstraps | 60, 7 + 1 inside ArgMax | 41, 5 | 60, 7 + 1 | 43, 5 + 1 |
+| Time per image | 146 s | 128 s | 326 s | 500 s |
+| Peak memory | 10.8 GB | 10.9 GB | 10.9 GB | 10.9 GB |
+| Encrypted vs torch | detections identical, 1.8e-4 | every label identical | detections identical, outputs within 2.8e-2 | every label identical |
+
+Two of the 5000 val images (person segmenter) and one (6-class segmenter)
+push a ReLU input outside its interval; their encrypted results would be
+garbage, and the torch scores count them as they come out. The six classes
+are person, car, bus, train, cat and dog. Accuracy is limited
+by the model's size, not by encryption. In 64×64 trials, the same backbone
+with exact ReLU in plain torch reached 4.7% mAP50 on the six classes, and the
+0.5x + 0.25x² variant (`--activation quad`) reached 3.7%.
+
+Memory sets the input size. At 64×64 the activations need 16384 slots, and
+bootstrapping keys alone at that size exceed 14 GB. The comparisons cost one
+FHEW bootstrap per compared slot, switched 256 slots at a time, which is most
+of each image's time. 128-bit parameters do not fit this machine.
+
 ## Encrypted training
 
 `Trainer` trains a network on encrypted data. The client encrypts inputs and
@@ -1160,11 +1420,9 @@ still need their own key).
 | --- | --- |
 | `include/fheml/`, `src/` | the library: backend selection (`backend.h`: OpenFHE or FIDESlib), context, linear transforms, layers, network, encrypted training (`train.h`) |
 | `examples/` | `mnist_cnn` (encrypted MNIST), `conv_demo` (network built in code), `packing_bench` (gapped vs compact vs multiplexed packing) and `rotation_bench` (hoisted rotation trees vs. plain composed rotations) |
-| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py`, `test_eval.py`, `test_g2p.py` (the encoder-decoder example) |
+| `tests/` | `test_fheml`: BSGS plans vs. exact products, encrypted vs. plaintext per layer, depth accounting, scheme-switching comparison and max pooling; `test_train`: encrypted training vs. plaintext SGD and finite differences; `test_python.py`, `test_torch.py`, `test_train.py`, `test_eval.py`, `test_g2p.py` (the encoder-decoder example), `test_vision_transformers.py`, `test_recurrent.py` (RNN, GRU, LSTM) |
 | `python/` | pybind11 bindings and the `fheml` Python package (`fheml.nn` + `fheml.from_torch`: PyTorch export) |
-| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` and `train_torch_cifar10.py` train in torch and run encrypted; `train_encrypted_mnist.py` trains on encrypted data |
-
-| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` trains in torch and runs encrypted; `mnist_mlp_cnn.py` compares the MLP and CNN; `train_encrypted_mnist.py` trains on encrypted data; `text_transformer.py` classifies text (AG News, SST-2) with encoder transformers; `g2p_transformer.py` is an encoder-decoder (CMUdict grapheme to phoneme) decoded greedily under encryption |
+| `examples/python/` | encrypted MNIST CNN and transformer from Python; `train_torch_mnist.py` and `train_torch_cifar10.py` train in torch and run encrypted; `mnist_mlp_cnn.py` compares the MLP and CNN; `train_encrypted_mnist.py` trains on encrypted data; `text_transformer.py` classifies text (AG News, SST-2) with encoder transformers; `rnn_sequences.py` runs RNN, GRU and LSTM classifiers (sequential MNIST, SST-2, AG News); `g2p_transformer.py` is an encoder-decoder (CMUdict grapheme to phoneme) decoded greedily under encryption; `vision_transformers.py` is a CIFAR-10 ViT and an Oxford Pets segmentation transformer |
 | `tools/train_mnist.py`, `tools/train_transformer.py` | HE-friendly CNN / transformer training and export (numpy) |
 | `models/` | trained example models and 200 test images |
 | `legacy/` | the original PALISADE capstone code |

@@ -544,6 +544,31 @@ class Scale : public LinearLayer {
   std::vector<double> factors_;
 };
 
+// A fixed linear map y = M x + b between arbitrary shapes, given as a sparse
+// matrix (M: out.size() x in.size(), entries (row, col, value)) and an
+// optional bias per output element. Not trainable. It expresses the
+// permutations, gathers and per-position offsets of post-processing that
+// no convolution can: pixel shuffle, a box decoder adding each grid cell's
+// position, the neighbour gather of a local-maximum test. Its cost is that
+// of any linear layer: one level, a rotation per distinct slot offset.
+class LinearMap : public LinearLayer {
+ public:
+  LinearMap(Shape in, Shape out, std::vector<size_t> rows, std::vector<size_t> cols, std::vector<double> vals,
+            std::vector<double> bias, std::string what = "linearmap");
+  std::string type() const override { return "linearmap"; }
+  std::string describe() const override;
+  Shape configure(const Shape& in) override;
+  SparseMatrix matrix() const override;
+  std::vector<double> bias() const override { return b_; }
+  void save(std::ostream& os) const override;
+
+ private:
+  Shape in0_, out0_;
+  std::vector<size_t> rows_, cols_;
+  std::vector<double> vals_, b_;
+  std::string what_;
+};
+
 // Product of consecutive linear layers, produced by Network::fuse_linear().
 class FusedLinear : public LinearLayer {
  public:
