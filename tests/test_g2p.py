@@ -19,8 +19,8 @@ torch.manual_seed(0)
 rng = np.random.default_rng(0)
 src = rng.integers(1, 27, size=(1, G.S))
 
-for heads in (1, 4):
-    model = G.g2p(heads).eval()
+for heads, kw in ((1, {}), (4, {}), (1, dict(attention="quadratic", norm=False, act="square"))):
+    model = G.g2p(heads, **kw).eval()
     net = fheml.from_torch(model, (G.N, G.V))  # raises if fheml plaintext != torch
     net.compile()
     # The logits at target position t depend on the letters and on the
@@ -41,6 +41,19 @@ for heads in (1, 4):
     assert not np.allclose(ya[G.S:], yc[G.S:])
     # The source and target embeddings are separate weight sets.
     assert {layer.type for layer in net.layers} >= {"tokendense", "residual"}
+
+# Server decoding: the unrolled network (transformer -> select -> ArgMax ->
+# write back, per step) in the clear decodes exactly like the client loop.
+model = G.g2p(4).double().eval()
+dec = G.decoder_network(model, 1000.0)
+dec.compile()
+assert sum(layer.type == "residual" for layer in dec.layers) == G.T - 1
+words = rng.integers(1, 27, size=(2, G.S))
+step = G.torch_step(model)
+want, _ = G.greedy(step, words)
+got = np.stack([G.read_decoded(fheml.plain(dec, x)) for x in G.server_inputs(words)])
+# The last position is never computed (it is </s> for every word that fits).
+assert (got[:, :G.T - 1] == want[:, :G.T - 1]).all(), (got, want)
 
 # Greedy decoding: a stub server that always predicts phoneme 5, 6, ...,
 # then </s> at position 3. The client feeds its own choices back, stops at

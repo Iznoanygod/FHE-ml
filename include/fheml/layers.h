@@ -481,6 +481,8 @@ class ArgMax : public Layer {
   uint32_t blocks() const { return 1u << rounds(); }
   uint32_t block() const;
   bool over_channels() const { return over_channels_; }
+  // Shallowest bootstrap (levels) the bootstrapped plan assumes: level budget {2,2}.
+  static constexpr uint32_t kMinBootstrapDepth = 18;
   // Logical (c, h, w row-major) index of class j of group i.
   size_t logical(uint32_t i, uint32_t j) const;
 
@@ -584,6 +586,24 @@ class FusedLinear : public LinearLayer {
   SparseMatrix m_;
   std::vector<double> b_;
   std::string what_;
+};
+
+// Moves values between slots: y[i] = x[index[i]] (0 where index[i] < 0),
+// from in_shape to out_shape. One level (a 0/1 slot matrix). Picks one
+// token out of a sequence, or writes values into another token's slots,
+// e.g. an encrypted decoder feeding its prediction back as its next input.
+class Select : public LinearLayer {
+ public:
+  Select(Shape in, Shape out, std::vector<int> index);
+  std::string type() const override { return "select"; }
+  std::string describe() const override;
+  Shape configure(const Shape& in) override;
+  SparseMatrix matrix() const override;
+  void save(std::ostream& os) const override;
+  const std::vector<int>& index() const { return index_; }
+
+ private:
+  std::vector<int> index_;
 };
 
 // x -> x^2 (CryptoNets). One level.

@@ -630,9 +630,18 @@ bool ArgMax::plan_chain(uint32_t d, uint32_t top, uint32_t* refreshes) const {
   return true;
 }
 
+//
+// The output (the bits' chain and the scatter) sits at compare_depth() +
+// rounds + 2 absolute (one level for the mask of a folded or chunked
+// comparison), i.e. that minus a bootstrap's output level into the stretch;
+// kMinBootstrapDepth is the shallowest bootstrap the library configures
+// (level budget {2,2}; forward() checks it). So 40 classes (6 rounds) leave
+// the stretch at level 2, not 6.
 uint32_t ArgMax::level_after(uint32_t d, uint32_t budget) const {
   if (!bootstrapped_) return Layer::level_after(d, budget);
-  return plan_chain(d, budget, nullptr) ? rounds() : kNoFit;
+  if (!plan_chain(d, budget, nullptr)) return kNoFit;
+  const uint32_t top = FHEContext::compare_depth() + rounds() + 2;
+  return std::max<uint32_t>(1, top > kMinBootstrapDepth ? top - kMinBootstrapDepth : 0);
 }
 
 uint32_t ArgMax::level_peak(uint32_t d, uint32_t budget) const {
@@ -702,6 +711,10 @@ Ctxt ArgMax::forward(const FHEContext& ctx, const Ctxt& x) const {
     cc->EvalAddInPlace(a, p);
   }
   Ctxt alive;  // the "still winning" bit of every block (slots of real groups)
+  if (bootstrapped_ && ctx.bootstrap_depth() && ctx.bootstrap_depth() < kMinBootstrapDepth)
+    throw std::logic_error("argmax: planned for bootstraps of depth >= " + std::to_string(kMinBootstrapDepth) +
+                           " (level budget {2,2} or more), the context's take " +
+                           std::to_string(ctx.bootstrap_depth()));
   const uint32_t top = ctx.stretch_budget() + 1;  // the context's levels per stretch
   for (uint32_t h = nb / 2; h >= 1; h /= 2) {
     const size_t n = static_cast<size_t>(h) * m;
@@ -903,6 +916,41 @@ void FusedLinear::scale(double fm, double fb) {
 
 void FusedLinear::save(std::ostream&) const {
   throw std::logic_error("fused layers are a runtime optimisation and are not serialised; save before fusing");
+}
+
+// ---------------------------------------------------------------------- Select
+
+Select::Select(Shape in, Shape out, std::vector<int> index) : index_(std::move(index)) {
+  if (index_.size() != out.size()) throw std::invalid_argument("select: need one index per output");
+  for (int i : index_)
+    if (i >= static_cast<int>(in.size())) throw std::invalid_argument("select: index past the input");
+  in_ = in;
+  out_ = out;
+}
+
+std::string Select::describe() const {
+  std::ostringstream os;
+  os << "select " << in_.c << "x" << in_.h << "x" << in_.w << " -> " << out_.c << "x" << out_.h << "x" << out_.w;
+  return os.str() + LinearLayer::describe();
+}
+
+Shape Select::configure(const Shape& in) {
+  if (in.size() != in_.size()) throw std::invalid_argument("select: input size mismatch");
+  in_ = in;
+  return out_;
+}
+
+SparseMatrix Select::matrix() const {
+  SparseMatrix m(out_.size(), in_.size());
+  for (size_t i = 0; i < index_.size(); ++i)
+    if (index_[i] >= 0) m.add(i, static_cast<size_t>(index_[i]), 1.0);
+  return m;
+}
+
+void Select::save(std::ostream& os) const {
+  os << "select " << in_.c << " " << in_.h << " " << in_.w << " " << out_.c << " " << out_.h << " " << out_.w << "\n";
+  std::vector<double> v(index_.begin(), index_.end());
+  write_vec(os, v);
 }
 
 // ---------------------------------------------------------------- Activations

@@ -66,6 +66,7 @@ Dense = _accepting_numpy(_fheml.Dense)
 Poly = _accepting_numpy(_fheml.Poly)
 TokenDense = _accepting_numpy(_fheml.TokenDense)
 TokenMean = _fheml.TokenMean
+Select = _fheml.Select
 LayerNorm = _accepting_numpy(_fheml.LayerNorm)
 Recurrent = _accepting_numpy(_fheml.Recurrent)
 SoftmaxOptions = _fheml.SoftmaxOptions

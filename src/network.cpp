@@ -140,6 +140,12 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
     size_t c;
     is >> c;
     layer = std::make_shared<Scale>(read_vec(is, c, "scale factors"));
+  } else if (tok == "select") {
+    int ic, ih, iw, oc, oh, ow;
+    is >> ic >> ih >> iw >> oc >> oh >> ow;
+    Shape in{ic, ih, iw}, out{oc, oh, ow};
+    auto v = read_vec(is, out.size(), "select index");
+    layer = std::make_shared<Select>(in, out, std::vector<int>(v.begin(), v.end()));
   } else if (tok == "linearmap") {
     std::string what;
     Shape in, out;
