@@ -106,4 +106,41 @@ err = np.abs(params(enc) - params(ref)).max()
 print(f"level budget {trainer.level_budget}: {trainer.sample_bootstraps} bootstraps per sample, "
       f"max weight error {err:.1e}")
 assert err < 1e-3
+
+# A torch CNN with BatchNorm2d/BatchNorm1d (kept as trainable batch norms)
+# and Dropout: the encrypted batched step matches train_plain, running
+# statistics included.
+try:
+    import torch
+    from torch import nn
+    from fheml import nn as hnn
+except ImportError:
+    torch = None
+if torch is not None:
+    torch.manual_seed(3)
+
+    def build_bn():
+        torch.manual_seed(3)
+        m = nn.Sequential(nn.Conv2d(1, 2, 3, padding=1), nn.BatchNorm2d(2), hnn.Poly([0, 0.5, 0.25]),
+                          nn.Dropout(0.25), nn.Flatten(), nn.Linear(32, 4), nn.BatchNorm1d(4), hnn.Square(),
+                          nn.Linear(4, 2)).double()
+        net = fheml.from_torch(m, (1, 4, 4), batchnorm_range=(0.0, 3.0))
+        net.compile()
+        return net
+
+    enc, ref = build_bn(), build_bn()
+    assert [l.type for l in enc.layers].count("batchnorm") == 2 and any(l.type == "dropout" for l in enc.layers)
+    xb, tb = rng.uniform(-1, 1, (3, 1, 4, 4)), rng.uniform(-1, 1, (3, 2))
+    trainer, ctx = fheml.make_trainer(enc, secure=False, bootstrapping=False)
+    assert trainer.batch_coupled
+    trainer.encrypt_weights(ctx)
+    fheml.train_step(trainer, ctx, xb, tb, lr=0.5)
+    fheml.train_plain(ref, xb, tb, lr=0.5)
+    trainer.decrypt_weights(ctx)
+    err = np.abs(params(enc) - params(ref)).max()
+    bns = [(a, b) for a, b in zip(enc.layers, ref.layers) if a.type == "batchnorm"]
+    run_err = max(np.abs(np.subtract(a.running_mean, b.running_mean)).max() +
+                  np.abs(np.subtract(a.running_var, b.running_var)).max() for a, b in bns)
+    print(f"batch norm + dropout: max weight error {err:.1e}, running statistics {run_err:.1e}")
+    assert err < 1e-4 and run_err < 1e-4
 print("PASSED")

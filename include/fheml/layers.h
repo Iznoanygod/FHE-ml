@@ -14,6 +14,7 @@
 #include <functional>
 #include <iosfwd>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -594,6 +595,67 @@ class ChannelAffine : public LinearLayer {
   std::vector<double> scale_, shift_;
 };
 
+// Batch normalisation over the channels of (C, H, W) images, (C, L) signals
+// or (k,) vectors (k channels of one value). Inference uses the running
+// statistics, so it is the per-channel affine
+//   y = gamma (x - running_mean) / sqrt(running_var + eps) + beta,
+// one level like any linear layer (the scale and shift are computed in the
+// clear by whoever holds the weights). The Trainer normalises with the
+// statistics of the batch instead, like torch in train mode: the batch mean
+// and (biased) variance of each channel, summed over the batch's
+// ciphertexts and over the channel's positions with one linear map, and
+// 1 / sqrt(var + eps) as a Chebyshev series on [var_min, var_max] plus
+// `newton` Newton steps, as in LayerNorm. It also updates the running
+// statistics under encryption (momentum, unbiased variance, as torch does).
+class BatchNorm : public LinearLayer {
+ public:
+  BatchNorm(std::vector<double> gamma, std::vector<double> beta, std::vector<double> running_mean,
+            std::vector<double> running_var, double eps, double momentum, double var_min, double var_max,
+            uint32_t degree = 15, uint32_t newton = 1);
+  std::string type() const override { return "batchnorm"; }
+  std::string describe() const override;
+  Shape configure(const Shape& in) override;
+  SparseMatrix matrix() const override;
+  std::vector<double> bias() const override;
+  int gap_stride() const override { return 1; }
+  // Training: gamma then beta (the running statistics are state, not
+  // parameters: running_mean()/running_var(), set_running()).
+  std::vector<double> params() const override;
+  void set_params(const std::vector<double>& p) override;
+  bool trainable() const override { return true; }
+  void save(std::ostream& os) const override;
+
+  size_t channels() const { return gamma_.size(); }
+  const std::vector<double>& gamma() const { return gamma_; }
+  const std::vector<double>& beta() const { return beta_; }
+  const std::vector<double>& running_mean() const { return rm_; }
+  const std::vector<double>& running_var() const { return rv_; }
+  void set_running(std::vector<double> mean, std::vector<double> var);
+  // The input arriving multiplied by c > 0 leaves the output unchanged once
+  // the statistics, eps and the variance range are rescaled (see
+  // Network::place_bootstraps).
+  void absorb_input_scale(double c);
+  double eps() const { return eps_; }
+  double momentum() const { return momentum_; }
+  double var_min() const { return var_min_; }
+  double var_max() const { return var_max_; }
+  uint32_t degree() const { return degree_; }
+  uint32_t newton() const { return newton_; }
+  // 1 / sqrt(v + eps) as the trainer approximates it, its Chebyshev
+  // coefficients on [var_min, var_max], and the levels it takes.
+  double inv_sqrt(double v) const;
+  const std::vector<double>& inv_sqrt_coeffs() const { return coeffs_; }
+  uint32_t inv_sqrt_depth() const;
+  // Elements per channel (H*W) after configure().
+  size_t positions() const { return static_cast<size_t>(in_.h) * in_.w; }
+
+ private:
+  std::vector<double> gamma_, beta_, rm_, rv_;
+  double eps_, momentum_, var_min_, var_max_;
+  uint32_t degree_, newton_;
+  std::vector<double> coeffs_;
+};
+
 // Fixed per-channel scale y = factor[c] * x, not trainable. Inserted by
 // Network::place_bootstraps() when a bootstrap's input scale cannot be folded
 // into a neighbouring layer.
@@ -799,6 +861,38 @@ class ExactReLU : public Layer {
  private:
   double range_, out_scale_;
   bool after_bootstrap_;
+};
+
+// Dropout: the identity at inference (no level, no operation). The Trainer
+// zeroes each element with probability p and scales the others by
+// 1 / (1 - p), drawing a fresh mask per sample and step: a plaintext 0/1
+// mask, one level. The mask is random noise independent of the data, so
+// the server draws it; the ciphertexts stay encrypted. Masks come from the
+// layer's own generator (seed), so a plaintext reference with the same seed
+// drops the same elements.
+class Dropout : public Layer {
+ public:
+  explicit Dropout(double p, uint64_t seed = 0);
+  std::string type() const override { return "dropout"; }
+  std::string describe() const override;
+  Shape configure(const Shape& in) override { return in_ = out_ = in; }
+  std::vector<double> forward_plain(const std::vector<double>& x) const override { return x; }
+  Ctxt forward(const FHEContext& ctx, const Ctxt& x) const override {
+    (void)ctx;
+    return x;
+  }
+  uint32_t depth() const override { return 0; }
+  void save(std::ostream& os) const override;
+  double p() const { return p_; }
+  // The next training mask: out_shape().size() values, 0 or 1 / (1 - p).
+  std::vector<double> draw();
+  // Restarts the mask sequence.
+  void reseed(uint64_t seed);
+
+ private:
+  double p_;
+  uint64_t seed_;
+  std::mt19937_64 rng_;
 };
 
 // Refreshes the ciphertext's levels with CKKS bootstrapping. Slot values must

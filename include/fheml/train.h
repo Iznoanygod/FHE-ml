@@ -157,6 +157,15 @@ class Trainer {
   // Forward and backward pass for one sample; adds its gradient to the
   // batch. Returns the (encrypted) network output.
   Ctxt accumulate(const FHEContext& ctx, const Ctxt& x, const Ctxt& target);
+  // The same for a whole batch, processed layer by layer so that batch norms
+  // normalise with the batch's statistics (required for networks with
+  // BatchNorm layers; accumulate() is a batch of one). Keeps every sample's
+  // activations until the backward pass. Returns the outputs.
+  std::vector<Ctxt> accumulate_batch(const FHEContext& ctx, const std::vector<Ctxt>& xs,
+                                     const std::vector<Ctxt>& targets);
+  // True when a trained layer couples the samples of a batch (batch norm):
+  // train with accumulate_batch.
+  bool batch_coupled() const;
   // w -= lr / n * (sum of the n accumulated gradients), then bootstraps the
   // weights when the context supports it.
   void update(const FHEContext& ctx, double lr);
@@ -198,8 +207,15 @@ class Trainer {
 };
 
 // Plaintext reference of Trainer: one SGD update on a batch with the same
-// loss, the same polynomials and the same weight sharing. Updates the
+// loss, the same polynomials and the same weight sharing (batch norms use
+// the batch's statistics and update their running statistics). Updates the
 // network's layers in place (compile() again before encrypted inference).
+// The network's outputs on a batch as training computes them: batch norms
+// normalise with the batch's statistics (and the trainer's 1/sqrt
+// approximation) instead of their running statistics; every other layer is
+// forward_plain.
+std::vector<std::vector<double>> forward_plain_batch(const Network& net, const std::vector<std::vector<double>>& xs);
+
 void train_plain(Network& net, const std::vector<std::vector<double>>& xs, const std::vector<std::vector<double>>& ts,
                  double lr, const std::vector<size_t>& frozen = {}, const Loss& loss = Loss{});
 

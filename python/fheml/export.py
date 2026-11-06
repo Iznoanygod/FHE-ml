@@ -58,7 +58,9 @@ class _Exporter:
     """Walks the module tree tracking the activation shape and emits a list of
     layer specs (plain tuples), so later passes can fold or pad weights."""
 
-    def __init__(self, maxpool_range=None, exact_relu=None):
+    def __init__(self, maxpool_range=None, exact_relu=None, batchnorm_range=None):
+        self.batchnorm_range = batchnorm_range
+        self.dropouts = 0
         self.max_token_width = 0
         self.maxpool_range = maxpool_range
         self.exact_relu = exact_relu
@@ -76,7 +78,14 @@ class _Exporter:
             specs, state = self.run(m, state)
             out.extend(specs)
             return state
-        if isinstance(m, (nn.Identity, nn.Dropout, hnn.Bootstrap)):
+        if isinstance(m, (nn.Dropout, nn.Dropout1d, nn.Dropout2d)):
+            if isinstance(m, (nn.Dropout1d, nn.Dropout2d)):
+                raise ValueError(f"nn.{name} (channel dropout) is unsupported: use nn.Dropout")
+            if m.p > 0:
+                self.dropouts += 1  # each layer its own mask sequence
+                out.append(("dropout", float(m.p), self.dropouts))
+            return state
+        if isinstance(m, (nn.Identity, hnn.Bootstrap)):
             if isinstance(m, hnn.Bootstrap):
                 out.append(("bootstrap",))
             return state
@@ -133,6 +142,13 @@ class _Exporter:
                 raise ValueError("nn.BatchNorm1d is supported on vectors and (C, L) signals only")
             if m.running_mean is None:
                 raise ValueError(f"{name}: needs track_running_stats=True")
+            if self.batchnorm_range is not None:
+                if not m.affine:
+                    raise ValueError(f"{name}: batchnorm_range needs affine=True")
+                lo, hi = self.batchnorm_range
+                out.append(("batchnorm", _np(m.weight), _np(m.bias), _np(m.running_mean), _np(m.running_var),
+                            float(m.eps), float(m.momentum if m.momentum is not None else 0.1), float(lo), float(hi)))
+                return state
             scale = 1.0 / np.sqrt(_np(m.running_var) + m.eps)
             shift = -_np(m.running_mean) * scale
             if m.affine:
@@ -414,6 +430,11 @@ def _build(s):
         return cls(ic, oc, kh, kw, stride, pad, _flat(w), _flat(b), **g)
     if k == "upsample":
         return _fheml.Upsample(*s[1:])
+    if k == "dropout":
+        return _fheml.Dropout(s[1], s[2])
+    if k == "batchnorm":
+        _, g, b, rm, rv, eps, mom, lo, hi = s
+        return _fheml.BatchNorm(_flat(g), _flat(b), _flat(rm), _flat(rv), eps, mom, lo, hi, 31, 1)
     if k == "avgpool2d":
         return _fheml.AvgPool2d(*s[1:])
     if k == "maxpool2d":
@@ -466,7 +487,8 @@ def _build(s):
     raise AssertionError(k)
 
 
-def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range=None, exact_relu=None):
+def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range=None, exact_relu=None,
+               batchnorm_range=None):
     """Converts a trained torch model to an ``fheml.Network`` (not yet compiled).
 
     token_width: for token inputs, zero-pad each input token to this width
@@ -482,6 +504,11 @@ def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range
       random input and raise if they disagree.
     maxpool_range: input bound R of every plain nn.MaxPool2d (exported as the
       exact scheme-switching max pool; fheml.nn.MaxPool2d carries its own).
+    batchnorm_range: (var_min, var_max). None (default) folds batch norms into
+      the preceding conv/linear for inference. Given, they stay BatchNorm
+      layers (still one affine level at inference) that the encrypted Trainer
+      trains with batch statistics, 1/sqrt(var + eps) being a Chebyshev
+      series on this variance range.
     """
     shape = tuple(int(v) for v in input_shape)
     if len(shape) == 3:
@@ -493,7 +520,7 @@ def from_torch(model, input_shape, token_width="auto", check=True, maxpool_range
     else:
         raise ValueError("input_shape must be (C, H, W), (tokens, dim) or (features,)")
 
-    ex = _Exporter(maxpool_range, exact_relu)
+    ex = _Exporter(maxpool_range, exact_relu, batchnorm_range)
     modules = model if isinstance(model, nn.Sequential) else [model]
     with torch.no_grad():
         specs, _ = ex.run(modules, state)

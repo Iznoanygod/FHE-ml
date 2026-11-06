@@ -41,11 +41,10 @@ std::vector<double> scaled(const std::vector<double>& mask, double s) {
   return v;
 }
 
+// acc += c. Not in place: the first c is shared, not copied, and may still
+// be in use (a batch's gradients).
 void add_to(const FHEContext& ctx, Ctxt& acc, const Ctxt& c) {
-  if (acc)
-    ctx.cc()->EvalAddInPlace(acc, c);
-  else
-    acc = c;
+  acc = acc ? ctx.cc()->EvalAdd(acc, c) : c;
 }
 
 }  // namespace
@@ -142,6 +141,8 @@ std::vector<double> activation_derivative_plain(const Layer& l, const std::vecto
   } else if (auto* c = dynamic_cast<const ChebyshevActivation*>(&l)) {
     auto dc = chebyshev_derivative(c->coeffs(), c->a(), c->b());
     for (size_t i = 0; i < z.size(); ++i) d[i] = chebyshev_eval(dc, c->a(), c->b(), z[i]);
+  } else if (auto* r = dynamic_cast<const ExactReLU*>(&l)) {
+    for (size_t i = 0; i < z.size(); ++i) d[i] = z[i] > 0.0 ? r->out_scale() : 0.0;
   } else {
     throw std::logic_error("no derivative for " + l.type());
   }
@@ -171,7 +172,7 @@ size_t first_trainable(const Network& net, const std::vector<size_t>& frozen) {
 // ----------------------------------------------------------------------- Node
 
 struct Trainer::Node {
-  enum Kind { kLinear, kSquare, kPoly, kCheb, kBoot, kResidual, kNorm, kAttn, kMax } kind = kLinear;
+  enum Kind { kLinear, kSquare, kPoly, kCheb, kBoot, kResidual, kNorm, kAttn, kMax, kRelu, kBatchNorm, kDropout } kind = kLinear;
   Layer* layer = nullptr;
   bool trainable = false;
 
@@ -211,6 +212,11 @@ struct Trainer::Node {
   // kAttn: body holds the four projection nodes (q, k, v, o); the rest is
   // the current sample's attention internals (see attention_forward).
   Attention* att = nullptr;
+  // Evaluated token offsets (Attention::offsets(): those pairing some query
+  // with a key it may attend to) and, per offset, the head mask and the
+  // quadratic score coefficients with the masked-out pairs zeroed.
+  std::vector<int> aoffs;
+  std::vector<std::vector<double>> ahead, ac2, ac1, ac0;
   std::vector<Ctxt> kr, vr;  // rotated (cyclic) keys and values per token offset
   std::vector<Ctxt> p, aw, A;  // scores, head-slot weights, weights broadcast over the head
   Ctxt q, o, y;               // queries, sum_s A_s (*) v_s before the softmax division, 1 / row sum
@@ -222,6 +228,37 @@ struct Trainer::Node {
   MaxPool2d* pool = nullptr;
   std::vector<std::vector<double>> round_mask;
   std::vector<Ctxt> pick_b, pick_a;
+
+  // kRelu: the forward's step out_scale [x > 0] (the derivative of
+  // out_scale relu(x)), so the backward pass needs no comparison.
+  ExactReLU* relu = nullptr;
+  Ctxt step;
+
+  // kBatchNorm: gamma in D_0 and beta in B like kNorm. The batch statistics
+  // couple the samples (see forward_batch): per batch size, the linear map
+  // that averages each channel over the batch's summed ciphertext; the
+  // shared 1/sqrt(var + eps) of the batch (r) and the running statistics,
+  // broadcast over each channel's slots and encrypted like weights.
+  BatchNorm* bn = nullptr;
+  std::map<size_t, std::shared_ptr<LinearMap>> channel_mean;
+  std::vector<double> var_pad;  // 1/sqrt's interval midpoint outside the layout
+  std::vector<std::vector<uint32_t>> channel_slots;
+  Ctxt rm, rv;
+
+  // Per-sample state of the forward pass, kept between forward and backward
+  // while a batch is processed layer by layer (forward_batch): the node's
+  // own fields are swapped in and out (attention: with its projections).
+  // kDropout: the layer (its mask generator); the sample's mask in slots.
+  Dropout* drop = nullptr;
+  std::vector<double> dmask;
+
+  struct Sample {
+    std::vector<double> dmask;
+    Ctxt in, centred, r, q, o, y, step;
+    std::vector<Ctxt> kr, vr, p, aw, A, pick_b, pick_a;
+    std::vector<Sample> body;
+  };
+  std::vector<Sample> saved;
 
   std::vector<std::unique_ptr<Node>> body;  // kResidual, kAttn
 };
@@ -346,6 +383,16 @@ std::unique_ptr<Node> build(Layer* l, bool train, uint32_t slots) {
     n->kind = Node::kBoot;
     return n;
   }
+  if (auto* dr = dynamic_cast<Dropout*>(l)) {
+    n->kind = Node::kDropout;
+    n->drop = dr;
+    return n;
+  }
+  if (auto* er = dynamic_cast<ExactReLU*>(l)) {
+    n->kind = Node::kRelu;
+    n->relu = er;
+    return n;
+  }
   if (auto* mp = dynamic_cast<MaxPool2d*>(l)) {
     n->kind = Node::kMax;
     n->pool = mp;
@@ -360,16 +407,24 @@ std::unique_ptr<Node> build(Layer* l, bool train, uint32_t slots) {
     return n;
   }
   if (auto* at = dynamic_cast<Attention*>(l)) {
-    if (!at->mask().empty() || !at->segments().empty())
-      throw std::invalid_argument("trainer: masked or segmented attention (encoder-decoder) is inference only");
     n->kind = Node::kAttn;
     n->att = at;
+    n->aoffs = at->offsets();
+    for (size_t k = 0; k < n->aoffs.size(); ++k) {
+      const int ki = static_cast<int>(k);
+      if (at->softmax()) {
+        n->ahead.push_back(at->head_mask(ki));
+      } else {
+        n->ac2.push_back(at->masked(at->score_mask(2), ki));
+        n->ac1.push_back(at->masked(at->score_mask(1), ki));
+        n->ac0.push_back(at->masked(at->score_mask(0), ki));
+      }
+    }
     n->trainable = train;
     for (int i = 0; i < 4; ++i) n->body.push_back(build(at->projection(i).get(), train, slots));
     return n;
   }
   if (auto* ln = dynamic_cast<LayerNorm*>(l)) {
-    if (!ln->segments().empty()) throw std::invalid_argument("trainer: segmented layer norm is inference only");
     n->kind = Node::kNorm;
     n->norm = ln;
     n->trainable = train;
@@ -378,6 +433,8 @@ std::unique_ptr<Node> build(Layer* l, bool train, uint32_t slots) {
     n->window = 1;
     while (n->window < ol.span(out)) n->window *= 2;
     const int d = ln->dim(), tokens = ln->tokens();
+    // gamma and beta: one [d] set per token segment (one without segments).
+    const size_t na = ln->gamma().size(), nb = na;
     n->offs = {0};
     n->diag.emplace_back(slots, 0.0);
     n->bias.assign(slots, 0.0);
@@ -386,31 +443,86 @@ std::unique_ptr<Node> build(Layer* l, bool train, uint32_t slots) {
       n->owner.emplace_back(slots, -1);
       n->bias_owner.assign(slots, -1);
     }
-    std::vector<std::vector<double>> masks(static_cast<size_t>(d), std::vector<double>(slots, 0.0));
+    std::vector<std::vector<double>> masks(na, std::vector<double>(slots, 0.0));
+    std::vector<int> users(na, 0);  // tokens sharing each gamma/beta element
     for (int t = 0; t < tokens; ++t)
       for (int j = 0; j < d; ++j) {
-        const size_t sl = ol.slot(out, static_cast<size_t>(t) * d + j);
-        n->diag[0][sl] = ln->gamma()[static_cast<size_t>(j)];
-        n->bias[sl] = ln->beta()[static_cast<size_t>(j)];
+        const size_t sl = ol.slot(out, static_cast<size_t>(t) * d + j), a = ln->affine_index(t, j);
+        n->diag[0][sl] = ln->gamma()[a];
+        n->bias[sl] = ln->beta()[a];
         if (n->trainable) {
-          n->owner[0][sl] = j;
-          n->bias_owner[sl] = d + j;
+          n->owner[0][sl] = static_cast<int>(a);
+          n->bias_owner[sl] = static_cast<int>(nb + a);
         }
-        masks[static_cast<size_t>(j)][sl] = 1.0;
+        masks[a][sl] = 1.0;
+        ++users[a];
       }
     if (n->trainable) {
-      if (tokens == 1) {
+      // gamma and beta elements used by one token are updated in place; the
+      // others (shared by the tokens of a segment) through a masked sum.
+      for (size_t a = 0; a < na; ++a) {
+        if (users[a] == 1) {
+          if (n->unshared[0].empty()) {
+            n->unshared[0].assign(slots, 0.0);
+            n->bias_unshared.assign(slots, 0.0);
+          }
+          for (uint32_t sl = 0; sl < slots; ++sl)
+            if (masks[a][sl] != 0.0) n->unshared[0][sl] = n->bias_unshared[sl] = 1.0;
+        } else if (users[a] > 1) {
+          Node::Group gg, gb;
+          gg.masks.emplace_back(0, masks[a]);
+          gb.masks.emplace_back(-1, masks[a]);
+          n->groups.push_back(std::move(gg));
+          n->groups.push_back(std::move(gb));
+        }
+      }
+    }
+    return n;
+  }
+  if (auto* bn = dynamic_cast<BatchNorm*>(l)) {
+    n->kind = Node::kBatchNorm;
+    n->bn = bn;
+    n->trainable = train;
+    const Shape& out = bn->out_shape();
+    const Layout& ol = bn->out_layout();
+    n->window = 1;
+    while (n->window < ol.span(out)) n->window *= 2;
+    const size_t C = bn->channels(), hw = bn->positions();
+    n->offs = {0};
+    n->diag.emplace_back(slots, 0.0);
+    n->bias.assign(slots, 0.0);
+    n->unshared.assign(1, {});
+    n->var_pad.assign(slots, 0.5 * (bn->var_min() + bn->var_max()));
+    n->channel_slots.assign(C, {});
+    if (n->trainable) {
+      n->owner.emplace_back(slots, -1);
+      n->bias_owner.assign(slots, -1);
+    }
+    std::vector<std::vector<double>> masks(C, std::vector<double>(slots, 0.0));
+    for (size_t i = 0; i < out.size(); ++i) {
+      const size_t c = i / hw;
+      const uint32_t sl = static_cast<uint32_t>(ol.slot(out, i));
+      n->diag[0][sl] = bn->gamma()[c];
+      n->bias[sl] = bn->beta()[c];
+      n->var_pad[sl] = 0.0;
+      n->channel_slots[c].push_back(sl);
+      masks[c][sl] = 1.0;
+      if (n->trainable) {
+        n->owner[0][sl] = static_cast<int>(c);
+        n->bias_owner[sl] = static_cast<int>(C + c);
+      }
+    }
+    if (n->trainable) {
+      if (hw == 1) {
         n->unshared[0].assign(slots, 0.0);
         n->bias_unshared.assign(slots, 0.0);
-        for (int j = 0; j < d; ++j)
-          for (uint32_t sl = 0; sl < slots; ++sl)
-            if (masks[static_cast<size_t>(j)][sl] != 0.0) n->unshared[0][sl] = n->bias_unshared[sl] = 1.0;
+        for (const auto& cs : n->channel_slots)
+          for (uint32_t sl : cs) n->unshared[0][sl] = n->bias_unshared[sl] = 1.0;
       } else {
-        // gamma_j and beta_j are shared by every token.
-        for (int j = 0; j < d; ++j) {
+        for (size_t c = 0; c < C; ++c) {  // gamma_c and beta_c are shared by the channel's positions
           Node::Group gg, gb;
-          gg.masks.emplace_back(0, masks[static_cast<size_t>(j)]);
-          gb.masks.emplace_back(-1, masks[static_cast<size_t>(j)]);
+          gg.masks.emplace_back(0, masks[c]);
+          gb.masks.emplace_back(-1, masks[c]);
           n->groups.push_back(std::move(gg));
           n->groups.push_back(std::move(gb));
         }
@@ -519,6 +631,7 @@ struct Sim {
   uint32_t w;
   uint32_t max = 0;
   uint32_t new_w = 0;
+  bool eval = false;  // inference with the trained weights (batch norms use their running statistics)
   uint32_t see(uint32_t l) {
     max = std::max(max, l);
     return l;
@@ -528,6 +641,8 @@ struct Sim {
 struct SimTrace {
   std::vector<uint32_t> in;  // input level of each node
   std::vector<SimTrace> body;
+  // Batch norms: levels of x_hat and r (training) for the backward pass.
+  std::vector<std::pair<uint32_t, uint32_t>> bn;
 };
 
 // Levels of the attention internals of forward (see attention_forward), from
@@ -575,6 +690,13 @@ uint32_t sim_maxpool_forward(Sim& s, const Node& n, uint32_t x) {
   return x;
 }
 
+// Level of the stored step out_scale [x > 0] of an exact ReLU (fresh from
+// the comparison at compare_depth(), one more with an output scale).
+uint32_t relu_step_level(Sim& s, const Node& n) {
+  const uint32_t c = s.see(FHEContext::compare_depth());
+  return n.relu->out_scale() == 1.0 ? c : s.see(c + 1);
+}
+
 uint32_t sim_linear_backward(Sim& s, const Node& n, uint32_t g, uint32_t z) {
   if (n.trainable) {
     uint32_t grad = s.see(std::max(g, z) + 1);
@@ -584,9 +706,29 @@ uint32_t sim_linear_backward(Sim& s, const Node& n, uint32_t g, uint32_t z) {
   return s.see(std::max(g, n.trainable ? s.w : g) + 1);
 }
 
+// Batch norm forward from input level x: the batch statistics in training
+// (s.eval = false; with the running statistics' update), else the running
+// statistics (at the weights' level).
+uint32_t sim_batchnorm_forward(Sim& s, const Node& n, uint32_t x, std::pair<uint32_t, uint32_t>& keep) {
+  const uint32_t aff = n.trainable ? s.w : 0;
+  if (s.eval) {
+    const uint32_t r = s.see(s.w + n.bn->inv_sqrt_depth());
+    const uint32_t h = s.see(std::max({x, s.w, r}) + 1);
+    return s.see(std::max(h, aff) + 1);
+  }
+  const uint32_t mu = s.see(x + 1), d = std::max(x, mu);
+  const uint32_t var = s.see(s.see(d + 1) + 1);
+  const uint32_t r = s.see(var + n.bn->inv_sqrt_depth());
+  const uint32_t xh = s.see(std::max(d, r) + 1);
+  keep = {xh, r};
+  s.new_w = std::max(s.new_w, s.see(std::max({s.w, mu, var}) + 1));  // running statistics
+  return s.see(std::max(xh, aff) + 1);
+}
+
 uint32_t sim_forward(Sim& s, const std::vector<std::unique_ptr<Node>>& nodes, uint32_t x, SimTrace& tr) {
   tr.in.assign(nodes.size(), 0);
   tr.body.assign(nodes.size(), {});
+  tr.bn.assign(nodes.size(), {0, 0});
   for (size_t i = 0; i < nodes.size(); ++i) {
     const Node& n = *nodes[i];
     tr.in[i] = x;
@@ -600,6 +742,12 @@ uint32_t sim_forward(Sim& s, const std::vector<std::unique_ptr<Node>>& nodes, ui
       }
       case Node::kAttn: x = attention_levels(s, n, x).out; break;
       case Node::kMax: x = sim_maxpool_forward(s, n, x); break;
+      case Node::kRelu:
+        s.see(x + 2);  // the comparison needs two levels left
+        x = s.see(std::max(x, relu_step_level(s, n)) + 1);
+        break;
+      case Node::kBatchNorm: x = sim_batchnorm_forward(s, n, x, tr.bn[i]); break;
+      case Node::kDropout: x = s.eval ? x : s.see(x + 1); break;
       case Node::kSquare:
       case Node::kPoly:
       case Node::kCheb: x = s.see(x + n.layer->depth()); break;
@@ -666,6 +814,22 @@ uint32_t sim_backward(Sim& s, const std::vector<std::unique_ptr<Node>>& nodes, c
         else
           g = s.see(g + 1);
         break;
+      case Node::kRelu: g = s.see(std::max(g, relu_step_level(s, n)) + 1); break;
+      case Node::kDropout: g = s.see(g + 1); break;
+      case Node::kBatchNorm: {
+        const auto [xh, r] = tr.bn[k];
+        const uint32_t gg = s.see(std::max(g, n.trainable ? s.w : g) + 1);
+        if (n.trainable) {
+          uint32_t grad = s.see(std::max(g, xh) + 1);
+          uint32_t upd = s.see(grad + (n.groups.empty() ? 1 : 2));
+          s.new_w = std::max(s.new_w, std::max(s.w, upd));
+        }
+        const uint32_t m1 = s.see(gg + 1);
+        const uint32_t m2 = s.see(s.see(std::max(gg, xh) + 1) + 1);
+        const uint32_t inner = s.see(std::max({gg, m1, s.see(std::max(xh, m2) + 1)}));
+        g = s.see(std::max(inner, r) + 1);
+        break;
+      }
       case Node::kMax:
         for (uint32_t r = 0; r < n.pool->rounds(); ++r) g = s.see(std::max(g, FHEContext::compare_depth() + 1) + 1);
         g = s.see(g + 1);  // scatter
@@ -696,6 +860,8 @@ uint32_t sim_loss(Sim& s, const CrossEntropy* ce, uint32_t y) {
   return s.see(std::max(e, r) + 1);
 }
 
+LinearMap& channel_mean(Node& n, size_t count, uint32_t slots);
+
 void collect_rotations(const std::vector<std::unique_ptr<Node>>& nodes, uint32_t slots, std::set<int32_t>& r,
                        bool& allsum) {
   auto add = [&](int64_t k) {
@@ -706,6 +872,8 @@ void collect_rotations(const std::vector<std::unique_ptr<Node>>& nodes, uint32_t
     if (n->kind == Node::kResidual || n->kind == Node::kAttn) collect_rotations(n->body, slots, r, allsum);
     if (n->kind == Node::kNorm)
       for (int32_t k : n->norm->rotation_indices()) add(k);
+    if (n->kind == Node::kBatchNorm)
+      for (int32_t k : channel_mean(const_cast<Node&>(*n), 1, slots).rotation_indices()) add(k);
     if (n->kind == Node::kMax) {
       for (int32_t k : n->pool->gather().rotation_indices()) add(k);
       for (int32_t k : n->pool->scatter().rotation_indices()) add(k);
@@ -749,7 +917,7 @@ template <typename F>
 void for_each_weighted(std::vector<std::unique_ptr<Node>>& nodes, F f) {
   for (auto& n : nodes) {
     if (n->kind == Node::kResidual || n->kind == Node::kAttn) for_each_weighted(n->body, f);
-    if (n->kind == Node::kLinear || n->kind == Node::kNorm) f(*n);
+    if (n->kind == Node::kLinear || n->kind == Node::kNorm || n->kind == Node::kBatchNorm) f(*n);
   }
 }
 
@@ -757,7 +925,7 @@ template <typename F>
 void for_each_weighted(const std::vector<std::unique_ptr<Node>>& nodes, F f) {
   for (const auto& n : nodes) {
     if (n->kind == Node::kResidual || n->kind == Node::kAttn) for_each_weighted(n->body, f);
-    if (n->kind == Node::kLinear || n->kind == Node::kNorm) f(*n);
+    if (n->kind == Node::kLinear || n->kind == Node::kNorm || n->kind == Node::kBatchNorm) f(*n);
   }
 }
 
@@ -849,8 +1017,8 @@ Ctxt window_broadcast(const FHEContext& ctx, const Ctxt& c, int width) {
 Ctxt attention_forward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt x) {
   const CC& cc = ctx.cc();
   const Attention& at = *n.att;
-  const int tokens = at.tokens(), dh = at.head_width(), B = at.stride();
-  const int32_t nd = tokens * B;
+  const int tokens = static_cast<int>(n.aoffs.size()), dh = at.head_width(), B = at.stride();
+  const int32_t nd = at.tokens() * B;
   rf.fit(x, 1);  // once for the three projections
   n.q = linear_forward(ctx, rf, *n.body[0], x);
   Ctxt k = linear_forward(ctx, rf, *n.body[1], x);
@@ -862,7 +1030,7 @@ Ctxt attention_forward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt x) {
   k = cc->EvalAdd(k, ctx.rotate(k, -nd));
   v = cc->EvalAdd(v, ctx.rotate(v, -nd));
   std::vector<int32_t> offs(static_cast<size_t>(tokens));
-  for (int s = 0; s < tokens; ++s) offs[static_cast<size_t>(s)] = s * B;
+  for (int s = 0; s < tokens; ++s) offs[static_cast<size_t>(s)] = n.aoffs[static_cast<size_t>(s)] * B;
   n.kr = ctx.rotate_many(k, offs);
   n.vr = ctx.rotate_many(v, offs);
   // score[i][h] = q_i . k_{i+s} over head h, in slot i*B + h*dh.
@@ -901,14 +1069,15 @@ Ctxt attention_forward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt x) {
     }
     rf.fit_all(e, 1);
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
-    for (int s = 0; s < tokens; ++s) n.aw[static_cast<size_t>(s)] = mul_plain(ctx, e[static_cast<size_t>(s)], at.head_mask());
+    for (int s = 0; s < tokens; ++s)
+      n.aw[static_cast<size_t>(s)] = mul_plain(ctx, e[static_cast<size_t>(s)], n.ahead[static_cast<size_t>(s)]);
   } else {
     rf.fit_all(n.p, 2);
 #pragma omp parallel for schedule(dynamic) if (ctx.parallel())
     for (int s = 0; s < tokens; ++s) {
       const size_t i = static_cast<size_t>(s);
-      Ctxt a = add_plain(ctx, mul_plain(ctx, n.p[i], at.score_mask(2)), at.score_mask(1));
-      n.aw[i] = add_plain(ctx, cc->EvalMult(n.p[i], a), at.score_mask(0));
+      Ctxt a = add_plain(ctx, mul_plain(ctx, n.p[i], n.ac2[i]), n.ac1[i]);
+      n.aw[i] = add_plain(ctx, cc->EvalMult(n.p[i], a), n.ac0[i]);
     }
   }
   rf.fit_all(n.aw, 1);
@@ -949,8 +1118,8 @@ Ctxt attention_forward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt x) {
 Ctxt attention_backward(const FHEContext& ctx, Refresh& rf, Node& n, const Ctxt& g, bool need) {
   const CC& cc = ctx.cc();
   const Attention& at = *n.att;
-  const int tokens = at.tokens(), dh = at.head_width(), B = at.stride();
-  const int32_t nd = tokens * B;
+  const int tokens = static_cast<int>(n.aoffs.size()), dh = at.head_width(), B = at.stride();
+  const int32_t nd = at.tokens() * B;
   const bool softmax = at.softmax();
   Ctxt go = linear_backward(ctx, rf, *n.body[3], g, true);
   Ctxt dO = go, c;
@@ -987,7 +1156,7 @@ Ctxt attention_backward(const FHEContext& ctx, Refresh& rf, Node& n, const Ctxt&
     if (softmax) {
       dp = cc->EvalMult(da[i], n.aw[i]);
     } else {
-      Ctxt slope = add_plain(ctx, mul_plain(ctx, n.p[i], scaled(at.score_mask(2), 2.0)), at.score_mask(1));
+      Ctxt slope = add_plain(ctx, mul_plain(ctx, n.p[i], scaled(n.ac2[i], 2.0)), n.ac1[i]);
       dp = cc->EvalMult(da[i], slope);
     }
     P[i] = window_broadcast(ctx, dp, dh);  // the q.k sums spread over the head
@@ -1000,8 +1169,9 @@ Ctxt attention_backward(const FHEContext& ctx, Refresh& rf, Node& n, const Ctxt&
   for (int s = 0; s < tokens; ++s) {
     const size_t i = static_cast<size_t>(s);
     dqs[i] = cc->EvalMult(P[i], n.kr[i]);
-    dks[i] = ctx.rotate(cc->EvalMult(P[i], n.q), -s * B);
-    dvs[i] = ctx.rotate(cc->EvalMult(dO, n.A[i]), -s * B);
+    const int32_t back = -n.aoffs[i] * B;
+    dks[i] = ctx.rotate(cc->EvalMult(P[i], n.q), back);
+    dvs[i] = ctx.rotate(cc->EvalMult(dO, n.A[i]), back);
   }
   Ctxt dq = sum(ctx, std::move(dqs));
   // Fold the cyclic copies [n*B, 2n*B) back onto the tokens.
@@ -1072,116 +1242,372 @@ Ctxt maxpool_backward(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt g, bool 
   return need ? g : nullptr;
 }
 
-Ctxt forward_nodes(const FHEContext& ctx, Refresh& rf, std::vector<std::unique_ptr<Node>>& nodes, Ctxt x) {
-  for (auto& np : nodes) {
-    Node& n = *np;
-    switch (n.kind) {
-      case Node::kLinear: x = linear_forward(ctx, rf, n, x); break;
-      case Node::kNorm: {
-        rf.fit(x, n.norm->inv_sqrt_depth());
-        n.norm->normalize(ctx, x, n.centred, n.r);
-        rf.fit(n.centred, 1);
-        Ctxt cg = n.trainable ? ctx.cc()->EvalMult(n.centred, n.D[0]) : mul_plain(ctx, n.centred, n.diag[0]);
-        rf.fit(cg, 1);
-        rf.fit(n.r, 1);
-        x = ctx.cc()->EvalMult(cg, n.r);
-        if (n.trainable)
-          ctx.cc()->EvalAddInPlace(x, n.B);
-        else
-          x = add_plain(ctx, x, n.bias);
-        break;
+Ctxt forward_nodes(const FHEContext& ctx, Refresh& rf, std::vector<std::unique_ptr<Node>>& nodes, Ctxt x);
+
+// The channel-mean map of a batch of `count` samples: averages each channel
+// over its positions, applied to the sum of the batch's ciphertexts (one
+// level, zero outside the layout).
+LinearMap& channel_mean(Node& n, size_t count, uint32_t slots) {
+  auto& m = n.channel_mean[count];
+  if (m) return *m;
+  const BatchNorm& bn = *n.bn;
+  const Shape& s = bn.in_shape();
+  const size_t hw = bn.positions();
+  const double w = 1.0 / static_cast<double>(hw * count);
+  std::vector<size_t> rows, cols;
+  std::vector<double> vals;
+  for (size_t c = 0; c < bn.channels(); ++c)
+    for (size_t i = 0; i < hw; ++i)
+      for (size_t j = 0; j < hw; ++j) {
+        rows.push_back(c * hw + i);
+        cols.push_back(c * hw + j);
+        vals.push_back(w);
       }
-      case Node::kAttn: x = attention_forward(ctx, rf, n, x); break;
-      case Node::kMax: x = maxpool_forward(ctx, rf, n, x); break;
-      case Node::kResidual: {
-        n.in = x;
-        Ctxt y = forward_nodes(ctx, rf, n.body, x);
-        x = ctx.cc()->EvalAdd(y, x);
-        break;
-      }
-      default:
-        rf.fit(x, n.layer->depth());
-        n.in = x;
-        x = n.layer->forward(ctx, x);
-        break;
+  m = std::make_shared<LinearMap>(s, s, rows, cols, vals, std::vector<double>{}, "channelmean");
+  m->configure(s);
+  m->configure_layout(bn.in_layout(), Packing::kCompact);
+  m->set_out_layout(bn.in_layout());
+  m->set_allow_fold(false);
+  m->compile(slots);
+  return *m;
+}
+
+// 1 / sqrt(v + eps) as BatchNorm::inv_sqrt computes it (series scaled so the
+// Newton steps need no scalar product on r, as in LayerNorm::normalize).
+Ctxt bn_inv_sqrt(const FHEContext& ctx, Refresh& rf, const Node& n, Ctxt v) {
+  const CC& cc = ctx.cc();
+  const BatchNorm& bn = *n.bn;
+  v = add_plain(ctx, v, n.var_pad);
+  rf.fit(v, bn.inv_sqrt_depth());
+  double k = std::pow(1.5, static_cast<double>(bn.newton()));
+  std::vector<double> c = bn.inv_sqrt_coeffs();
+  for (double& ci : c) ci *= k;
+  Ctxt r = cc->EvalChebyshevSeries(v, c, bn.var_min(), bn.var_max());
+  if (bn.newton()) {
+    Ctxt ve = cc->EvalAdd(v, bn.eps());
+    for (uint32_t i = 0; i < bn.newton(); ++i) {
+      Ctxt vc = cc->EvalMult(ve, 0.5 / (1.5 * k * k));
+      Ctxt p = cc->EvalMult(cc->EvalMult(vc, r), cc->EvalMult(r, r));
+      r = cc->EvalSub(r, p);
+      k /= 1.5;
     }
   }
+  return r;
+}
+
+// y = gamma (*) h + beta.
+Ctxt bn_affine(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt h) {
+  rf.fit(h, 1);
+  Ctxt y = n.trainable ? ctx.cc()->EvalMult(h, n.D[0]) : mul_plain(ctx, h, n.diag[0]);
+  if (n.trainable)
+    ctx.cc()->EvalAddInPlace(y, n.B);
+  else
+    y = add_plain(ctx, y, n.bias);
+  return y;
+}
+
+// One sample through one node (not a residual block's body; attention with
+// its projections). A batch norm uses its running statistics here
+// (inference); forward_batch normalises with the batch's.
+Ctxt forward_node(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt x) {
+  switch (n.kind) {
+    case Node::kLinear: return linear_forward(ctx, rf, n, x);
+    case Node::kNorm: {
+      rf.fit(x, n.norm->inv_sqrt_depth());
+      n.norm->normalize(ctx, x, n.centred, n.r);
+      rf.fit(n.centred, 1);
+      Ctxt cg = n.trainable ? ctx.cc()->EvalMult(n.centred, n.D[0]) : mul_plain(ctx, n.centred, n.diag[0]);
+      rf.fit(cg, 1);
+      rf.fit(n.r, 1);
+      x = ctx.cc()->EvalMult(cg, n.r);
+      if (n.trainable)
+        ctx.cc()->EvalAddInPlace(x, n.B);
+      else
+        x = add_plain(ctx, x, n.bias);
+      return x;
+    }
+    case Node::kAttn: return attention_forward(ctx, rf, n, x);
+    case Node::kMax: return maxpool_forward(ctx, rf, n, x);
+    case Node::kRelu: {
+      if (!ctx.scheme_switching())
+        throw std::logic_error("exactrelu needs a context with ContextOptions::scheme_switching");
+      rf.fit(x, 1);  // compare() needs two levels left, the product one
+      const double sc = n.relu->out_scale();
+      Ctxt sel = ctx.positive(x, n.relu->range());
+      n.step = sc == 1.0 ? sel : ctx.cc()->EvalMult(sel, sc);
+      return ctx.cc()->EvalMult(x, n.step);
+    }
+    case Node::kBatchNorm: {
+      Ctxt r = bn_inv_sqrt(ctx, rf, n, n.rv);
+      Ctxt c = ctx.cc()->EvalSub(x, n.rm);
+      rf.fit(c, 1);
+      rf.fit(r, 1);
+      return bn_affine(ctx, rf, n, ctx.cc()->EvalMult(c, r));
+    }
+    case Node::kResidual: {
+      n.in = x;
+      Ctxt y = forward_nodes(ctx, rf, n.body, x);
+      return ctx.cc()->EvalAdd(y, x);
+    }
+    default:
+      rf.fit(x, n.layer->depth());
+      n.in = x;
+      return n.layer->forward(ctx, x);
+  }
+}
+
+Ctxt forward_nodes(const FHEContext& ctx, Refresh& rf, std::vector<std::unique_ptr<Node>>& nodes, Ctxt x) {
+  for (auto& np : nodes) x = forward_node(ctx, rf, *np, x);
   return x;
 }
 
-// Returns dL/dx (null when need_input_grad is false).
-Ctxt backward_nodes(const FHEContext& ctx, Refresh& rf, std::vector<std::unique_ptr<Node>>& nodes, Ctxt g,
-                    bool need_input_grad) {
+// dL/dx of one sample through one node (not a residual block or a batch
+// norm, see backward_batch); null when need is false.
+Ctxt backward_node(const FHEContext& ctx, Refresh& rf, Node& n, Ctxt g, bool need) {
   const CC& cc = ctx.cc();
+  switch (n.kind) {
+    case Node::kLinear: return linear_backward(ctx, rf, n, g, need);
+    case Node::kNorm: {
+      // y = gamma (*) x_hat + beta, x_hat = centred (*) r:
+      // dgamma = g (*) x_hat, dbeta = g (summed over the tokens at update),
+      // dx = r (*) (gg - mean(gg) - x_hat (*) mean(gg (*) x_hat)), gg = g (*) gamma.
+      rf.fit(n.centred, 1);
+      rf.fit(n.r, 1);
+      Ctxt xhat = cc->EvalMult(n.centred, n.r);
+      rf.fit(g, 1);
+      rf.fit(xhat, 1);
+      if (n.trainable) {
+        add_to(ctx, n.gD[0], cc->EvalMult(g, xhat));
+        add_to(ctx, n.gB, g);
+      }
+      if (need) {
+        Ctxt gg = n.trainable ? cc->EvalMult(g, n.D[0]) : mul_plain(ctx, g, n.diag[0]);
+        rf.fit(gg, 1);
+        Ctxt m1 = n.norm->block_mean(ctx, gg);
+        Ctxt t = cc->EvalMult(gg, xhat);
+        rf.fit(t, 1);
+        Ctxt m2 = n.norm->block_mean(ctx, t);
+        rf.fit(m2, 1);
+        Ctxt inner = cc->EvalSub(cc->EvalSub(gg, m1), cc->EvalMult(xhat, m2));
+        rf.fit(inner, 1);
+        rf.fit(n.r, 1);
+        g = cc->EvalMult(inner, n.r);
+      }
+      n.centred = n.r = nullptr;
+      return need ? g : nullptr;
+    }
+    case Node::kAttn: return attention_backward(ctx, rf, n, g, need);
+    case Node::kMax: return maxpool_backward(ctx, rf, n, g, need);
+    case Node::kRelu:
+      if (need) {
+        rf.fit(g, 1);
+        rf.fit(n.step, 1);
+        g = cc->EvalMult(g, n.step);
+      }
+      n.step = nullptr;
+      return need ? g : nullptr;
+    case Node::kSquare:
+    case Node::kPoly:
+    case Node::kCheb:
+      if (need) {
+        rf.fit(g, 1);
+        if (n.kind == Node::kSquare) {
+          rf.fit(n.in, 1);
+          g = cc->EvalMult(g, cc->EvalAdd(n.in, n.in));
+        } else if (n.dcoef.size() == 1) {
+          g = cc->EvalMult(g, n.kind == Node::kCheb ? n.dcoef[0] / 2.0 : n.dcoef[0]);
+        } else {
+          rf.fit(n.in, derivative_depth(n));
+          Ctxt f = n.kind == Node::kPoly ? PolyActivation(n.dcoef).forward(ctx, n.in)
+                                         : cc->EvalChebyshevSeries(n.in, n.dcoef, n.a, n.b);
+          rf.fit(f, 1);
+          g = cc->EvalMult(g, f);
+        }
+      }
+      n.in = nullptr;
+      return need ? g : nullptr;
+    case Node::kBoot:
+      return need ? ctx.bootstrap(g) : nullptr;
+    default:
+      throw std::logic_error("backward_node: " + n.layer->type() + " goes through backward_batch");
+  }
+}
+
+// Swaps the node's per-sample forward state with s (attention: and its
+// projections'). Residual bodies are walked by forward_batch itself.
+void swap_state(Node& n, Node::Sample& s) {
+  std::swap(n.in, s.in);
+  std::swap(n.centred, s.centred);
+  std::swap(n.r, s.r);
+  std::swap(n.q, s.q);
+  std::swap(n.o, s.o);
+  std::swap(n.y, s.y);
+  std::swap(n.step, s.step);
+  n.dmask.swap(s.dmask);
+  n.kr.swap(s.kr);
+  n.vr.swap(s.vr);
+  n.p.swap(s.p);
+  n.aw.swap(s.aw);
+  n.A.swap(s.A);
+  n.pick_b.swap(s.pick_b);
+  n.pick_a.swap(s.pick_a);
+  if (n.kind == Node::kAttn) {
+    s.body.resize(n.body.size());
+    for (size_t i = 0; i < n.body.size(); ++i) swap_state(*n.body[i], s.body[i]);
+  }
+}
+
+Ctxt sum_of(const FHEContext& ctx, const std::vector<Ctxt>& v) {
+  Ctxt t = v[0];
+  for (size_t i = 1; i < v.size(); ++i) t = ctx.cc()->EvalAdd(t, v[i]);
+  return t;
+}
+
+// Batch norm in training mode: the batch's mean and biased variance per
+// channel, x_hat = (x - mean) / sqrt(var + eps) kept per sample, and the
+// running statistics moved toward the batch's (unbiased variance, as torch).
+void batchnorm_forward(const FHEContext& ctx, Refresh& rf, Node& n, std::vector<Ctxt>& xs) {
+  const CC& cc = ctx.cc();
+  const BatchNorm& bn = *n.bn;
+  const size_t B = xs.size();
+  LinearMap& mean_map = channel_mean(n, B, ctx.slots());
+  Ctxt S = sum_of(ctx, xs);
+  rf.fit(S, 1);
+  Ctxt mu = mean_map.forward(ctx, S);
+  std::vector<Ctxt> d(B), sq(B);
+  for (size_t b = 0; b < B; ++b) {
+    d[b] = cc->EvalSub(xs[b], mu);
+    rf.fit(d[b], 1);
+    sq[b] = cc->EvalMult(d[b], d[b]);
+  }
+  Ctxt Q = sum_of(ctx, sq);
+  rf.fit(Q, 1);
+  Ctxt var = mean_map.forward(ctx, Q);
+  n.r = bn_inv_sqrt(ctx, rf, n, var);
+  n.saved.assign(B, {});
+  for (size_t b = 0; b < B; ++b) {
+    rf.fit(d[b], 1);
+    rf.fit(n.r, 1);
+    n.saved[b].centred = cc->EvalMult(d[b], n.r);  // x_hat
+    xs[b] = bn_affine(ctx, rf, n, n.saved[b].centred);
+  }
+  const double m = bn.momentum(), count = static_cast<double>(B * bn.positions());
+  const double unbias = count > 1.0 ? count / (count - 1.0) : 1.0;
+  rf.fit(n.rm, 1);
+  rf.fit(n.rv, 1);
+  rf.fit(mu, 1);
+  rf.fit(var, 1);
+  n.rm = cc->EvalAdd(cc->EvalMult(n.rm, 1.0 - m), cc->EvalMult(mu, m));
+  n.rv = cc->EvalAdd(cc->EvalMult(n.rv, 1.0 - m), cc->EvalMult(var, m * unbias));
+}
+
+// dgamma = sum g (*) x_hat, dbeta = sum g (over the batch; over the channel
+// at update); dx = r (*) (gg - mean(gg) - x_hat (*) mean(gg (*) x_hat)),
+// gg = g (*) gamma, the means over the batch and the channel's positions.
+void batchnorm_backward(const FHEContext& ctx, Refresh& rf, Node& n, std::vector<Ctxt>& gs, bool need) {
+  const CC& cc = ctx.cc();
+  const size_t B = gs.size();
+  for (size_t b = 0; b < B; ++b) {
+    rf.fit(gs[b], 1);
+    rf.fit(n.saved[b].centred, 1);
+    if (n.trainable) {
+      add_to(ctx, n.gD[0], cc->EvalMult(gs[b], n.saved[b].centred));
+      add_to(ctx, n.gB, gs[b]);
+    }
+  }
+  if (need) {
+    LinearMap& mean_map = channel_mean(n, B, ctx.slots());
+    std::vector<Ctxt> gg(B), t(B);
+    for (size_t b = 0; b < B; ++b) {
+      gg[b] = n.trainable ? cc->EvalMult(gs[b], n.D[0]) : mul_plain(ctx, gs[b], n.diag[0]);
+      rf.fit(gg[b], 1);
+      t[b] = cc->EvalMult(gg[b], n.saved[b].centred);
+    }
+    Ctxt G = sum_of(ctx, gg), T = sum_of(ctx, t);
+    rf.fit(G, 1);
+    rf.fit(T, 1);
+    Ctxt m1 = mean_map.forward(ctx, G), m2 = mean_map.forward(ctx, T);
+    rf.fit(m2, 1);
+    for (size_t b = 0; b < B; ++b) {
+      rf.fit(n.saved[b].centred, 1);
+      Ctxt inner = cc->EvalSub(cc->EvalSub(gg[b], m1), cc->EvalMult(n.saved[b].centred, m2));
+      rf.fit(inner, 1);
+      rf.fit(n.r, 1);
+      gs[b] = cc->EvalMult(inner, n.r);
+    }
+  }
+  n.saved.clear();
+  n.r = nullptr;
+}
+
+// A batch through the nodes, layer by layer: every node runs all samples
+// before the next one (so a batch norm sees the whole batch), keeping each
+// sample's state for the backward pass.
+void forward_batch(const FHEContext& ctx, Refresh& rf, std::vector<std::unique_ptr<Node>>& nodes,
+                   std::vector<Ctxt>& xs) {
+  for (auto& np : nodes) {
+    Node& n = *np;
+    if (n.kind == Node::kResidual) {
+      std::vector<Ctxt> skip = xs;
+      forward_batch(ctx, rf, n.body, xs);
+      for (size_t b = 0; b < xs.size(); ++b) xs[b] = ctx.cc()->EvalAdd(xs[b], skip[b]);
+    } else if (n.kind == Node::kBatchNorm) {
+      batchnorm_forward(ctx, rf, n, xs);
+    } else if (n.kind == Node::kDropout) {
+      // A fresh mask per sample, scaled by 1 / (1 - p), placed in the slots.
+      const Shape& sh = n.drop->in_shape();
+      const Layout& lay = n.drop->in_layout();
+      n.saved.assign(xs.size(), {});
+      for (size_t b = 0; b < xs.size(); ++b) {
+        const std::vector<double> m = n.drop->draw();
+        std::vector<double>& slots = n.saved[b].dmask;
+        slots.assign(ctx.slots(), 0.0);
+        for (size_t i = 0; i < m.size(); ++i) slots[lay.slot(sh, i)] = m[i];
+        rf.fit(xs[b], 1);
+        xs[b] = mul_plain(ctx, xs[b], slots);
+      }
+    } else {
+      n.saved.assign(xs.size(), {});
+      for (size_t b = 0; b < xs.size(); ++b) {
+        swap_state(n, n.saved[b]);
+        xs[b] = forward_node(ctx, rf, n, xs[b]);
+        swap_state(n, n.saved[b]);
+      }
+    }
+  }
+}
+
+// The batch's gradients back through the nodes (dL/dx of every sample when
+// need_input_grad).
+void backward_batch(const FHEContext& ctx, Refresh& rf, std::vector<std::unique_ptr<Node>>& nodes,
+                    std::vector<Ctxt>& gs, bool need_input_grad) {
   for (size_t k = nodes.size(); k-- > 0;) {
     Node& n = *nodes[k];
     const bool need = k > 0 || need_input_grad;
-    switch (n.kind) {
-      case Node::kLinear: g = linear_backward(ctx, rf, n, g, need); break;
-      case Node::kNorm: {
-        // y = gamma (*) x_hat + beta, x_hat = centred (*) r:
-        // dgamma = g (*) x_hat, dbeta = g (summed over the tokens at update),
-        // dx = r (*) (gg - mean(gg) - x_hat (*) mean(gg (*) x_hat)), gg = g (*) gamma.
-        rf.fit(n.centred, 1);
-        rf.fit(n.r, 1);
-        Ctxt xhat = cc->EvalMult(n.centred, n.r);
-        rf.fit(g, 1);
-        rf.fit(xhat, 1);
-        if (n.trainable) {
-          add_to(ctx, n.gD[0], cc->EvalMult(g, xhat));
-          add_to(ctx, n.gB, g);
+    if (n.kind == Node::kResidual) {
+      std::vector<Ctxt> gb = gs;
+      backward_batch(ctx, rf, n.body, gb, need);
+      if (need)
+        for (size_t b = 0; b < gs.size(); ++b) gs[b] = ctx.cc()->EvalAdd(gb[b], gs[b]);
+    } else if (n.kind == Node::kBatchNorm) {
+      batchnorm_backward(ctx, rf, n, gs, need);
+    } else if (n.kind == Node::kDropout) {
+      if (need)
+        for (size_t b = 0; b < gs.size(); ++b) {
+          rf.fit(gs[b], 1);
+          gs[b] = mul_plain(ctx, gs[b], n.saved[b].dmask);
         }
-        if (need) {
-          Ctxt gg = n.trainable ? cc->EvalMult(g, n.D[0]) : mul_plain(ctx, g, n.diag[0]);
-          rf.fit(gg, 1);
-          Ctxt m1 = n.norm->block_mean(ctx, gg);
-          Ctxt t = cc->EvalMult(gg, xhat);
-          rf.fit(t, 1);
-          Ctxt m2 = n.norm->block_mean(ctx, t);
-          rf.fit(m2, 1);
-          Ctxt inner = cc->EvalSub(cc->EvalSub(gg, m1), cc->EvalMult(xhat, m2));
-          rf.fit(inner, 1);
-          rf.fit(n.r, 1);
-          g = cc->EvalMult(inner, n.r);
-        }
-        n.centred = n.r = nullptr;
-        break;
+      n.saved.clear();
+    } else {
+      for (size_t b = 0; b < gs.size(); ++b) {
+        swap_state(n, n.saved[b]);
+        gs[b] = backward_node(ctx, rf, n, gs[b], need);
+        swap_state(n, n.saved[b]);
       }
-      case Node::kAttn: g = attention_backward(ctx, rf, n, g, need); break;
-      case Node::kMax: g = maxpool_backward(ctx, rf, n, g, need); break;
-      case Node::kSquare:
-      case Node::kPoly:
-      case Node::kCheb:
-        if (need) {
-          rf.fit(g, 1);
-          if (n.kind == Node::kSquare) {
-            rf.fit(n.in, 1);
-            g = cc->EvalMult(g, cc->EvalAdd(n.in, n.in));
-          } else if (n.dcoef.size() == 1) {
-            g = cc->EvalMult(g, n.kind == Node::kCheb ? n.dcoef[0] / 2.0 : n.dcoef[0]);
-          } else {
-            rf.fit(n.in, derivative_depth(n));
-            Ctxt f = n.kind == Node::kPoly ? PolyActivation(n.dcoef).forward(ctx, n.in)
-                                           : cc->EvalChebyshevSeries(n.in, n.dcoef, n.a, n.b);
-            rf.fit(f, 1);
-            g = cc->EvalMult(g, f);
-          }
-        }
-        n.in = nullptr;
-        break;
-      case Node::kBoot:
-        if (need) g = ctx.bootstrap(g);
-        break;
-      case Node::kResidual: {
-        Ctxt gb = backward_nodes(ctx, rf, n.body, g, need);
-        if (need) g = cc->EvalAdd(gb, g);
-        n.in = nullptr;
-        break;
-      }
+      n.saved.clear();
     }
-    if (!need) return nullptr;
+    if (!need) return;
   }
-  return g;
 }
 
 // Sum of all slots, in every slot.
@@ -1261,8 +1687,10 @@ void bootstrap_packed(const FHEContext& ctx, std::vector<Ctxt*> cts, uint32_t wi
 // --------------------------------------------------------- plaintext reference
 
 struct PlainTrace {
-  std::vector<std::vector<double>> in;
-  std::vector<PlainTrace> body;
+  std::vector<std::vector<std::vector<double>>> in;  // [layer][sample]
+  std::vector<PlainTrace> body;                      // residual bodies; batch norms keep x_hat and r here
+  std::vector<std::vector<double>> xhat;
+  std::vector<double> r;
 };
 
 using Grads = std::map<Layer*, std::vector<double>>;
@@ -1296,9 +1724,10 @@ std::vector<double> plain_layernorm_backward(LayerNorm* ln, bool train, const st
   const int d = ln->dim();
   const std::vector<double>& gamma = ln->gamma();
   std::vector<double>* gr = nullptr;
+  const size_t na = gamma.size();  // [G][d]: one set per token segment
   if (train) {
     gr = &grads[ln];
-    if (gr->empty()) gr->assign(2u * d, 0.0);
+    if (gr->empty()) gr->assign(2 * na, 0.0);
   }
   std::vector<double> gx(x.size(), 0.0), xh(static_cast<size_t>(d)), gg(static_cast<size_t>(d));
   for (int t = 0; t < ln->tokens(); ++t) {
@@ -1306,12 +1735,13 @@ std::vector<double> plain_layernorm_backward(LayerNorm* ln, bool train, const st
     double m1 = 0.0, m2 = 0.0;
     for (int j = 0; j < d; ++j) {
       xh[j] = centred[base + j] * r[static_cast<size_t>(t)];
-      gg[j] = g[base + j] * gamma[static_cast<size_t>(j)];
+      const size_t a = ln->affine_index(t, j);
+      gg[j] = g[base + j] * gamma[a];
       m1 += gg[j];
       m2 += gg[j] * xh[j];
       if (gr) {
-        (*gr)[static_cast<size_t>(j)] += g[base + j] * xh[j];
-        (*gr)[static_cast<size_t>(d + j)] += g[base + j];
+        (*gr)[a] += g[base + j] * xh[j];
+        (*gr)[na + a] += g[base + j];
       }
     }
     m1 /= d;
@@ -1352,12 +1782,12 @@ std::vector<double> plain_attention_backward(Attention* at, bool train, const st
         std::vector<double> ev = lbcrypto::EvalChebyshevFunctionPtxt([](double z) { return std::exp(z); }, sv,
                                                                      at->exp_lo(), at->exp_hi(), sm.exp_degree);
         double S = 0.0;
-        for (int j = 0; j < n; ++j) S += (es[j] = ev[static_cast<size_t>(j)]);
-        y[static_cast<size_t>(h) * n + i] = at->inv_plain(S);
+        for (int j = 0; j < n; ++j) S += (es[j] = ev[static_cast<size_t>(j)] * at->allowed(i, j));
+        y[static_cast<size_t>(h) * n + i] = S == 0.0 && at->empty_row(i) ? 0.0 : at->inv_plain(S);
         for (int j = 0; j < n; ++j) as[j] = es[j] * y[static_cast<size_t>(h) * n + i];
       } else {
         const double c0 = at->score_coeff(h, 0), c1 = at->score_coeff(h, 1), c2 = at->score_coeff(h, 2);
-        for (int j = 0; j < n; ++j) as[j] = c0 + c1 * s[j] + c2 * s[j] * s[j];
+        for (int j = 0; j < n; ++j) as[j] = at->allowed(i, j) * (c0 + c1 * s[j] + c2 * s[j] * s[j]);
       }
       for (int j = 0; j < n; ++j)
         for (int c = h * dh; c < (h + 1) * dh; ++c) o[static_cast<size_t>(i) * d + c] += as[j] * v[static_cast<size_t>(j) * d + c];
@@ -1384,7 +1814,7 @@ std::vector<double> plain_attention_backward(Attention* at, bool train, const st
         for (int j = 0; j < n; ++j) ds[j] = (da[j] * yi + dS) * es[j];
       } else {
         const double c1 = at->score_coeff(h, 1), c2 = at->score_coeff(h, 2);
-        for (int j = 0; j < n; ++j) ds[j] = da[j] * (c1 + 2.0 * c2 * s[j]);
+        for (int j = 0; j < n; ++j) ds[j] = at->allowed(i, j) * da[j] * (c1 + 2.0 * c2 * s[j]);
       }
       for (int j = 0; j < n; ++j)
         for (int c = h * dh; c < (h + 1) * dh; ++c) {
@@ -1433,52 +1863,138 @@ void sync_attention(const std::vector<std::shared_ptr<Layer>>& layers) {
   }
 }
 
-std::vector<double> plain_forward(const std::vector<std::shared_ptr<Layer>>& layers, size_t from, std::vector<double> x,
-                                  PlainTrace& tr) {
+// Batch norm in training mode on a batch, as the trainer computes it: batch
+// mean and biased variance per channel, the layer's 1/sqrt approximation;
+// keeps x_hat and r for the backward pass and moves the running statistics.
+std::vector<std::vector<double>> plain_batchnorm_forward(BatchNorm* bn, const std::vector<std::vector<double>>& xs,
+                                                         PlainTrace& tr, bool update_running) {
+  const size_t C = bn->channels(), hw = bn->positions(), B = xs.size();
+  const double count = static_cast<double>(B * hw);
+  std::vector<double> mean(C, 0.0), var(C, 0.0);
+  for (const auto& x : xs)
+    for (size_t i = 0; i < x.size(); ++i) mean[i / hw] += x[i] / count;
+  for (const auto& x : xs)
+    for (size_t i = 0; i < x.size(); ++i) var[i / hw] += (x[i] - mean[i / hw]) * (x[i] - mean[i / hw]) / count;
+  tr.r.assign(C, 0.0);
+  for (size_t c = 0; c < C; ++c) tr.r[c] = bn->inv_sqrt(var[c]);
+  tr.xhat.assign(B, {});
+  std::vector<std::vector<double>> ys(B);
+  for (size_t b = 0; b < B; ++b) {
+    tr.xhat[b].resize(xs[b].size());
+    ys[b].resize(xs[b].size());
+    for (size_t i = 0; i < xs[b].size(); ++i) {
+      const size_t c = i / hw;
+      tr.xhat[b][i] = (xs[b][i] - mean[c]) * tr.r[c];
+      ys[b][i] = bn->gamma()[c] * tr.xhat[b][i] + bn->beta()[c];
+    }
+  }
+  if (update_running) {
+    const double m = bn->momentum(), unbias = count > 1.0 ? count / (count - 1.0) : 1.0;
+    std::vector<double> rm = bn->running_mean(), rv = bn->running_var();
+    for (size_t c = 0; c < C; ++c) {
+      rm[c] = (1.0 - m) * rm[c] + m * mean[c];
+      rv[c] = (1.0 - m) * rv[c] + m * unbias * var[c];
+    }
+    bn->set_running(rm, rv);
+  }
+  return ys;
+}
+
+void plain_batchnorm_backward(BatchNorm* bn, bool train, const PlainTrace& tr, std::vector<std::vector<double>>& gs,
+                              Grads& grads) {
+  const size_t C = bn->channels(), hw = bn->positions(), B = gs.size();
+  const double count = static_cast<double>(B * hw);
+  if (train) {
+    auto& gr = grads[bn];
+    if (gr.empty()) gr.assign(2 * C, 0.0);
+    for (size_t b = 0; b < B; ++b)
+      for (size_t i = 0; i < gs[b].size(); ++i) {
+        gr[i / hw] += gs[b][i] * tr.xhat[b][i];
+        gr[C + i / hw] += gs[b][i];
+      }
+  }
+  std::vector<double> m1(C, 0.0), m2(C, 0.0);
+  for (size_t b = 0; b < B; ++b)
+    for (size_t i = 0; i < gs[b].size(); ++i) {
+      const double gg = gs[b][i] * bn->gamma()[i / hw];
+      m1[i / hw] += gg / count;
+      m2[i / hw] += gg * tr.xhat[b][i] / count;
+    }
+  for (size_t b = 0; b < B; ++b)
+    for (size_t i = 0; i < gs[b].size(); ++i) {
+      const size_t c = i / hw;
+      gs[b][i] = tr.r[c] * (gs[b][i] * bn->gamma()[c] - m1[c] - tr.xhat[b][i] * m2[c]);
+    }
+}
+
+// A batch layer by layer (batch norms see the whole batch); tr.in[i][b] is
+// sample b's input of layer i.
+std::vector<std::vector<double>> plain_forward(const std::vector<std::shared_ptr<Layer>>& layers, size_t from,
+                                               std::vector<std::vector<double>> xs, PlainTrace& tr,
+                                               bool update_running) {
   tr.in.assign(layers.size(), {});
   tr.body.assign(layers.size(), {});
   for (size_t i = from; i < layers.size(); ++i) {
-    tr.in[i] = x;
+    tr.in[i] = xs;
     if (auto* r = dynamic_cast<Residual*>(layers[i].get())) {
-      std::vector<double> y = plain_forward(r->body(), 0, x, tr.body[i]);
-      for (size_t k = 0; k < y.size(); ++k) y[k] += x[k];
-      x = std::move(y);
+      std::vector<std::vector<double>> ys = plain_forward(r->body(), 0, xs, tr.body[i], update_running);
+      for (size_t b = 0; b < xs.size(); ++b)
+        for (size_t k = 0; k < xs[b].size(); ++k) xs[b][k] += ys[b][k];
+    } else if (auto* bn = dynamic_cast<BatchNorm*>(layers[i].get())) {
+      xs = plain_batchnorm_forward(bn, xs, tr.body[i], update_running);
+    } else if (auto* dr = dynamic_cast<Dropout*>(layers[i].get())) {
+      tr.body[i].xhat.assign(xs.size(), {});  // the masks
+      for (size_t b = 0; b < xs.size(); ++b) {
+        tr.body[i].xhat[b] = dr->draw();
+        for (size_t k = 0; k < xs[b].size(); ++k) xs[b][k] *= tr.body[i].xhat[b][k];
+      }
     } else {
-      x = layers[i]->forward_plain(x);
+      for (auto& x : xs) x = layers[i]->forward_plain(x);
     }
   }
-  return x;
+  return xs;
 }
 
-std::vector<double> plain_backward(const std::vector<std::shared_ptr<Layer>>& layers, size_t from,
-                                   const std::vector<char>& train, const PlainTrace& tr, std::vector<double> g,
-                                   Grads& grads) {
+void plain_backward(const std::vector<std::shared_ptr<Layer>>& layers, size_t from, const std::vector<char>& train,
+                    const PlainTrace& tr, std::vector<std::vector<double>>& gs, Grads& grads) {
   for (size_t k = layers.size(); k-- > from;) {
     Layer* l = layers[k].get();
-    const std::vector<double>& x = tr.in[k];
     if (auto* r = dynamic_cast<Residual*>(l)) {
       std::vector<char> t(r->body().size(), train[k]);
-      std::vector<double> gb = plain_backward(r->body(), 0, t, tr.body[k], g, grads);
-      for (size_t i = 0; i < g.size(); ++i) g[i] += gb[i];
-    } else if (auto* lin = dynamic_cast<LinearLayer*>(l)) {
-      g = plain_linear_backward(lin, train[k], x, g, grads);
-    } else if (auto* ln = dynamic_cast<LayerNorm*>(l)) {
-      if (!ln->segments().empty()) throw std::invalid_argument("train_plain: segmented layer norm is inference only");
-      g = plain_layernorm_backward(ln, train[k], x, g, grads);
-    } else if (auto* at = dynamic_cast<Attention*>(l)) {
-      if (!at->mask().empty() || !at->segments().empty())
-        throw std::invalid_argument("train_plain: masked or segmented attention is inference only");
-      g = plain_attention_backward(at, train[k], x, g, grads);
-    } else if (auto* mp = dynamic_cast<MaxPool2d*>(l)) {
-      g = plain_maxpool_backward(mp, x, g);
-    } else if (dynamic_cast<Bootstrap*>(l)) {
-      // identity
-    } else {
-      std::vector<double> d = activation_derivative_plain(*l, x);
-      for (size_t i = 0; i < g.size(); ++i) g[i] *= d[i];
+      std::vector<std::vector<double>> gb = gs;
+      plain_backward(r->body(), 0, t, tr.body[k], gb, grads);
+      for (size_t b = 0; b < gs.size(); ++b)
+        for (size_t i = 0; i < gs[b].size(); ++i) gs[b][i] += gb[b][i];
+      continue;
+    }
+    if (auto* bn = dynamic_cast<BatchNorm*>(l)) {
+      plain_batchnorm_backward(bn, train[k], tr.body[k], gs, grads);
+      continue;
+    }
+    if (dynamic_cast<Dropout*>(l)) {
+      for (size_t b = 0; b < gs.size(); ++b)
+        for (size_t i = 0; i < gs[b].size(); ++i) gs[b][i] *= tr.body[k].xhat[b][i];
+      continue;
+    }
+    for (size_t b = 0; b < gs.size(); ++b) {
+      const std::vector<double>& x = tr.in[k][b];
+      std::vector<double>& g = gs[b];
+      if (auto* lin = dynamic_cast<LinearLayer*>(l)) {
+        g = plain_linear_backward(lin, train[k], x, g, grads);
+      } else if (auto* ln = dynamic_cast<LayerNorm*>(l)) {
+        g = plain_layernorm_backward(ln, train[k], x, g, grads);
+      } else if (auto* at = dynamic_cast<Attention*>(l)) {
+        g = plain_attention_backward(at, train[k], x, g, grads);
+      } else if (auto* mp = dynamic_cast<MaxPool2d*>(l)) {
+        g = plain_maxpool_backward(mp, x, g);
+      } else if (dynamic_cast<Bootstrap*>(l)) {
+        // identity
+      } else {
+        std::vector<double> d = activation_derivative_plain(*l, x);
+        for (size_t i = 0; i < g.size(); ++i) g[i] *= d[i];
+      }
     }
   }
-  return g;
 }
 
 }  // namespace
@@ -1531,6 +2047,7 @@ uint32_t Trainer::min_level_budget() const {
         case Node::kPoly:
         case Node::kCheb: m = std::max({m, n.layer->depth(), derivative_depth(n)}); break;
         case Node::kNorm: m = std::max(m, n.norm->inv_sqrt_depth()); break;
+        case Node::kBatchNorm: m = std::max(m, n.bn->inv_sqrt_depth()); break;
         case Node::kAttn:
           if (n.att->softmax()) {
             const SoftmaxOptions& o = n.att->softmax_options();
@@ -1614,6 +2131,7 @@ ContextOptions Trainer::context_options(bool secure, bool bootstrapping, uint32_
     // output level: a max pool's comparisons need two levels below their
     // inputs.
     Sim s{w};
+    s.eval = true;
     SimTrace tr;
     sim_forward(s, nodes_, prefix, tr);
     top = std::max(top, s.max);
@@ -1626,6 +2144,17 @@ void Trainer::encrypt_weights(const FHEContext& ctx) {
   if (ctx.slots() != slots_) throw std::invalid_argument("train: context slot count differs from the network");
   base_level_ = ctx.options().bootstrapping ? ctx.bootstrap_depth() + 1 : 0;
   for_each_weighted(nodes_, [&](Node& n) {
+    if (n.kind == Node::kBatchNorm) {
+      // The running statistics, broadcast over each channel's slots.
+      std::vector<double> m(slots_, 0.0), v(slots_, 0.0);
+      for (size_t c = 0; c < n.channel_slots.size(); ++c)
+        for (uint32_t sl : n.channel_slots[c]) {
+          m[sl] = n.bn->running_mean()[c];
+          v[sl] = n.bn->running_var()[c];
+        }
+      n.rm = ctx.encrypt(m, base_level_);
+      n.rv = ctx.encrypt(v, base_level_);
+    }
     if (!n.trainable) return;
     n.D.assign(n.offs.size(), nullptr);
     n.gD.assign(n.offs.size(), nullptr);
@@ -1681,13 +2210,29 @@ Ctxt Trainer::forward(const FHEContext& ctx, const Ctxt& x) {
 }
 
 Ctxt Trainer::accumulate(const FHEContext& ctx, const Ctxt& x, const Ctxt& target) {
+  return accumulate_batch(ctx, {x}, {target})[0];
+}
+
+std::vector<Ctxt> Trainer::accumulate_batch(const FHEContext& ctx, const std::vector<Ctxt>& xs,
+                                            const std::vector<Ctxt>& targets) {
   if (!encrypted_) throw std::logic_error("train: encrypt_weights() first");
+  if (xs.empty() || xs.size() != targets.size())
+    throw std::invalid_argument("train: need matching, non-empty batches of inputs and targets");
   Refresh rf = make_refresh(ctx, base_level_, budget_, log_range_);
-  Ctxt y = run_forward(ctx, rf, net_, first_, nodes_, x);
-  backward_nodes(ctx, rf, nodes_, loss_gradient(ctx, rf, y, target), false);
+  const auto& layers = net_.layers();
+  std::vector<Ctxt> ys = xs;
+  for (Ctxt& c : ys)
+    for (size_t i = 0; i < first_; ++i) {
+      if (!layers[i]->is_bootstrap()) rf.fit(c, layers[i]->depth());
+      c = layers[i]->forward(ctx, c);
+    }
+  forward_batch(ctx, rf, nodes_, ys);
+  std::vector<Ctxt> gs(ys.size());
+  for (size_t b = 0; b < ys.size(); ++b) gs[b] = loss_gradient(ctx, rf, ys[b], targets[b]);
+  backward_batch(ctx, rf, nodes_, gs, false);
   sample_bootstraps_ = rf.count;
-  ++batch_;
-  return y;
+  batch_ += xs.size();
+  return ys;
 }
 
 Ctxt Trainer::loss_gradient(const FHEContext& ctx, Refresh& rf, Ctxt y, const Ctxt& target) const {
@@ -1745,6 +2290,10 @@ void Trainer::update(const FHEContext& ctx, double lr) {
   if (ctx.options().bootstrapping) {
     std::map<uint32_t, std::vector<Ctxt*>> by_window;
     for_each_weighted(nodes_, [&](Node& n) {
+      if (n.kind == Node::kBatchNorm) {
+        by_window[n.window].push_back(&n.rm);
+        by_window[n.window].push_back(&n.rv);
+      }
       if (!n.trainable) return;
       for (auto& d : n.D) by_window[n.window].push_back(&d);
       if (n.B) by_window[n.window].push_back(&n.B);
@@ -1761,6 +2310,19 @@ std::vector<double> Trainer::decrypt_output(const FHEContext& ctx, const Ctxt& y
 void Trainer::decrypt_weights(const FHEContext& ctx) {
   if (!encrypted_) throw std::logic_error("train: encrypt_weights() first");
   for_each_weighted(nodes_, [&](Node& n) {
+    if (n.kind == Node::kBatchNorm) {
+      const std::vector<double> m = ctx.decrypt(n.rm, slots_), v = ctx.decrypt(n.rv, slots_);
+      std::vector<double> mean(n.channel_slots.size(), 0.0), var(mean.size(), 0.0);
+      for (size_t c = 0; c < mean.size(); ++c) {
+        for (uint32_t sl : n.channel_slots[c]) {
+          mean[c] += m[sl];
+          var[c] += v[sl];
+        }
+        mean[c] /= static_cast<double>(n.channel_slots[c].size());
+        var[c] /= static_cast<double>(n.channel_slots[c].size());
+      }
+      n.bn->set_running(mean, var);
+    }
     if (!n.trainable) return;
     std::vector<double> p = n.layer->params(), total(p.size(), 0.0), count(p.size(), 0.0);
     auto take = [&](const Ctxt& c, const std::vector<int>& owner) {
@@ -1782,6 +2344,12 @@ void Trainer::decrypt_weights(const FHEContext& ctx) {
   net_.compile(slots_);
 }
 
+bool Trainer::batch_coupled() const {
+  bool any = false;
+  for_each_weighted(nodes_, [&](const Node& n) { any = any || n.kind == Node::kBatchNorm; });
+  return any;
+}
+
 size_t Trainer::weight_ciphertexts() const {
   size_t k = 0;
   for_each_weighted(nodes_, [&](const Node& n) {
@@ -1795,6 +2363,7 @@ uint32_t Trainer::weight_level() const {
   for_each_weighted(nodes_, [&](const Node& n) {
     for (const auto& d : n.D) l = std::max(l, lvl(d));
     if (n.B) l = std::max(l, lvl(n.B));
+    if (n.rm) l = std::max({l, lvl(n.rm), lvl(n.rv)});
   });
   return l;
 }
@@ -1806,7 +2375,7 @@ std::string Trainer::summary() const {
   if (first_) os << ", layers 0.." << first_ - 1 << " run forward only";
   os << "\n";
   for_each_weighted(nodes_, [&](const Node& n) {
-    os << "  " << n.layer->type() << ": " << n.offs.size() << (n.kind == Node::kNorm ? " gamma, " : " diagonals, ");
+    os << "  " << n.layer->type() << ": " << n.offs.size() << (n.kind == Node::kNorm || n.kind == Node::kBatchNorm ? " gamma, " : " diagonals, ");
     if (n.trainable)
       os << n.groups.size() << " shared weights";
     else
@@ -1828,6 +2397,11 @@ std::string Trainer::summary() const {
 
 // ------------------------------------------------------------- train_plain
 
+std::vector<std::vector<double>> forward_plain_batch(const Network& net, const std::vector<std::vector<double>>& xs) {
+  PlainTrace tr;
+  return plain_forward(net.layers(), 0, xs, tr, false);
+}
+
 void train_plain(Network& net, const std::vector<std::vector<double>>& xs, const std::vector<std::vector<double>>& ts,
                  double lr, const std::vector<size_t>& frozen, const Loss& loss) {
   if (xs.size() != ts.size() || xs.empty()) throw std::invalid_argument("train_plain: need matching, non-empty batches");
@@ -1838,16 +2412,18 @@ void train_plain(Network& net, const std::vector<std::vector<double>>& xs, const
   Grads grads;
   std::unique_ptr<CrossEntropy> ce;
   if (loss.kind == Loss::kCrossEntropy) ce = std::make_unique<CrossEntropy>(loss.softmax, layers.back()->out_shape().size());
-  for (size_t s = 0; s < xs.size(); ++s) {
-    std::vector<double> x = xs[s];
+  std::vector<std::vector<double>> xb = xs;
+  for (auto& x : xb)
     for (size_t i = 0; i < first; ++i) x = layers[i]->forward_plain(x);
-    PlainTrace tr;
-    std::vector<double> y = plain_forward(layers, first, x, tr);
+  PlainTrace tr;
+  std::vector<std::vector<double>> ys = plain_forward(layers, first, xb, tr, true);
+  for (size_t s = 0; s < ys.size(); ++s) {
+    std::vector<double>& y = ys[s];
     if (y.size() != ts[s].size()) throw std::invalid_argument("train_plain: target size mismatch");
     if (ce) y = ce->softmax(y);  // d(cross-entropy)/dy = softmax(y) - t
     for (size_t i = 0; i < y.size(); ++i) y[i] -= ts[s][i];
-    plain_backward(layers, first, train, tr, y, grads);
   }
+  plain_backward(layers, first, train, tr, ys, grads);
   const double step = lr / static_cast<double>(xs.size());
   for (auto& kv : grads) {
     std::vector<double> p = kv.first->params();
