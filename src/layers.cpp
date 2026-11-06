@@ -1008,6 +1008,106 @@ void ChannelAffine::save(std::ostream& os) const {
   write_vec(os, shift_);
 }
 
+// ------------------------------------------------------------------- BatchNorm
+
+BatchNorm::BatchNorm(std::vector<double> gamma, std::vector<double> beta, std::vector<double> running_mean,
+                     std::vector<double> running_var, double eps, double momentum, double var_min, double var_max,
+                     uint32_t degree, uint32_t newton)
+    : gamma_(std::move(gamma)), beta_(std::move(beta)), rm_(std::move(running_mean)), rv_(std::move(running_var)),
+      eps_(eps), momentum_(momentum), var_min_(var_min), var_max_(var_max), degree_(degree), newton_(newton) {
+  const size_t c = gamma_.size();
+  if (!c || beta_.size() != c || rm_.size() != c || rv_.size() != c)
+    throw std::invalid_argument("batchnorm: gamma, beta and the running statistics need one value per channel");
+  if (!(eps > 0.0) || !(momentum >= 0.0 && momentum <= 1.0))
+    throw std::invalid_argument("batchnorm: need eps > 0 and momentum in [0, 1]");
+  if (!(var_min >= 0.0 && var_min < var_max) || degree < 1)
+    throw std::invalid_argument("batchnorm: need 0 <= var_min < var_max and degree >= 1");
+  for (double v : rv_)
+    if (!(v + eps_ > 0.0)) throw std::invalid_argument("batchnorm: running variance + eps must be positive");
+  coeffs_ = lbcrypto::EvalChebyshevCoefficients([this](double v) { return 1.0 / std::sqrt(v + eps_); }, var_min_,
+                                                var_max_, degree_);
+}
+
+std::string BatchNorm::describe() const {
+  std::ostringstream os;
+  os << "batchnorm " << gamma_.size() << " var [" << var_min_ << ", " << var_max_ << "] deg " << degree_
+     << LinearLayer::describe();
+  return os.str();
+}
+
+Shape BatchNorm::configure(const Shape& in) {
+  if (static_cast<size_t>(in.c) != gamma_.size()) throw std::invalid_argument("batchnorm: channel mismatch");
+  return in_ = out_ = in;
+}
+
+SparseMatrix BatchNorm::matrix() const {
+  SparseMatrix m(in_.size(), in_.size());
+  const size_t hw = positions();
+  for (size_t i = 0; i < in_.size(); ++i) {
+    const size_t c = i / hw;
+    m.add(i, i, gamma_[c] / std::sqrt(rv_[c] + eps_));
+  }
+  return m;
+}
+
+std::vector<double> BatchNorm::bias() const {
+  std::vector<double> b(in_.size());
+  const size_t hw = positions();
+  for (size_t i = 0; i < b.size(); ++i) {
+    const size_t c = i / hw;
+    b[i] = beta_[c] - rm_[c] * gamma_[c] / std::sqrt(rv_[c] + eps_);
+  }
+  return b;
+}
+
+std::vector<double> BatchNorm::params() const { return concat(gamma_, beta_); }
+
+void BatchNorm::set_params(const std::vector<double>& p) {
+  split(p, gamma_, beta_, "batchnorm");
+  invalidate();
+}
+
+void BatchNorm::set_running(std::vector<double> mean, std::vector<double> var) {
+  if (mean.size() != gamma_.size() || var.size() != gamma_.size())
+    throw std::invalid_argument("batchnorm: running statistics size mismatch");
+  for (double& v : var) v = std::max(v, 0.0);  // CKKS noise around a zero variance
+  rm_ = std::move(mean);
+  rv_ = std::move(var);
+  invalidate();
+}
+
+void BatchNorm::absorb_input_scale(double c) {
+  if (!(c > 0.0)) throw std::invalid_argument("batchnorm: input scale must be positive");
+  for (double& m : rm_) m *= c;
+  for (double& v : rv_) v *= c * c;
+  eps_ *= c * c;
+  var_min_ *= c * c;
+  var_max_ *= c * c;
+  coeffs_ = lbcrypto::EvalChebyshevCoefficients([this](double v) { return 1.0 / std::sqrt(v + eps_); }, var_min_,
+                                                var_max_, degree_);
+  invalidate();
+}
+
+double BatchNorm::inv_sqrt(double v) const {
+  double r = lbcrypto::EvalChebyshevFunctionPtxt([this](double u) { return 1.0 / std::sqrt(u + eps_); }, {v},
+                                                 var_min_, var_max_, degree_)[0];
+  for (uint32_t i = 0; i < newton_; ++i) r = 1.5 * r - 0.5 * (v + eps_) * r * r * r;
+  return r;
+}
+
+uint32_t BatchNorm::inv_sqrt_depth() const {
+  return poly_depth(degree_) + (var_min_ == -1.0 && var_max_ == 1.0 ? 0 : 1) + 2 * newton_;
+}
+
+void BatchNorm::save(std::ostream& os) const {
+  os << std::setprecision(std::numeric_limits<double>::max_digits10) << "batchnorm " << gamma_.size() << " " << eps_
+     << " " << momentum_ << " " << var_min_ << " " << var_max_ << " " << degree_ << " " << newton_ << "\n";
+  write_vec(os, gamma_);
+  write_vec(os, beta_);
+  write_vec(os, rm_);
+  write_vec(os, rv_);
+}
+
 // ----------------------------------------------------------------------- Scale
 
 Scale::Scale(std::vector<double> factors) : factors_(std::move(factors)) {
@@ -1343,6 +1443,32 @@ void ExactReLU::rescale(double in, double out) {
 void ExactReLU::save(std::ostream& os) const {
   os << std::setprecision(std::numeric_limits<double>::max_digits10) << "exactrelu " << range_ << " " << out_scale_
      << " " << (after_bootstrap_ ? 1 : 0) << "\n";
+}
+
+Dropout::Dropout(double p, uint64_t seed) : p_(p), seed_(seed), rng_(seed) {
+  if (!(p >= 0.0 && p < 1.0)) throw std::invalid_argument("dropout: p must be in [0, 1)");
+}
+
+std::string Dropout::describe() const {
+  std::ostringstream os;
+  os << "dropout p=" << p_;
+  return os.str();
+}
+
+std::vector<double> Dropout::draw() {
+  std::vector<double> m(out_.size());
+  std::uniform_real_distribution<double> u(0.0, 1.0);
+  for (double& v : m) v = u(rng_) < p_ ? 0.0 : 1.0 / (1.0 - p_);
+  return m;
+}
+
+void Dropout::reseed(uint64_t seed) {
+  seed_ = seed;
+  rng_.seed(seed);
+}
+
+void Dropout::save(std::ostream& os) const {
+  os << std::setprecision(std::numeric_limits<double>::max_digits10) << "dropout " << p_ << " " << seed_ << "\n";
 }
 
 void Bootstrap::save(std::ostream& os) const { os << "bootstrap\n"; }

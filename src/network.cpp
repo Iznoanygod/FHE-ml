@@ -78,6 +78,22 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
       layer = std::make_shared<Conv2d>(ic, oc, kh, kw, g, std::move(w), std::move(b));
     else
       layer = std::make_shared<ConvTranspose2d>(ic, oc, kh, kw, g, std::move(w), std::move(b));
+  } else if (tok == "batchnorm") {
+    size_t c;
+    double eps, mom, vmin, vmax;
+    uint32_t deg, newton;
+    is >> c >> eps >> mom >> vmin >> vmax >> deg >> newton;
+    auto g = read_vec(is, c, "batchnorm gamma");
+    auto b = read_vec(is, c, "batchnorm beta");
+    auto m = read_vec(is, c, "batchnorm running mean");
+    auto v = read_vec(is, c, "batchnorm running var");
+    layer = std::make_shared<BatchNorm>(std::move(g), std::move(b), std::move(m), std::move(v), eps, mom, vmin, vmax,
+                                        deg, newton);
+  } else if (tok == "dropout") {
+    double p;
+    uint64_t seed;
+    is >> p >> seed;
+    layer = std::make_shared<Dropout>(p, seed);
   } else if (tok == "upsample") {
     std::string mode;
     int oh, ow, align;
@@ -444,7 +460,7 @@ Fold fold_kind(const Layer& l) {
     // MaxPool2d: max(c x) = c max(x), c > 0, taken by its gather; ArgMax:
     // argmax(c x) = argmax(x), its gather takes 1/c (the range stays put).
     return Fold::kAbsorb;
-  if (l.is_bootstrap()) return Fold::kPass;
+  if (l.is_bootstrap() || dynamic_cast<const Dropout*>(&l)) return Fold::kPass;
   if (auto* lin = dynamic_cast<const LinearLayer*>(&l)) {
     if (lin->trainable()) return Fold::kAbsorb;
     return lin->bias().empty() ? Fold::kPass : Fold::kBlock;
@@ -556,6 +572,7 @@ void absorb_input(std::shared_ptr<Layer>& l, double c) {
   if (auto* mp = dynamic_cast<MaxPool2d*>(l.get())) return mp->set_gain(mp->gain() / c);
   if (auto* rec = dynamic_cast<Recurrent*>(l.get())) return rec->absorb_input_scale(c);
   if (auto* am = dynamic_cast<ArgMax*>(l.get())) return am->set_gain(am->gain() / c);
+  if (auto* bn = dynamic_cast<BatchNorm*>(l.get())) return bn->absorb_input_scale(c);
   if (auto* at = dynamic_cast<Attention*>(l.get())) {
     // q, k and v are linear in the input: their weights (not biases) take 1/c.
     std::vector<double> p = at->params();
