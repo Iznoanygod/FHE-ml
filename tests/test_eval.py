@@ -37,6 +37,10 @@ ap2, _ = E.average_precision([np.array([[0, 0, 1, 1, 0.9], [0, 0, 1, 1, 0.8]])],
 assert np.isclose(ap2, 1.0), ap2
 ap3, _ = E.average_precision([np.array([[0, 0, 1, 1, 0.5], [3, 3, 4, 4, 0.9]])], [np.array([[0, 0, 1, 1]])])
 assert np.isclose(ap3, 0.5), ap3
+# ... unless it overlaps an ignored box: then it is dropped, AP 1
+ap4, _ = E.average_precision([np.array([[0, 0, 1, 1, 0.5], [3, 3, 4, 4, 0.9]])], [np.array([[0, 0, 1, 1]])],
+                             ignore=[np.array([[3, 3, 4, 4.2]])])
+assert np.isclose(ap4, 1.0), ap4
 
 # sequences: pad (0) positions are ignored
 tok, seq = E.sequence_accuracy(np.array([[3, 4, 2, 9], [3, 5, 2, 0]]), np.array([[3, 4, 2, 0], [3, 4, 2, 0]]))

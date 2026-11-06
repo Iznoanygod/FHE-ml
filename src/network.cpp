@@ -139,6 +139,22 @@ std::shared_ptr<Layer> read_layer(const std::string& tok, std::istream& is) {
     size_t c;
     is >> c;
     layer = std::make_shared<Scale>(read_vec(is, c, "scale factors"));
+  } else if (tok == "linearmap") {
+    std::string what;
+    Shape in, out;
+    size_t nnz;
+    int has_bias;
+    is >> what >> in.c >> in.h >> in.w >> out.c >> out.h >> out.w >> nnz >> has_bias;
+    auto idx = read_vec(is, 2 * nnz, "linearmap indices");
+    std::vector<size_t> rows(nnz), cols(nnz);
+    for (size_t i = 0; i < nnz; ++i) {
+      rows[i] = static_cast<size_t>(idx[2 * i]);
+      cols[i] = static_cast<size_t>(idx[2 * i + 1]);
+    }
+    auto vals = read_vec(is, nnz, "linearmap values");
+    auto b = read_vec(is, has_bias ? out.size() : 0, "linearmap bias");
+    layer = std::make_shared<LinearMap>(in, out, std::move(rows), std::move(cols), std::move(vals), std::move(b),
+                                        what);
   } else if (tok == "bootstrap") {
     layer = std::make_shared<Bootstrap>();
   } else if (tok == "tokendense") {

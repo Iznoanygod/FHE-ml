@@ -131,6 +131,11 @@ PYBIND11_MODULE(_fheml, m) {
   py::class_<ChannelAffine, LinearLayer, std::shared_ptr<ChannelAffine>>(m, "ChannelAffine")
       .def(py::init<Vec, Vec>(), py::arg("scale"), py::arg("shift"));
   py::class_<Scale, LinearLayer, std::shared_ptr<Scale>>(m, "Scale").def(py::init<Vec>(), py::arg("factors"));
+  py::class_<LinearMap, LinearLayer, std::shared_ptr<LinearMap>>(m, "LinearMap")
+      .def(py::init<Shape, Shape, std::vector<size_t>, std::vector<size_t>, Vec, Vec, std::string>(),
+           py::arg("input_shape"), py::arg("output_shape"), py::arg("rows"), py::arg("cols"), py::arg("values"),
+           py::arg("bias") = Vec{}, py::arg("name") = "linearmap",
+           "Fixed sparse linear map y = M x + b between any shapes (entries (rows[i], cols[i], values[i])).");
   py::class_<TokenDense, LinearLayer, std::shared_ptr<TokenDense>>(m, "TokenDense")
       .def(py::init<int, int, int, Vec, Vec, std::vector<int>>(), py::arg("tokens"), py::arg("inputs"),
            py::arg("outputs"), py::arg("weights"), py::arg("bias") = Vec{}, py::arg("segments") = std::vector<int>{},
